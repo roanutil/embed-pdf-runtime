@@ -1,0 +1,41 @@
+# Copyright 2026 CloudPDF LTD
+# SPDX-License-Identifier: Apache-2.0
+#
+# The wasm32-eh variant of wasm/config.gn. Identical except that PDFium's
+# setjmp/longjmp is lowered through the native WebAssembly exception-handling
+# mechanism instead of emscripten's JS emulation.
+#
+# Why: rustc's precompiled std for wasm32-unknown-emscripten imports
+# __cpp_exception as a wasm tag, which needs em++ -fwasm-exceptions. PDFium
+# genuinely uses setjmp/longjmp for libpng and libjpeg error handling
+# (core/fxcodec/png/pngmodule.cpp, core/fxcodec/jpeg/jpeg_common.c), which
+# with the default settings needs -sSUPPORT_LONGJMP=emscripten. em++ refuses
+# both on one link: "SUPPORT_LONGJMP=emscripten is not compatible with
+# -fwasm-exceptions". Compiling PDFium with SUPPORT_LONGJMP=wasm puts both
+# sides on the same mechanism.
+
+config("compiler") {
+  defines = [
+    # Enable fseeko() and ftello() (required by libopenjpeg20)
+    # https://github.com/emscripten-core/emscripten/issues/4932
+    "_POSIX_C_SOURCE=200112",
+  ]
+
+  cflags = [
+    "-fwasm-exceptions",
+    "-sSUPPORT_LONGJMP=wasm",
+
+    # emsdk 4.0.0 still defaults -fwasm-exceptions to the LEGACY encoding
+    # (settings.js:785, WASM_LEGACY_EXCEPTIONS = true). Firefox never shipped
+    # legacy in a release build, so the legacy default is the one thing that
+    # makes this target pointless. Forcing 0 emits try_table / throw_ref /
+    # catch_all_ref instead, measured on this toolchain.
+    "-sWASM_LEGACY_EXCEPTIONS=0",
+  ]
+
+  ldflags = [
+    "-fwasm-exceptions",
+    "-sSUPPORT_LONGJMP=wasm",
+    "-sWASM_LEGACY_EXCEPTIONS=0",
+  ]
+}

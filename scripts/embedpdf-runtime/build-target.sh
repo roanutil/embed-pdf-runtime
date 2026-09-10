@@ -6,76 +6,18 @@ set -euo pipefail
 
 SOURCE_DIR="${PDF_RUNTIME_SOURCE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 TARGET="${1:-}"
-PDF_IS_COMPLETE_LIB=true
-# EmbedPDF: thread-confined runtime. Off by default; enabled per-target below
-# for the native server builds. wasm isolates globals per-instance, so it stays
-# off there.
-EMBEDPDF_TLS_GLOBALS=false
 
 if [[ -z "$TARGET" ]]; then
   echo "usage: $0 <target>" >&2
   exit 1
 fi
 
-case "$TARGET" in
-  wasm32)
-    GN_TARGET_OS="emscripten"
-    GN_TARGET_CPU="wasm"
-    EXTRA_ARGS=$'\nis_clang=false\nuse_custom_libcxx=false'
-    ;;
-  darwin-arm64)
-    GN_TARGET_OS="mac"
-    GN_TARGET_CPU="arm64"
-    PDF_IS_COMPLETE_LIB=false
-    ;;
-  darwin-x64)
-    GN_TARGET_OS="mac"
-    GN_TARGET_CPU="x64"
-    PDF_IS_COMPLETE_LIB=false
-    ;;
-  linux-x64)
-    GN_TARGET_OS="linux"
-    GN_TARGET_CPU="x64"
-    PDF_IS_COMPLETE_LIB=false
-    ;;
-  linux-arm64)
-    GN_TARGET_OS="linux"
-    GN_TARGET_CPU="arm64"
-    PDF_IS_COMPLETE_LIB=false
-    EXTRA_ARGS=$'\narm_control_flow_integrity="none"'
-    ;;
-  linuxmusl-x64)
-    GN_TARGET_OS="linux"
-    GN_TARGET_CPU="x64"
-    EXTRA_ARGS=$'\nis_musl=true\nis_clang=false\nuse_sysroot=false\nuse_custom_libcxx=false\nuse_custom_libcxx_for_host=false\nuse_glib=false'
-    ;;
-  linuxmusl-arm64)
-    GN_TARGET_OS="linux"
-    GN_TARGET_CPU="arm64"
-    EXTRA_ARGS=$'\nis_musl=true\nis_clang=false\nuse_sysroot=false\nuse_custom_libcxx=false\nuse_custom_libcxx_for_host=false\nuse_glib=false'
-    ;;
-  win32-x64)
-    GN_TARGET_OS="win"
-    GN_TARGET_CPU="x64"
-    PDF_IS_COMPLETE_LIB=false
-    ;;
-  win32-arm64)
-    GN_TARGET_OS="win"
-    GN_TARGET_CPU="arm64"
-    PDF_IS_COMPLETE_LIB=false
-    ;;
-  *)
-    echo "unknown target: $TARGET" >&2
-    exit 1
-    ;;
-esac
-
-# EmbedPDF: enable per-thread PDFium globals for the native server targets so
-# the server worker pool can render in parallel in-process. wasm stays off
-# (each instance already isolates globals via its own linear memory).
-if [[ "$TARGET" != "wasm32" ]]; then
-  EMBEDPDF_TLS_GLOBALS=true
+if ! GN_ARGS="$("$SOURCE_DIR/scripts/embedpdf-runtime/target-args.sh" "$TARGET")"; then
+  exit 1
 fi
+
+GN_TARGET_OS="$(sed -n 's/^target_os="\(.*\)"$/\1/p' <<<"$GN_ARGS")"
+GN_TARGET_CPU="$(sed -n 's/^target_cpu="\(.*\)"$/\1/p' <<<"$GN_ARGS")"
 
 PDF_RUNTIME_TARGET_OS_LIST="${PDF_RUNTIME_TARGET_OS_LIST:-$GN_TARGET_OS}" \
   "$SOURCE_DIR/scripts/embedpdf-runtime/ensure-deps.sh"
@@ -93,23 +35,7 @@ fi
 OUT="$SOURCE_DIR/out/embedpdf-runtime/$TARGET"
 mkdir -p "$OUT"
 
-cat > "$OUT/args.gn" <<EOF
-is_debug=false
-treat_warnings_as_errors=false
-pdf_use_skia=false
-pdf_enable_xfa=false
-pdf_enable_v8=false
-is_component_build=false
-clang_use_chrome_plugins=false
-pdf_is_standalone=true
-use_debug_fission=false
-pdf_is_complete_lib=$PDF_IS_COMPLETE_LIB
-pdf_use_partition_alloc=false
-embedpdf_thread_local_globals=$EMBEDPDF_TLS_GLOBALS
-symbol_level=0
-target_os="$GN_TARGET_OS"
-target_cpu="$GN_TARGET_CPU"${EXTRA_ARGS:-}
-EOF
+printf '%s\n' "$GN_ARGS" > "$OUT/args.gn"
 
 (
   cd "$SOURCE_DIR"

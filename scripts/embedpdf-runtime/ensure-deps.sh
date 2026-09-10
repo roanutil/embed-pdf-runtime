@@ -56,6 +56,22 @@ needs_sync() {
 
 run_sync() {
   "$SOURCE_DIR/scripts/embedpdf-runtime/unapply-patches.sh"
+  # third_party/llvm-build/Release+Asserts is a gclient 'gcs' dep with several
+  # objects gated on independent per-object conditions (host_os, host_cpu,
+  # checkout_android, ...) that all unpack into this one directory. gclient
+  # only adds objects whose condition newly evaluates true; it never removes
+  # ones left over from a previous sync whose condition has since gone false.
+  # Concretely: syncing this checkout for target_os=android once pulls in
+  # Linux_x64/clang-*.tar.xz (needed for Android's libclang_rt.builtins,
+  # DEPS condition '... or checkout_android'), which extracts a Linux ELF
+  # bin/clang. A later sync of the same checkout for target_os=ios does not
+  # re-trigger that condition, but the stale ELF binary is never cleaned up,
+  # and it silently shadows the correct Mac arm64 clang: ninja fails with
+  # "cannot execute binary file" the first time anything tries to compile.
+  # Force a clean re-fetch of this one directory on every resync so switching
+  # target_os in a shared checkout can't leave a wrong-platform compiler
+  # behind.
+  rm -rf "$SOURCE_DIR/third_party/llvm-build"
   "$SOURCE_DIR/scripts/embedpdf-runtime/sync-deps.sh"
   if ! required_paths_exist; then
     echo "dependency sync completed, but required dependency paths are missing" >&2

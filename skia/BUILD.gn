@@ -490,10 +490,22 @@ component("skia") {
   }
 
   if (is_android) {
-    deps += [
-      "//third_party/cpu_features:ndk_compat",
-      "//third_party/expat",
-    ]
+    deps += [ "//third_party/cpu_features:ndk_compat" ]
+
+    # //third_party/expat is not in standalone PDFium's DEPS, so it exists
+    # only in a Chromium checkout. Upstream acknowledges this in the
+    # gn_check group in //BUILD.gn, which skips //skia on Android for the
+    # same reason (crbug.com/pdfium/1832).
+    #
+    # Every embedpdf-runtime target sets pdf_use_skia=false, so this
+    # component is never built here; the redaction work uses
+    # :redaction_pathops, a static_library over specific Skia sources that
+    # does not depend on this target. Gating the dep keeps an Android build
+    # from failing to load a BUILD.gn it will never need, while leaving a
+    # real pdf_use_skia=true build exactly as it was.
+    if (pdf_use_skia) {
+      deps += [ "//third_party/expat" ]
+    }
   }
 
   if (is_android && !is_debug) {
@@ -608,11 +620,6 @@ skia_source_set("skia_opts") {
     # WASM builds do not use Skia, but GN still evaluates this target.
     # Keep unsupported CPU evaluation non-fatal for the runtime build.
     # assert(false, "Unsupported target CPU " + current_cpu)
-  }
-
-  if (is_android && !is_debug) {
-    configs -= [ "//build/config/compiler:default_optimization" ]
-    configs += [ "//build/config/compiler:optimize_max" ]
   }
 
   visibility = [

@@ -46,6 +46,30 @@ remove_copied_file() {
   rmdir "$(dirname "$dst")" 2>/dev/null || true
 }
 
+# build/config/wasm/BUILD.gn is copied from one of two sources depending on the
+# wasm target that was last built. Accept either, and keep refusing to delete a
+# destination that matches neither, which is how a local edit is protected.
+remove_copied_wasm_config() {
+  local dst="$SOURCE_DIR/build/config/wasm/BUILD.gn"
+  local src
+
+  if [[ ! -f "$dst" ]]; then
+    return
+  fi
+
+  for src in "$PATCH_DIR/wasm/config.gn" "$PATCH_DIR/wasm/config-eh.gn"; do
+    if [[ -f "$src" ]] && cmp -s "$src" "$dst"; then
+      echo "Removing copied patch output $dst"
+      rm "$dst"
+      rmdir "$(dirname "$dst")" 2>/dev/null || true
+      return
+    fi
+  done
+
+  echo "Refusing to remove copied patch output with local changes: $dst" >&2
+  exit 1
+}
+
 remove_patch_backup() {
   local path="$1"
 
@@ -57,7 +81,7 @@ remove_patch_backup() {
 
 # Remove copied files before reversing patches so their parent directories can
 # disappear cleanly if they were introduced only by the runtime patch set.
-remove_copied_file "$PATCH_DIR/wasm/config.gn" "$SOURCE_DIR/build/config/wasm/BUILD.gn"
+remove_copied_wasm_config
 remove_copied_file "$PATCH_DIR/musl/toolchain.gn" "$SOURCE_DIR/build/toolchain/linux/musl/BUILD.gn"
 remove_copied_file "$PATCH_DIR/win/resources.rc" "$SOURCE_DIR/resources.rc"
 
@@ -71,6 +95,7 @@ reverse_patch_file "$SOURCE_DIR/build" "$PATCH_DIR/mac/build.patch"
 reverse_patch_file "$SOURCE_DIR/build" "$PATCH_DIR/wasm/build.patch"
 reverse_patch_file "$SOURCE_DIR/build" "$PATCH_DIR/musl/build.patch"
 reverse_patch_file "$SOURCE_DIR" "$PATCH_DIR/musl/pdfium.patch"
+reverse_patch_file "$SOURCE_DIR" "$PATCH_DIR/apple/pdfium.patch"
 reverse_patch_file "$SOURCE_DIR" "$PATCH_DIR/shared-library.patch"
 
 # GNU patch can leave backup files after failed or manual patch attempts.
@@ -80,3 +105,4 @@ remove_patch_backup "$SOURCE_DIR/build/config/compiler/BUILD.gn.orig"
 remove_patch_backup "$SOURCE_DIR/build/toolchain/apple/toolchain.gni.orig"
 remove_patch_backup "$SOURCE_DIR/build/toolchain/wasm/BUILD.gn.orig"
 remove_patch_backup "$SOURCE_DIR/BUILD.gn.orig"
+remove_patch_backup "$SOURCE_DIR/core/fxge/BUILD.gn.orig"

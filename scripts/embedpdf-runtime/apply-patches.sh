@@ -80,6 +80,10 @@ case "$TARGET" in
     apply_patch_file "$SOURCE_DIR/build" "$PATCH_DIR/wasm/build.patch"
     copy_patch_file "$PATCH_DIR/wasm/config.gn" "$SOURCE_DIR/build/config/wasm/BUILD.gn"
     ;;
+  wasm32-eh)
+    apply_patch_file "$SOURCE_DIR/build" "$PATCH_DIR/wasm/build.patch"
+    copy_patch_file "$PATCH_DIR/wasm/config-eh.gn" "$SOURCE_DIR/build/config/wasm/BUILD.gn"
+    ;;
   linuxmusl-*)
     apply_patch_file "$SOURCE_DIR" "$PATCH_DIR/musl/pdfium.patch"
     apply_patch_file "$SOURCE_DIR/build" "$PATCH_DIR/musl/build.patch"
@@ -96,6 +100,14 @@ case "$TARGET" in
     ;;
   linux-*)
     apply_patch_file "$SOURCE_DIR" "$PATCH_DIR/shared-library.patch"
+    ;;
+  android-*)
+    # Static, like iOS: no shared-library.patch here. Kept as its own case
+    # (rather than falling to the `*)` branch) because that branch rejects
+    # unrecognized targets outright.
+    ;;
+  ios-*)
+    apply_patch_file "$SOURCE_DIR" "$PATCH_DIR/apple/pdfium.patch"
     ;;
   *)
     echo "unknown target: $TARGET" >&2

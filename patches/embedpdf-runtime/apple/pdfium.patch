@@ -1,0 +1,47 @@
+diff --git a/BUILD.gn b/BUILD.gn
+index d5539f40f..03f5ac486 100644
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -284,11 +284,12 @@ component("pdfium") {
+     ]
+   }
+ 
++  if (is_apple) {
++    frameworks = [ "CoreFoundation.framework" ]
++  }
++
+   if (is_mac) {
+-    frameworks = [
+-      "AppKit.framework",
+-      "CoreFoundation.framework",
+-    ]
++    frameworks += [ "AppKit.framework" ]
+   }
+ 
+   if (pdf_is_complete_lib) {
+diff --git a/core/fxge/BUILD.gn b/core/fxge/BUILD.gn
+index 4763ea406..b64a0dabb 100644
+--- a/core/fxge/BUILD.gn
++++ b/core/fxge/BUILD.gn
+@@ -170,7 +170,7 @@ source_set("fxge") {
+     sources += [ "linux/fx_linux_impl.cpp" ]
+   }
+ 
+-  if (is_mac) {
++  if (is_apple) {
+     sources += [
+       "apple/fx_apple_impl.cpp",
+       "apple/fx_apple_platform.cpp",
+diff --git a/testing/test.gni b/testing/test.gni
+index 6ad2c2d4a..039ac2098 100644
+--- a/testing/test.gni
++++ b/testing/test.gni
+@@ -207,7 +207,7 @@ template("test") {
+       }
+ 
+       _bundle_id_suffix = target_name
+-      if (ios_automatically_manage_certs) {
++      if (defined(ios_automatically_manage_certs) && ios_automatically_manage_certs) {
+         # Use the same bundle identifier for all unit tests when managing
+         # certificates automatically as the number of free certs is limited.
+         _bundle_id_suffix = "generic-unit-test"
