@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <utility>
 #include <vector>
@@ -25,6 +26,7 @@
 #include "core/fpdfapi/page/cpdf_imageobject.h"
 #include "core/fpdfapi/page/cpdf_page.h"
 #include "core/fpdfapi/page/cpdf_pageobject.h"
+#include "core/fpdfapi/page/cpdf_streamparser.h"
 #include "core/fpdfapi/parser/cpdf_array.h"
 #include "core/fpdfapi/parser/cpdf_boolean.h"
 #include "core/fpdfapi/parser/cpdf_dictionary.h"
@@ -42,6 +44,9 @@
 #include "core/fpdfdoc/cpdf_formfield.h"
 #include "core/fpdfdoc/cpdf_generateap.h"
 #include "core/fpdfdoc/cpdf_interactiveform.h"
+#include "core/fpdfdoc/cpdf_richtextjson.h"
+#include "core/fpdfdoc/cpdf_richtextparser.h"
+#include "core/fpdfdoc/cpdf_richtextwriter.h"
 #include "core/fxcrt/check.h"
 #include "core/fxcrt/containers/contains.h"
 #include "core/fxcrt/containers/unique_ptr_adapters.h"
@@ -54,8 +59,8 @@
 #include "core/fxge/cfx_fontregistry.h"
 #include "fpdfsdk/cpdfsdk_formfillenvironment.h"
 #include "fpdfsdk/cpdfsdk_helpers.h"
-#include "fpdfsdk/epdf_appearance_exporter.h"
 #include "fpdfsdk/cpdfsdk_interactiveform.h"
+#include "fpdfsdk/epdf_appearance_exporter.h"
 
 namespace {
 
@@ -815,6 +820,77 @@ static CFX_FloatRect GetFormDisplayBox(const CPDF_Dictionary* stream_dict) {
     bbox.Normalize();
   }
   return bbox;
+}
+
+// Private metadata can survive an external editor replacing the appearance.
+// Only reuse our child when the stream still consists solely of its placement.
+// Derive the source bounds from the child, not a possibly stale cached rect.
+static CFX_FloatRect GetWrappedAPContentRect(const CPDF_Stream* ap) {
+  RetainPtr<const CPDF_Dictionary> resources =
+      ap->GetDict()->GetDictFor("Resources");
+  RetainPtr<const CPDF_Dictionary> xobjects =
+      resources ? resources->GetDictFor("XObject") : nullptr;
+  RetainPtr<const CPDF_Stream> child =
+      xobjects ? xobjects->GetStreamFor("EPDFWRAP") : nullptr;
+  if (!child || child.Get() == ap ||
+      child->GetDict()->GetNameFor("Subtype") != "Form") {
+    return CFX_FloatRect();
+  }
+
+  auto acc = pdfium::MakeRetain<CPDF_StreamAcc>(pdfium::WrapRetain(ap));
+  acc->LoadAllDataFiltered();
+  CPDF_StreamParser parser(acc->GetSpan());
+  auto keyword = [&parser](ByteStringView word) {
+    return parser.ParseNextElement() == CPDF_StreamParser::kKeyword &&
+           parser.GetWord() == word;
+  };
+  if (!keyword("q")) {
+    return CFX_FloatRect();
+  }
+  for (int i = 0; i < 6; ++i) {
+    if (parser.ParseNextElement() != CPDF_StreamParser::kNumber) {
+      return CFX_FloatRect();
+    }
+  }
+  if (!keyword("cm") || parser.ParseNextElement() != CPDF_StreamParser::kName ||
+      parser.GetWord() != "/EPDFWRAP" || !keyword("Do") || !keyword("Q") ||
+      parser.ParseNextElement() != CPDF_StreamParser::kEndOfData) {
+    return CFX_FloatRect();
+  }
+  return GetFormDisplayBox(child->GetDict().Get());
+}
+
+// Detach the reference path as well as the stream: /AP and /AP/N state
+// dictionaries may themselves be indirect objects shared by annotations.
+static void SetDetachedNormalAppearance(CPDF_Document* doc,
+                                        CPDF_Dictionary* annot,
+                                        RetainPtr<CPDF_Stream> stream) {
+  RetainPtr<const CPDF_Dictionary> original_ap = annot->GetDictFor("AP");
+  RetainPtr<CPDF_Dictionary> ap = ToDictionary(original_ap->Clone());
+  RetainPtr<const CPDF_Dictionary> original_states =
+      ToDictionary(original_ap->GetDirectObjectFor("N"));
+  doc->AddIndirectObject(stream);
+  if (original_states) {
+    // Match GetAnnotAPInternal's selection, including widgets without /AS.
+    ByteString state = annot->GetByteStringFor("AS");
+    if (state.IsEmpty()) {
+      ByteString value = annot->GetByteStringFor("V");
+      if (value.IsEmpty()) {
+        RetainPtr<const CPDF_Dictionary> parent = annot->GetDictFor("Parent");
+        value = parent ? parent->GetByteStringFor("V") : ByteString();
+      }
+      state =
+          !value.IsEmpty() && original_states->KeyExist(value.AsStringView())
+              ? value
+              : "Off";
+    }
+    RetainPtr<CPDF_Dictionary> states = ToDictionary(original_states->Clone());
+    states->SetNewFor<CPDF_Reference>(state, doc, stream->GetObjNum());
+    ap->SetFor("N", std::move(states));
+  } else {
+    ap->SetNewFor<CPDF_Reference>("N", doc, stream->GetObjNum());
+  }
+  annot->SetFor("AP", std::move(ap));
 }
 
 // Wraps the current AP stream content into a child Form XObject stored under
@@ -3293,6 +3369,139 @@ EPDFAnnot_GetRichContent(FPDF_ANNOTATION annot,
       ws, UNSAFE_BUFFERS(SpanFromFPDFApiArgs(buffer, buflen)));
 }
 
+namespace {
+
+const CPDF_Document* DocOf(FPDF_ANNOTATION annot) {
+  CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
+  return context ? context->GetPage()->GetDocument() : nullptr;
+}
+
+}  // namespace
+
+FPDF_EXPORT unsigned long FPDF_CALLCONV
+EPDFAnnot_GetRichTextJSON(FPDF_ANNOTATION annot,
+                          char* buffer,
+                          unsigned long buflen) {
+  CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
+  if (!context) {
+    return 0;
+  }
+  const CPDF_Dictionary* annot_dict = context->GetAnnotDict();
+  if (!annot_dict) {
+    return 0;
+  }
+  CPDF_Document* doc = context->GetPage()->GetDocument();
+  const CPDF_Dictionary* root = doc ? doc->GetRoot() : nullptr;
+  RetainPtr<const CPDF_Dictionary> acroform =
+      root ? root->GetDictFor("AcroForm") : nullptr;
+  const ByteString json = CPDF_RichTextParser::ToJSON(
+      CPDF_RichTextParser::FromAnnotation(annot_dict, acroform.Get(),
+                                          DocOf(annot)));
+  // SAFETY: same pattern as other getters.
+  return NulTerminateMaybeCopyAndReturnLength(
+      json, UNSAFE_BUFFERS(SpanFromFPDFApiArgs(buffer, buflen)));
+}
+
+namespace {
+
+// The rich text setters share one path: build the document, then write
+// all four forms and the appearance through CPDF_RichTextWriter, or nothing.
+bool ApplyRichTextDocument(FPDF_ANNOTATION annot,
+                           const CPDF_RichTextDocument& document) {
+  CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
+  if (!context) {
+    return false;
+  }
+  RetainPtr<CPDF_Dictionary> annot_dict = context->GetMutableAnnotDict();
+  if (!annot_dict || annot_dict->GetNameFor("Subtype") != "FreeText") {
+    return false;
+  }
+  CPDF_Document* doc = context->GetPage()->GetDocument();
+  if (!doc) {
+    return false;
+  }
+  return CPDF_RichTextWriter::Apply(doc, annot_dict.Get(), document, nullptr);
+}
+
+RetainPtr<const CPDF_Dictionary> AcroFormDictOf(FPDF_ANNOTATION annot) {
+  CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
+  CPDF_Document* doc = context ? context->GetPage()->GetDocument() : nullptr;
+  const CPDF_Dictionary* root = doc ? doc->GetRoot() : nullptr;
+  return root ? root->GetDictFor("AcroForm") : nullptr;
+}
+
+}  // namespace
+
+FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
+EPDFAnnot_SetRichTextJSON(FPDF_ANNOTATION annot, FPDF_BYTESTRING json_utf8) {
+  CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
+  if (!context || !json_utf8) {
+    return false;
+  }
+  // The annotation's current paragraph defaults (/Q, /DS, the /RC body) are
+  // the base for everything the JSON leaves unsaid — a body without an
+  // alignment, a paragraph without one — so a centred box stays centred
+  // when its paragraphs are replaced or its body restyled. (The STYLE of a
+  // given body stays engine defaults under the given keys, as documented.)
+  RetainPtr<const CPDF_Dictionary> acroform = AcroFormDictOf(annot);
+  const CPDF_RichTextDocument current = CPDF_RichTextParser::FromAnnotation(
+      context->GetAnnotDict(), acroform.Get(), DocOf(annot));
+  CPDF_RichTextDocument document;
+  bool has_body = false;
+  if (!CPDF_RichTextJson::Parse(ByteString(json_utf8), &document, &has_body,
+                                &current.body_paragraph)) {
+    return false;
+  }
+  if (!has_body) {
+    // The annotation's current body style (DA ∪ DS ∪ RC body) stays.
+    document.body = current.body;
+  }
+  return ApplyRichTextDocument(annot, document);
+}
+
+FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
+EPDFAnnot_SetRichTextXHTML(FPDF_ANNOTATION annot, FPDF_WIDESTRING xhtml) {
+  CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
+  if (!context || !xhtml) {
+    return false;
+  }
+  const WideString xml = WideStringFromFPDFWideString(xhtml);
+  if (xml.IsEmpty()) {
+    return false;
+  }
+  RetainPtr<const CPDF_Dictionary> acroform = AcroFormDictOf(annot);
+  CPDF_RichTextStyle defaults;
+  CPDF_RichTextParagraphProps paragraph_defaults;
+  std::vector<CPDF_RichTextDiagnostic> diagnostics;
+  CPDF_RichTextParser::DefaultsFromAnnotation(
+      context->GetAnnotDict(), acroform.Get(), &defaults, &paragraph_defaults,
+      &diagnostics, DocOf(annot));
+  const CPDF_RichTextDocument document = CPDF_RichTextParser::ParseRichContent(
+      xml, defaults, paragraph_defaults, WideString());
+  for (const CPDF_RichTextDiagnostic& diagnostic : document.diagnostics) {
+    if (diagnostic.code == CPDF_RichTextDiagnostic::Code::kMalformedRC) {
+      return false;
+    }
+  }
+  return ApplyRichTextDocument(annot, document);
+}
+
+FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
+EPDFDoc_SetTypographicFeatures(FPDF_DOCUMENT document, FPDF_BOOL enabled) {
+  CPDF_Document* doc = CPDFDocumentFromFPDFDocument(document);
+  if (!doc) {
+    return false;
+  }
+  doc->SetTypographicFeaturesEnabled(!!enabled);
+  return true;
+}
+
+FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
+EPDFDoc_GetTypographicFeatures(FPDF_DOCUMENT document) {
+  const CPDF_Document* doc = CPDFDocumentFromFPDFDocument(document);
+  return doc && doc->GetTypographicFeaturesEnabled();
+}
+
 FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
 EPDFAnnot_SetLineEndings(FPDF_ANNOTATION annot,
                          FPDF_ANNOT_LINE_END start_style,
@@ -3755,6 +3964,88 @@ EPDFPage_GetAnnotByName(FPDF_PAGE page, FPDF_WIDESTRING nm) {
   return nullptr;
 }
 
+namespace {
+
+// EmbedPDF: annotation removal reads before it writes. Scanning /Annots for a
+// match must not promote a single sibling into a layer's overlay (reads never
+// promote); only the match takes mutable handles, and only for what changes:
+// the page's /Annots. The removed object is deleted when it is local and left
+// alone when it belongs to the base - it is never edited, so never promoted.
+
+// The object number an /Annots entry names, without resolving it: a reference
+// carries its number; an inline dictionary has none (0). Pure.
+uint32_t AnnotEntryObjNum(const CPDF_Object* entry) {
+  return entry && entry->IsReference() ? entry->AsReference()->GetRefObjNum()
+                                       : 0;
+}
+
+// Index of the /Annots entry that is |obj_num|, or nullopt. A const scan.
+std::optional<size_t> FindAnnotIndexByObjNum(const CPDF_Array* annots,
+                                             uint32_t obj_num) {
+  if (!annots || obj_num == 0) {
+    return std::nullopt;
+  }
+  for (size_t i = 0; i < annots->size(); ++i) {
+    if (AnnotEntryObjNum(annots->GetObjectAt(i).Get()) == obj_num) {
+      return i;
+    }
+  }
+  return std::nullopt;
+}
+
+// Same for /NM. Resolving an entry to read a name is a const resolve
+// (GetDirectObjectAt -> GetIndirectObject -> the frozen base object).
+std::optional<size_t> FindAnnotIndexByName(const CPDF_Array* annots,
+                                           const WideString& name) {
+  if (!annots) {
+    return std::nullopt;
+  }
+  for (size_t i = 0; i < annots->size(); ++i) {
+    RetainPtr<const CPDF_Dictionary> dict =
+        ToDictionary(annots->GetDirectObjectAt(i));
+    if (dict && dict->GetUnicodeTextFor("NM") == name) {
+      return i;
+    }
+  }
+  return std::nullopt;
+}
+
+// The one mutation: |page_dict|'s /Annots shrinks (this promotes the page,
+// which is right - it changed). A local object is deleted; a base object is
+// simply no longer referenced (DeleteIndirectObject is a no-op for it).
+// Afterwards the page keeps the shape its BASE has: an add created /Annots
+// when the base page had none, and the reverse of that add is not an empty
+// array - but a page whose base carries `/Annots []` keeps it.
+bool RemoveAnnotEntryAt(CPDF_Document* doc,
+                        CPDF_Dictionary* page_dict,
+                        size_t index) {
+  if (!doc || !page_dict) {
+    return false;
+  }
+  RetainPtr<CPDF_Array> annots = page_dict->GetMutableArrayFor("Annots");
+  if (!annots || index >= annots->size()) {
+    return false;
+  }
+  const uint32_t objnum = AnnotEntryObjNum(annots->GetObjectAt(index).Get());
+  annots->RemoveAt(index);
+  if (objnum) {
+    doc->DeleteIndirectObject(objnum);
+  }
+  // The BASE twin decides: it is what a save compares against when it
+  // elides the page. The loaded twin would be wrong after a reopen - the
+  // delta's page carried the annotation just removed.
+  if (annots->IsEmpty()) {
+    RetainPtr<const CPDF_Dictionary> twin =
+        ToDictionary(doc->GetBaseTwin(page_dict->GetObjNum()));
+    if (!twin || !twin->KeyExist("Annots")) {
+      page_dict->RemoveFor("Annots");
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
 FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
 EPDFPage_RemoveAnnotByName(FPDF_PAGE page, FPDF_WIDESTRING nm) {
   if (!page || !nm || !*nm) {
@@ -3766,45 +4057,14 @@ EPDFPage_RemoveAnnotByName(FPDF_PAGE page, FPDF_WIDESTRING nm) {
     return false;
   }
 
-  RetainPtr<CPDF_Array> annots = pPage->GetMutableAnnotsArray();
-  if (!annots) {
+  WideString target = UNSAFE_BUFFERS(WideStringFromFPDFWideString(nm));
+  RetainPtr<const CPDF_Array> annots = pPage->GetAnnotsArray();
+  std::optional<size_t> index = FindAnnotIndexByName(annots.Get(), target);
+  if (!index.has_value()) {
     return false;
   }
-
-  WideString target = UNSAFE_BUFFERS(WideStringFromFPDFWideString(nm));
-
-  for (size_t i = 0; i < annots->size(); ++i) {
-    // Keep the raw entry so we can see if it was a reference.
-    RetainPtr<CPDF_Object> entry = annots->GetMutableObjectAt(i);
-
-    // Resolve to a dictionary to compare /NM.
-    RetainPtr<CPDF_Dictionary> dict =
-        ToDictionary(entry ? entry->GetMutableDirect() : nullptr);
-    if (!dict || dict->GetUnicodeTextFor("NM") != target) {
-      continue;
-    }
-
-    // Determine indirect object number, if any.
-    uint32_t objnum = 0;
-    if (entry && entry->IsReference()) {
-      objnum = entry->AsReference()->GetRefObjNum();
-    } else if (dict) {
-      // Handles the case where the dict was promoted indirect but the Annots
-      // array still holds it directly.
-      objnum = dict->GetObjNum();
-    }
-
-    // Remove from /Annots.
-    annots->RemoveAt(i);
-
-    // If it was indirect, delete the object to avoid leaving an orphan.
-    if (objnum) {
-      pPage->GetDocument()->DeleteIndirectObject(objnum);
-    }
-
-    return true;
-  }
-  return false;
+  return RemoveAnnotEntryAt(pPage->GetDocument(), pPage->GetMutableDict().Get(),
+                            *index);
 }
 
 FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
@@ -3927,40 +4187,18 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV EPDFPage_RemoveAnnotRaw(FPDF_DOCUMENT doc,
     return false;
   }
 
-  RetainPtr<CPDF_Dictionary> page_dict =
-      pdf->GetMutablePageDictionary(page_index);
-  if (!page_dict) {
-    return false;
-  }
-
-  RetainPtr<CPDF_Array> annots = page_dict->GetMutableArrayFor("Annots");
+  // Bounds are checked on the const view; only a real removal takes the
+  // mutable page dictionary.
+  RetainPtr<const CPDF_Dictionary> page_view = pdf->GetPageDictionary(page_index);
+  RetainPtr<const CPDF_Array> annots =
+      page_view ? page_view->GetArrayFor("Annots") : nullptr;
   if (!annots || static_cast<size_t>(index) >= annots->size()) {
     return false;
   }
 
-  // Keep original entry so we can determine if it was indirect.
-  RetainPtr<CPDF_Object> entry = annots->GetMutableObjectAt(index);
-
-  // Resolve to dictionary for fallback objnum detection.
-  RetainPtr<CPDF_Dictionary> dict =
-      ToDictionary(entry ? entry->GetMutableDirect() : nullptr);
-
-  uint32_t objnum = 0;
-  if (entry && entry->IsReference()) {
-    objnum = entry->AsReference()->GetRefObjNum();
-  } else if (dict) {
-    objnum = dict->GetObjNum();
-  }
-
-  // Remove from /Annots.
-  annots->RemoveAt(index);
-
-  // If it was indirect, delete the annot object to avoid leaving orphans.
-  if (objnum) {
-    pdf->DeleteIndirectObject(objnum);
-  }
-
-  return true;
+  RetainPtr<CPDF_Dictionary> page_dict =
+      pdf->GetMutablePageDictionary(page_index);
+  return RemoveAnnotEntryAt(pdf, page_dict.Get(), static_cast<size_t>(index));
 }
 
 FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV EPDFAnnot_SetName(FPDF_ANNOTATION annot,
@@ -4006,7 +4244,11 @@ EPDFAnnot_UpdateAppearanceToRect(FPDF_ANNOTATION annot, EPDF_STAMP_FIT fit) {
     return false;
   }
 
-  if (FPDFAnnot_GetSubtype(annot) != FPDF_ANNOT_STAMP) {
+  // Stamps, and widgets whose appearance is an imported page (a signature
+  // field's mark via EPDFAnnot_SetAppearanceFromPage): both are one wrapped
+  // form to place inside /Rect.
+  const FPDF_ANNOTATION_SUBTYPE subtype = FPDFAnnot_GetSubtype(annot);
+  if (subtype != FPDF_ANNOT_STAMP && subtype != FPDF_ANNOT_WIDGET) {
     return false;
   }
 
@@ -4043,7 +4285,9 @@ EPDFAnnot_UpdateAppearanceToRect(FPDF_ANNOTATION annot, EPDF_STAMP_FIT fit) {
     }
   }
 
-  // 3) Get the AP dict.
+  // 3) Edit a detached stream. Mutating a shared AP would also resize other
+  // annotations (or inactive states) that refer to it. Publish only on success.
+  ap = ToStream(ap->Clone());
   RetainPtr<CPDF_Dictionary> ap_dict = ap->GetMutableDict();
   if (!ap_dict) {
     return false;
@@ -4054,12 +4298,9 @@ EPDFAnnot_UpdateAppearanceToRect(FPDF_ANNOTATION annot, EPDF_STAMP_FIT fit) {
     return false;
   }
 
-  // 4) On first call, wrap the original AP content into a child Form XObject
-  //    and record the painted content rect in EPDFOrigContentRect.  This rect
-  //    captures where the visible content lives inside the child form's own
-  //    coordinate space; its Width()/Height() drive the scale factors and its
-  //    left/bottom drive the translation offset in the parent cm matrix.
-  CFX_FloatRect content_rect = ap_dict->GetRectFor("EPDFOrigContentRect");
+  // 4) Reuse an intact wrapper, even if an editor stripped private metadata.
+  // Otherwise preserve the current appearance as the new source artwork.
+  CFX_FloatRect content_rect = GetWrappedAPContentRect(ap.Get());
   if (content_rect.IsEmpty()) {
     content_rect = GetFormDisplayBox(ap_dict.Get());
     if (content_rect.IsEmpty()) {
@@ -4071,12 +4312,11 @@ EPDFAnnot_UpdateAppearanceToRect(FPDF_ANNOTATION annot, EPDF_STAMP_FIT fit) {
       return false;
     }
 
-    ap_dict->SetRectFor("EPDFOrigContentRect", content_rect);
-
     if (!WrapAPContentIntoFormXObject(ap.Get(), doc)) {
       return false;
     }
   }
+  ap_dict->SetRectFor("EPDFOrigContentRect", content_rect);
 
   const float orig_w = content_rect.Width();
   const float orig_h = content_rect.Height();
@@ -4099,8 +4339,8 @@ EPDFAnnot_UpdateAppearanceToRect(FPDF_ANNOTATION annot, EPDF_STAMP_FIT fit) {
   {
     const float sx = drawn_w / orig_w;
     const float sy = drawn_h / orig_h;
-    const float tx = std::max(0.f, dx) - content_rect.left * sx;
-    const float ty = std::max(0.f, dy) - content_rect.bottom * sy;
+    const float tx = dx - content_rect.left * sx;
+    const float ty = dy - content_rect.bottom * sy;
     fxcrt::ostringstream buf;
     buf << "q ";
     WriteFloat(buf, sx) << " 0 0 ";
@@ -4129,6 +4369,10 @@ EPDFAnnot_UpdateAppearanceToRect(FPDF_ANNOTATION annot, EPDF_STAMP_FIT fit) {
     ap_dict->RemoveFor("Matrix");
   }
 
+  SetDetachedNormalAppearance(doc, ad.Get(), ap);
+  if (ctx->HasForm()) {
+    ctx->SetForm(ap);
+  }
   return true;
 }
 
@@ -4424,6 +4668,17 @@ EPDFAnnot_SetAppearanceFromPage(FPDF_ANNOTATION annot,
     if (!WrapAPContentIntoFormXObject(cloned_stream.Get(), dest_doc)) {
       return false;
     }
+
+    // The page's content and resources now live in the child form; the
+    // outer stream's job is to PLACE it. Write that placement (identity:
+    // the outer BBox is the page's own box, so the viewer's BBox→/Rect
+    // mapping scales it) instead of leaving the page's original content
+    // behind — that content names resources that are no longer here and
+    // draws nothing. A caller wanting a uniform fit into the annotation's
+    // rect rewrites this through EPDFAnnot_UpdateAppearanceToRect.
+    fxcrt::ostringstream buf;
+    buf << "q 1 0 0 1 0 0 cm /EPDFWRAP Do Q";
+    cloned_stream->SetDataFromStringstreamAndRemoveFilter(&buf);
   }
 
   // Set cloned stream as AP/N on the annotation.
@@ -4897,29 +5152,12 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV EPDFPage_RemoveAnnot(FPDF_PAGE page,
     return false;
   }
 
-  RetainPtr<CPDF_Array> annots = pPage->GetMutableAnnotsArray();
+  RetainPtr<const CPDF_Array> annots = pPage->GetAnnotsArray();
   if (!annots || static_cast<size_t>(index) >= annots->size()) {
     return false;
   }
-
-  RetainPtr<CPDF_Object> entry = annots->GetMutableObjectAt(index);
-  RetainPtr<CPDF_Dictionary> dict =
-      ToDictionary(entry ? entry->GetMutableDirect() : nullptr);
-
-  uint32_t objnum = 0;
-  if (entry && entry->IsReference()) {
-    objnum = entry->AsReference()->GetRefObjNum();
-  } else if (dict) {
-    objnum = dict->GetObjNum();
-  }
-
-  annots->RemoveAt(index);
-
-  if (objnum) {
-    pPage->GetDocument()->DeleteIndirectObject(objnum);
-  }
-
-  return true;
+  return RemoveAnnotEntryAt(pPage->GetDocument(), pPage->GetMutableDict().Get(),
+                            static_cast<size_t>(index));
 }
 
 FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
@@ -4933,54 +5171,15 @@ EPDFPage_RemoveAnnotByObjectNumber(FPDF_PAGE page, unsigned int obj_num) {
     return false;
   }
 
-  RetainPtr<CPDF_Array> annots = pPage->GetMutableAnnotsArray();
-  if (!annots) {
+  RetainPtr<const CPDF_Array> annots = pPage->GetAnnotsArray();
+  std::optional<size_t> index = FindAnnotIndexByObjNum(annots.Get(), obj_num);
+  if (!index.has_value()) {
     return false;
   }
-
-  for (size_t i = 0; i < annots->size(); ++i) {
-    RetainPtr<CPDF_Object> entry = annots->GetMutableObjectAt(i);
-    RetainPtr<CPDF_Dictionary> dict =
-        ToDictionary(entry ? entry->GetMutableDirect() : nullptr);
-    if (!dict) {
-      continue;
-    }
-
-    uint32_t entry_objnum = 0;
-    if (entry && entry->IsReference()) {
-      entry_objnum = entry->AsReference()->GetRefObjNum();
-    } else {
-      entry_objnum = dict->GetObjNum();
-    }
-    if (entry_objnum != obj_num) {
-      continue;
-    }
-
-    annots->RemoveAt(i);
-
-    if (entry_objnum) {
-      pPage->GetDocument()->DeleteIndirectObject(entry_objnum);
-    }
-
-    return true;
-  }
-  return false;
+  return RemoveAnnotEntryAt(pPage->GetDocument(), pPage->GetMutableDict().Get(),
+                            *index);
 }
 
-// EmbedPDF Extension API.
-// Move a contiguous block of annotations within a page's /Annots array.
-// Mirrors FPDF_MovePages semantics for the per-page annotation list:
-// the entries at from_indices[0..len) are detached, then re-inserted as
-// a contiguous block starting at to_index in the post-removal index
-// space, preserving caller-supplied order.
-//
-// All validation happens BEFORE any mutation:
-//   - every from_index must be in [0, count)
-//   - from_indices must contain no duplicates
-//   - to_index must be in [0, count - len]
-// Any failure returns false without touching the array. The indirect
-// objects backing each annotation are never destroyed, so durable
-// identity (objectNumber, /NM) is preserved across the move.
 FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV EPDFPage_MoveAnnots(FPDF_PAGE page,
                                                         const int* from_indices,
                                                         int from_indices_len,

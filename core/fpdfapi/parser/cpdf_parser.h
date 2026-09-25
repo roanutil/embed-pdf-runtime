@@ -13,11 +13,13 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <vector>
 
 #include "core/fpdfapi/parser/cpdf_cross_ref_table.h"
 #include "core/fpdfapi/parser/cpdf_indirect_object_holder.h"
+#include "core/fpdfapi/parser/cpdf_reference_index.h"
 #include "core/fxcrt/bytestring.h"
 #include "core/fxcrt/fx_types.h"
 #include "core/fxcrt/retain_ptr.h"
@@ -28,6 +30,7 @@ class CPDF_Dictionary;
 class CPDF_LinearizedHeader;
 class CPDF_Object;
 class CPDF_ObjectStream;
+class CPDF_ObjectStreamCache;
 class CPDF_ReadValidator;
 class CPDF_SecurityHandler;
 class CPDF_SyntaxParser;
@@ -97,6 +100,19 @@ class CPDF_Parser {
 
   RetainPtr<CPDF_Object> ParseIndirectObject(uint32_t objnum);
 
+  // Parse from the loaded bytes without populating the document's caches.
+  // References, including indirect stream lengths, resolve through `holder`.
+  RetainPtr<CPDF_Object> ParseIndirectObjectForSave(
+      uint32_t objnum,
+      CPDF_IndirectObjectHolder* holder,
+      CPDF_ObjectStreamCache* stream_cache);
+
+  // Progressive loads can still change xref interpretation. They deliberately
+  // bypass this optimization; ordinary completed parses have immutable bytes.
+  CPDF_ReferenceIndex* GetSaveReferenceIndex() {
+    return linearized_ ? nullptr : &save_reference_index_;
+  }
+
   uint32_t GetLastObjNum() const;
   bool IsValidObjectNumber(uint32_t objnum) const;
   FX_FILESIZE GetObjectPositionOrZero(uint32_t objnum) const;
@@ -120,6 +136,33 @@ class CPDF_Parser {
   std::vector<unsigned int> GetTrailerEnds();
   bool WriteToArchive(IFX_ArchiveStream* archive, FX_FILESIZE src_size);
 
+  // EmbedPDF: one cross-reference section of the chain reached from the final
+  // startxref through /Prev, recorded while parsing. Offsets are
+  // header-relative like every other parser offset (see GetFileHeaderOffset()).
+  struct CrossRefSection {
+    // Start of the section: a classic table or a cross-reference stream.
+    FX_FILESIZE offset = 0;
+    // /XRefStm of a hybrid table section; 0 when absent.
+    FX_FILESIZE hybrid_stream_offset = 0;
+    // /Prev of this section's trailer; 0 for the oldest section.
+    FX_FILESIZE prev_offset = 0;
+  };
+
+  // EmbedPDF: the chain, oldest section first. Empty when the table was
+  // rebuilt by scanning, when the document was loaded progressively
+  // (linearized path), or when nothing was parsed.
+  const std::vector<CrossRefSection>& GetCrossRefSections() const {
+    return cross_ref_sections_;
+  }
+
+  // EmbedPDF: GetTrailerEnds() walks the whole document; this caches it.
+  // Positions are header-relative, like GetTrailerEnds().
+  const std::vector<unsigned int>& GetCachedTrailerEnds();
+
+  // EmbedPDF: bytes preceding the %PDF header. Parser offsets are relative to
+  // it; file offsets (a signature's /ByteRange) are not.
+  FX_FILESIZE GetFileHeaderOffset() const;
+
   const CPDF_CrossRefTable* GetCrossRefTable() const {
     return cross_ref_table_.get();
   }
@@ -128,6 +171,10 @@ class CPDF_Parser {
   }
 
   CPDF_Dictionary* GetMutableTrailerForTesting();
+
+  size_t GetCachedObjectStreamCountForTesting() const {
+    return object_stream_map_.size();
+  }
 
   RetainPtr<CPDF_Object> ParseIndirectObjectAtForTesting(FX_FILESIZE pos) {
     return ParseIndirectObjectAt(pos, 0);
@@ -170,6 +217,14 @@ class CPDF_Parser {
   Error LoadLinearizedMainXRefTable();
 
   const CPDF_ObjectStream* GetObjectStream(uint32_t object_number);
+  RetainPtr<CPDF_Object> ParseIndirectObjectInternal(
+      uint32_t objnum,
+      CPDF_IndirectObjectHolder* holder,
+      CPDF_ObjectStreamCache* stream_cache);
+  std::shared_ptr<const CPDF_ObjectStream> GetObjectStreamForSave(
+      uint32_t object_number,
+      CPDF_IndirectObjectHolder* holder,
+      CPDF_ObjectStreamCache* stream_cache);
   RetainPtr<const CPDF_Dictionary> GetRoot() const;
 
   // A simple check whether the cross reference table matches with
@@ -178,6 +233,10 @@ class CPDF_Parser {
 
   RetainPtr<CPDF_Object> ParseIndirectObjectAt(FX_FILESIZE pos,
                                                uint32_t objnum);
+  RetainPtr<CPDF_Object> ParseIndirectObjectAtWithHolder(
+      FX_FILESIZE pos,
+      uint32_t objnum,
+      CPDF_IndirectObjectHolder* holder);
 
   // If out_objects is null, the parser position will be moved to end subsection
   // without additional validation.
@@ -195,6 +254,8 @@ class CPDF_Parser {
   std::unique_ptr<CPDF_SyntaxParser> syntax_;
   std::unique_ptr<ParsedObjectsHolder> owned_objects_holder_;
   UnownedPtr<ParsedObjectsHolder> objects_holder_;
+
+  CPDF_ReferenceIndex save_reference_index_;
 
   bool has_parsed_ = false;
   bool xref_stream_ = false;
@@ -215,6 +276,10 @@ class CPDF_Parser {
   std::set<uint32_t> parsing_obj_nums_;
 
   RetainPtr<CPDF_SecurityHandler> security_handler_;
+
+  // EmbedPDF: see GetCrossRefSections() / GetCachedTrailerEnds().
+  std::vector<CrossRefSection> cross_ref_sections_;
+  std::optional<std::vector<unsigned int>> cached_trailer_ends_;
 };
 
 #endif  // CORE_FPDFAPI_PARSER_CPDF_PARSER_H_

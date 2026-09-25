@@ -530,6 +530,32 @@ bool CPDF_Document::IsObjectPromoted(uint32_t objnum) const {
   return !!FindPromotedObject(objnum);
 }
 
+RetainPtr<const CPDF_Object> CPDF_Document::GetBaseTwin(
+    uint32_t objnum) const {
+  return GetLoadedTwin(objnum);
+}
+
+bool CPDF_Document::SharesBackingStorageWith(const CPDF_Stream* stream) const {
+  CPDF_Parser* parser = GetParser();
+  RetainPtr<IFX_SeekableReadStream> file = parser ? parser->GetFileAccess() : nullptr;
+  RetainPtr<IFX_SeekableReadStream> view = stream ? stream->BackingView() : nullptr;
+  return file && view && view->GetUnderlyingStream() == file->GetUnderlyingStream();
+}
+
+RetainPtr<const CPDF_Object> CPDF_Document::GetLoadedTwin(
+    uint32_t objnum) const {
+  // The object as it is in the loaded bytes, parsed afresh: the parser
+  // hands out a fresh root object, while retaining decoded object streams in
+  // its normal cache. An in-place edit never reaches the twin. Null if the file
+  // does not carry the object (created in memory).
+  CPDF_Parser* parser = GetParser();
+  if (!parser || objnum == 0 || !parser->IsValidObjectNumber(objnum) ||
+      parser->IsObjectFree(objnum)) {
+    return nullptr;
+  }
+  return parser->ParseIndirectObject(objnum);
+}
+
 uint64_t CPDF_Document::GetOverlayEpoch() const {
   return 0;
 }
@@ -767,6 +793,14 @@ RetainPtr<CPDF_Dictionary> CPDF_Document::GetInfo() {
 
 RetainPtr<CPDF_Dictionary> CPDF_Document::GetMutableInfo() {
   return GetInfo();
+}
+
+uint32_t CPDF_Document::GetInfoObjectNumber() const {
+  if (info_dict_) {
+    return info_dict_->GetObjNum();
+  }
+  CPDF_Parser* parser = GetParser();
+  return parser ? parser->GetInfoObjNum() : 0;
 }
 
 RetainPtr<CPDF_Dictionary> CPDF_Document::GetOrCreateInfo() {

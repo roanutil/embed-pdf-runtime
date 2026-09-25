@@ -7,6 +7,7 @@
 #include "public/fpdf_save.h"
 
 #include <stdint.h>
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -176,10 +177,23 @@ bool SaveXFADocumentData(
 }
 #endif  // PDF_ENABLE_XFA
 
-bool DoDocSave(FPDF_DOCUMENT document,
-               FPDF_FILEWRITE* file_write,
-               FPDF_DWORD flags,
-               std::optional<int> version) {
+void SetSaveStatus(EPDFSaveStatus* out_status, EPDFSaveStatus status) {
+  if (out_status) {
+    *out_status = status;
+  }
+}
+
+// |skip_if_unchanged|: an incremental save of a layer writes nothing when no
+// reachable object differs from the document it was opened with, and
+// |out_status| says so. Without it the save always writes (the cumulative
+// delta a persisted artifact needs).
+bool DoDocSaveImpl(FPDF_DOCUMENT document,
+                   FPDF_FILEWRITE* file_write,
+                   FPDF_DWORD flags,
+                   std::optional<int> version,
+                   bool skip_if_unchanged,
+                   EPDFSaveStatus* out_status) {
+  SetSaveStatus(out_status, EPDFSaveStatus_kFailed);
   CPDF_Document* doc = CPDFDocumentFromFPDFDocument(document);
   if (!doc) {
     return false;
@@ -213,10 +227,13 @@ bool DoDocSave(FPDF_DOCUMENT document,
     }
   }
 
-  bool create_result = file_maker.Create(
+  Mask<CPDF_Creator::CreateFlags> create_flags =
       Mask<CPDF_Creator::CreateFlags>::FromUnderlyingUnchecked(
-          static_cast<uint32_t>(flags)),
-      version.value_or(0));
+          static_cast<uint32_t>(flags));
+  if (skip_if_unchanged) {
+    create_flags |= CPDF_Creator::CreateFlags::kSkipIfUnchangedSinceLoad;
+  }
+  bool create_result = file_maker.Create(create_flags, version.value_or(0));
 
 #ifdef PDF_ENABLE_XFA
   if (context) {
@@ -224,49 +241,112 @@ bool DoDocSave(FPDF_DOCUMENT document,
   }
 #endif  // PDF_ENABLE_XFA
 
+  if (create_result) {
+    SetSaveStatus(out_status, file_maker.IsUnchangedSinceLoad()
+                                  ? EPDFSaveStatus_kUnchangedSinceLoad
+                                  : EPDFSaveStatus_kWritten);
+  }
   return create_result;
 }
 
-struct MemoryFileWriter : public FPDF_FILEWRITE {
-  std::string data;
+bool DoDocSave(FPDF_DOCUMENT document,
+               FPDF_FILEWRITE* file_write,
+               FPDF_DWORD flags,
+               std::optional<int> version) {
+  return DoDocSaveImpl(document, file_write, flags, version,
+                       /*skip_if_unchanged=*/false, /*out_status=*/nullptr);
+}
 
+struct MemoryFileWriter : public FPDF_FILEWRITE {
   MemoryFileWriter() {
     version = 1;
     WriteBlock = [](FPDF_FILEWRITE* self, const void* buf,
                     unsigned long size) -> int {
-      static_cast<MemoryFileWriter*>(self)->data.append(
-          static_cast<const char*>(buf), size);
+      auto* writer = static_cast<MemoryFileWriter*>(self);
+      if (writer->failed_ || !writer->Append(buf, size)) {
+        writer->failed_ = true;
+        return 0;
+      }
       return 1;
     };
   }
+
+  ~MemoryFileWriter() { free(data_); }
+
+  MemoryFileWriter(const MemoryFileWriter&) = delete;
+  MemoryFileWriter& operator=(const MemoryFileWriter&) = delete;
+
+  size_t size() const { return size_; }
+  bool failed() const { return failed_; }
+
+  // The returned allocation is released by EPDF_FreeBuffer(). No final
+  // output-sized copy is needed to transfer ownership to the caller.
+  void* Release() { return std::exchange(data_, nullptr); }
+
+ private:
+  bool Append(const void* data, size_t size) {
+    if (size > std::numeric_limits<size_t>::max() - size_) {
+      return false;
+    }
+    const size_t required = size_ + size;
+    if (required > capacity_) {
+      const size_t growth = std::min(
+          capacity_ / 2, std::numeric_limits<size_t>::max() - capacity_);
+      const size_t capacity =
+          std::max(required, std::max(size_t{32768}, capacity_ + growth));
+      void* allocation = realloc(data_, capacity);
+      if (!allocation) {
+        return false;
+      }
+      data_ = static_cast<uint8_t*>(allocation);
+      capacity_ = capacity;
+    }
+    if (size != 0) {
+      memcpy(data_ + size_, data, size);
+    }
+    size_ = required;
+    return true;
+  }
+
+  uint8_t* data_ = nullptr;
+  size_t size_ = 0;
+  size_t capacity_ = 0;
+  bool failed_ = false;
 };
 
 void* SaveToOwnedBuffer(FPDF_DOCUMENT document,
                         FPDF_DWORD flags,
                         unsigned long* out_size,
-                        std::optional<int> version) {
+                        std::optional<int> version,
+                        bool skip_if_unchanged = false,
+                        EPDFSaveStatus* out_status = nullptr) {
+  SetSaveStatus(out_status, EPDFSaveStatus_kFailed);
   if (!out_size) {
     return nullptr;
   }
   *out_size = 0;
 
   MemoryFileWriter writer;
-  const bool ok = version.has_value()
-                      ? DoDocSave(document, &writer, flags, version.value())
-                      : DoDocSave(document, &writer, flags, {});
-  if (!ok || writer.data.empty() ||
-      writer.data.size() > std::numeric_limits<unsigned long>::max()) {
+  EPDFSaveStatus status = EPDFSaveStatus_kFailed;
+  const bool ok = DoDocSaveImpl(document, &writer, flags, version,
+                                skip_if_unchanged, &status);
+  // The archive flushes its final block during destruction in DoDocSaveImpl().
+  // Include that callback's result before handing a complete PDF to the caller.
+  if (!ok || writer.failed()) {
+    return nullptr;
+  }
+  SetSaveStatus(out_status, status);
+  if (status == EPDFSaveStatus_kUnchangedSinceLoad) {
+    return nullptr;  // nothing written, by design: the loaded bytes stand
+  }
+  if (writer.size() == 0 ||
+      writer.size() > std::numeric_limits<unsigned long>::max()) {
+    SetSaveStatus(out_status, EPDFSaveStatus_kFailed);
     return nullptr;
   }
 
-  void* buffer = malloc(writer.data.size());
-  if (!buffer) {
-    return nullptr;
-  }
-
-  memcpy(buffer, writer.data.data(), writer.data.size());
-  *out_size = static_cast<unsigned long>(writer.data.size());
-  return buffer;
+  *out_size = static_cast<unsigned long>(writer.size());
+  return writer.Release();
 }
 
 }  // namespace
@@ -302,4 +382,27 @@ EPDF_SaveDocumentToOwnedBufferWithVersion(FPDF_DOCUMENT document,
                                           unsigned long* out_size,
                                           int file_version) {
   return SaveToOwnedBuffer(document, flags, out_size, file_version);
+}
+
+FPDF_EXPORT void* FPDF_CALLCONV
+EPDF_SaveDocumentToOwnedBufferEx(FPDF_DOCUMENT document,
+                                 FPDF_DWORD flags,
+                                 int file_version,
+                                 unsigned long* out_size,
+                                 EPDFSaveStatus* out_status) {
+  std::optional<int> version;
+  if (file_version > 0) {
+    version = file_version;
+  }
+  return SaveToOwnedBuffer(document, flags, out_size, version,
+                           /*skip_if_unchanged=*/true, out_status);
+}
+
+FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
+EPDF_SaveAsCopyEx(FPDF_DOCUMENT document,
+                  FPDF_FILEWRITE* file_write,
+                  FPDF_DWORD flags,
+                  EPDFSaveStatus* out_status) {
+  return DoDocSaveImpl(document, file_write, flags, {},
+                       /*skip_if_unchanged=*/true, out_status);
 }

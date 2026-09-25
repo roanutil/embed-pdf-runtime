@@ -3,24 +3,33 @@
 // found in the LICENSE file.
 
 #include "public/fpdf_annot.h"
+#include "public/epdf_signature.h"
 #include "public/epdf_form.h"
 #include "public/epdf_text.h"
 #include "public/fpdf_edit.h"
 
 #include <limits.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
+#include <cctype>
+#include <chrono>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <initializer_list>
 #include <limits>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <type_traits>
 #include <vector>
 
 #include "build/build_config.h"
 #include "constants/annotation_common.h"
+#include "core/fpdfapi/edit/cpdf_stringarchivestream.h"
+#include "core/fpdfapi/font/cpdf_font.h"
 #include "core/fpdfapi/font/cpdf_tounicodemap.h"
 #include "core/fpdfapi/page/cpdf_annotcontext.h"
 #include "core/fpdfapi/page/cpdf_page.h"
@@ -34,17 +43,27 @@
 #include "core/fpdfapi/parser/cpdf_stream.h"
 #include "core/fpdfapi/parser/cpdf_stream_acc.h"
 #include "core/fpdfapi/parser/cpdf_string.h"
+#include "core/fpdfdoc/cpdf_annot.h"
+#include "core/fpdfdoc/cpdf_annotfontmap.h"
+#include "core/fpdfdoc/cpdf_annotfontsubset.h"
+#include "core/fpdfdoc/cpdf_richtextwriter.h"
 #include "core/fxcrt/compiler_specific.h"
 #include "core/fxcrt/containers/contains.h"
 #include "core/fxcrt/fx_memcpy_wrappers.h"
 #include "core/fxcrt/fx_safe_types.h"
+#include "core/fxcrt/fx_stream.h"
+#include "core/fxcrt/fx_string_wrappers.h"
 #include "core/fxcrt/fx_system.h"
 #include "core/fxcrt/span.h"
 #include "core/fxge/cfx_defaultrenderdevice.h"
+#include "core/fxge/cfx_font.h"
+#include "core/fxge/cfx_fontregistry.h"
 #include "fpdfsdk/cpdfsdk_helpers.h"
 #include "public/cpp/fpdf_scopers.h"
+#include "public/epdf_font.h"
 #include "public/fpdf_attachment.h"
 #include "public/fpdf_edit.h"
+#include "public/fpdf_flatten.h"
 #include "public/fpdf_formfill.h"
 #include "public/fpdf_ppo.h"
 #include "public/fpdf_save.h"
@@ -52,6 +71,7 @@
 #include "public/fpdfview.h"
 #include "testing/embedder_test.h"
 #include "testing/embedder_test_constants.h"
+#include "testing/embedpdf_layer_fixture.h"
 #include "testing/fx_string_testhelpers.h"
 #include "testing/gmock/include/gmock/gmock-matchers.h"
 #include "testing/gtest/include/gtest/gtest.h"
@@ -89,6 +109,37 @@ std::vector<uint8_t> LoadNotoSansSCFontData() {
       "NotoSansCJK/NotoSansSC-Regular.subset.otf");
   if (font_path.empty()) {
     ADD_FAILURE() << "Failed to find NotoSansSC subset font";
+    return {};
+  }
+  return GetFileContents(font_path.c_str());
+}
+
+std::vector<uint8_t> LoadAmiriFontData() {
+  std::string font_path = PathService::GetThirdPartyFilePath(
+      "harfbuzz-ng/src/perf/fonts/Amiri-Regular.ttf");
+  if (font_path.empty()) {
+    ADD_FAILURE() << "Failed to find Amiri test font";
+    return {};
+  }
+  return GetFileContents(font_path.c_str());
+}
+
+std::vector<uint8_t> LoadRobotoVariableAbcFontData() {
+  std::string font_path = PathService::GetThirdPartyFilePath(
+      "harfbuzz-ng/src/test/subset/data/fonts/Roboto-Variable.ABC.ttf");
+  if (font_path.empty()) {
+    ADD_FAILURE() << "Failed to find Roboto-Variable.ABC test font";
+    return {};
+  }
+  return GetFileContents(font_path.c_str());
+}
+
+std::vector<uint8_t> LoadCffLatinFontData() {
+  // A small OpenType/CFF font (no CIDFont operators) with A, B, C.
+  std::string font_path = PathService::GetThirdPartyFilePath(
+      "harfbuzz-ng/src/test/subset/data/fonts/gpos1_2_font.otf");
+  if (font_path.empty()) {
+    ADD_FAILURE() << "Failed to find gpos1_2_font.otf";
     return {};
   }
   return GetFileContents(font_path.c_str());
@@ -151,31 +202,7 @@ class ScopedRegisteredFonts {
   ~ScopedRegisteredFonts() { EPDFFont_ClearRegisteredFonts(); }
 };
 
-class MemoryFileAccess final : public FPDF_FILEACCESS {
- public:
-  explicit MemoryFileAccess(std::vector<uint8_t> data) : data_(std::move(data)) {
-    m_FileLen = static_cast<unsigned long>(data_.size());
-    m_GetBlock = &MemoryFileAccess::GetBlock;
-    m_Param = this;
-  }
-
- private:
-  static int GetBlock(void* param,
-                      unsigned long pos,
-                      unsigned char* buf,
-                      unsigned long size) {
-    auto* file_access = static_cast<MemoryFileAccess*>(param);
-    if (!file_access || !buf || pos > file_access->data_.size() ||
-        size > file_access->data_.size() - pos) {
-      return 0;
-    }
-
-    std::copy_n(file_access->data_.data() + pos, size, buf);
-    return 1;
-  }
-
-  std::vector<uint8_t> data_;
-};
+using embedpdf_test::MemoryFileAccess;
 
 ByteString RegisteredFontAlias(EPDF_FONT_ID font_id) {
   return ByteString::Format("ERegF%u", font_id);
@@ -255,7 +282,9 @@ RetainPtr<const CPDF_Dictionary> GetAppearanceFontDict(
   return font_dict ? font_dict->GetDictFor(font_alias.AsStringView()) : nullptr;
 }
 
-bool AppearanceFontHasEmbeddedSubset(const CPDF_Dictionary* font_dict) {
+// A Type0 font written by EmbedPDF with an embedded TrueType program and a
+// ToUnicode map, subset or whole.
+bool AppearanceFontEmbedsProgram(const CPDF_Dictionary* font_dict) {
   if (!font_dict || font_dict->GetNameFor("Subtype") != "Type0" ||
       !font_dict->GetStreamFor("ToUnicode")) {
     return false;
@@ -271,12 +300,33 @@ bool AppearanceFontHasEmbeddedSubset(const CPDF_Dictionary* font_dict) {
       descendant_fonts->GetDictAt(0);
   RetainPtr<const CPDF_Dictionary> font_descriptor =
       cid_font_dict ? cid_font_dict->GetDictFor("FontDescriptor") : nullptr;
-  if (!font_descriptor || !font_descriptor->GetStreamFor("FontFile2")) {
+  return font_descriptor && font_descriptor->GetStreamFor("FontFile2");
+}
+
+bool AppearanceFontIsSubsetTagged(const CPDF_Dictionary* font_dict) {
+  ByteString base_font = font_dict ? font_dict->GetNameFor("BaseFont") : "";
+  return base_font.GetLength() > 7 && base_font[6] == '+';
+}
+
+bool AppearanceFontHasEmbeddedSubset(const CPDF_Dictionary* font_dict) {
+  return AppearanceFontEmbedsProgram(font_dict) &&
+         AppearanceFontIsSubsetTagged(font_dict);
+}
+
+// The whole program of |size| bytes, untagged (Embedding::kFull).
+bool AppearanceFontEmbedsWholeProgram(const CPDF_Dictionary* font_dict,
+                                      size_t size) {
+  if (!AppearanceFontEmbedsProgram(font_dict) ||
+      AppearanceFontIsSubsetTagged(font_dict)) {
     return false;
   }
-
-  ByteString base_font = font_dict->GetNameFor("BaseFont");
-  return base_font.GetLength() > 7 && base_font[6] == '+';
+  RetainPtr<const CPDF_Array> descendant_fonts =
+      font_dict->GetArrayFor("DescendantFonts");
+  RetainPtr<const CPDF_Dictionary> font_descriptor =
+      descendant_fonts->GetDictAt(0)->GetDictFor("FontDescriptor");
+  RetainPtr<const CPDF_Stream> program =
+      font_descriptor->GetStreamFor("FontFile2");
+  return program->GetDict()->GetIntegerFor("Length1") == static_cast<int>(size);
 }
 
 bool AppearanceFontMapsUnicode(const CPDF_Dictionary* font_dict,
@@ -291,14 +341,18 @@ bool AppearanceFontMapsUnicode(const CPDF_Dictionary* font_dict,
   return to_unicode_map.ReverseLookup(value) != 0;
 }
 
+// |expect_subset|: the DEFAULT embedding policy subsets annotation text and
+// embeds form field text whole (Phase C note §2).
 void ExpectRegisteredAppearanceMapsUnicode(
     FPDF_ANNOTATION annot,
     EPDF_FONT_ID font_id,
-    std::initializer_list<wchar_t> unicodes) {
+    std::initializer_list<wchar_t> unicodes,
+    bool expect_subset = true) {
   RetainPtr<const CPDF_Dictionary> font_dict =
       GetAppearanceFontDict(annot, RegisteredFontAlias(font_id));
   ASSERT_TRUE(font_dict);
-  EXPECT_TRUE(AppearanceFontHasEmbeddedSubset(font_dict.Get()));
+  EXPECT_TRUE(AppearanceFontEmbedsProgram(font_dict.Get()));
+  EXPECT_EQ(expect_subset, AppearanceFontIsSubsetTagged(font_dict.Get()));
   for (wchar_t unicode : unicodes) {
     EXPECT_TRUE(AppearanceFontMapsUnicode(font_dict.Get(), unicode));
   }
@@ -340,6 +394,117 @@ bool BitmapHasNonWhitePixels(FPDF_BITMAP bitmap) {
       size.ValueOrDie());
   return std::ranges::any_of(bytes,
                              [](uint8_t value) { return value != 0xff; });
+}
+
+// Every font the normal appearance names ("/X size Tf") is in its
+// /Resources /Font: an appearance never names a font it does not carry.
+void ExpectAppearanceFontsResolve(FPDF_ANNOTATION annot) {
+  const ByteString content = GetNormalAppearanceStreamBytes(annot);
+  std::vector<ByteString> tokens;
+  ByteString token;
+  for (char ch : content) {
+    if (ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t') {
+      if (!token.IsEmpty()) {
+        tokens.push_back(token);
+        token.clear();
+      }
+    } else {
+      token += ch;
+    }
+  }
+  if (!token.IsEmpty()) {
+    tokens.push_back(token);
+  }
+  int named = 0;
+  for (size_t i = 2; i < tokens.size(); ++i) {
+    if (tokens[i] != "Tf" || tokens[i - 2].GetLength() < 2 ||
+        tokens[i - 2][0] != '/') {
+      continue;
+    }
+    const ByteString alias = tokens[i - 2].Substr(1);
+    EXPECT_TRUE(GetAppearanceFontDict(annot, alias))
+        << "the appearance names /" << alias.c_str()
+        << " which its /Resources /Font lacks";
+    ++named;
+  }
+  EXPECT_GT(named, 0) << "no Tf in the appearance";
+}
+
+// Ink (dark pixels) of a page rendered at scale 1, inside or outside a
+// page-space rectangle. Anti-aliased text edges are grey; only clearly dark
+// pixels count, so a border-less box over a blank region has none until
+// glyphs are drawn.
+int DarkPixels(FPDF_BITMAP bitmap, const FS_RECTF& rect, bool inside) {
+  if (!bitmap) {
+    return 0;
+  }
+  const int width = FPDFBitmap_GetWidth(bitmap);
+  const int height = FPDFBitmap_GetHeight(bitmap);
+  const int stride = FPDFBitmap_GetStride(bitmap);
+  const uint8_t* buffer =
+      static_cast<const uint8_t*>(FPDFBitmap_GetBuffer(bitmap));
+  // Page space y grows upwards; the bitmap's grows downwards.
+  const float left = std::min(rect.left, rect.right);
+  const float right = std::max(rect.left, rect.right);
+  const float top = height - std::max(rect.top, rect.bottom);
+  const float bottom = height - std::min(rect.top, rect.bottom);
+  int count = 0;
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      const bool in_rect = x >= left && x < right && y >= top && y < bottom;
+      if (in_rect != inside) {
+        continue;
+      }
+      const uint8_t* px = buffer + y * stride + x * 4;  // BGRx
+      if (static_cast<int>(px[0]) + px[1] + px[2] < 3 * 96) {
+        ++count;
+      }
+    }
+  }
+  return count;
+}
+
+// The number of pixels that differ between two renderings of one page,
+// outside |rect|.
+int PixelsChangedOutside(FPDF_BITMAP before,
+                         FPDF_BITMAP after,
+                         const FS_RECTF& rect) {
+  if (!before || !after) {
+    return -1;
+  }
+  const int width = FPDFBitmap_GetWidth(before);
+  const int height = FPDFBitmap_GetHeight(before);
+  const int stride = FPDFBitmap_GetStride(before);
+  if (width != FPDFBitmap_GetWidth(after) ||
+      height != FPDFBitmap_GetHeight(after) ||
+      stride != FPDFBitmap_GetStride(after)) {
+    return -1;
+  }
+  const uint8_t* a = static_cast<const uint8_t*>(FPDFBitmap_GetBuffer(before));
+  const uint8_t* b = static_cast<const uint8_t*>(FPDFBitmap_GetBuffer(after));
+  const float left = std::min(rect.left, rect.right);
+  const float right = std::max(rect.left, rect.right);
+  const float top = height - std::max(rect.top, rect.bottom);
+  const float bottom = height - std::min(rect.top, rect.bottom);
+  int changed = 0;
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      if (x >= left && x < right && y >= top && y < bottom) {
+        continue;
+      }
+      const size_t at = y * stride + x * 4;
+      if (a[at] != b[at] || a[at + 1] != b[at + 1] || a[at + 2] != b[at + 2]) {
+        ++changed;
+      }
+    }
+  }
+  return changed;
+}
+
+std::string RichTextJsonFor(const char* family, int size, const char* text) {
+  return std::string("{\"body\":{\"family\":\"") + family +
+         "\",\"size\":" + std::to_string(size) +
+         "},\"paragraphs\":[{\"runs\":[{\"text\":\"" + text + "\"}]}]}";
 }
 
 void AddBrokenTrueTypeCjkTextPageContent(FPDF_DOCUMENT doc, FPDF_PAGE page) {
@@ -1209,6 +1374,3134 @@ TEST_F(FPDFAnnotEmbedderTest, FreeTextRegistersFontFromFileAccess) {
   EXPECT_LT(saved_pdf.size(), original_font_size / 2);
 }
 
+namespace {
+
+// A1 helpers: the /DR entry a /DA alias names, and its Type0 descriptor.
+RetainPtr<const CPDF_Dictionary> GetDrFontEntry(FPDF_DOCUMENT doc,
+                                                const ByteString& alias) {
+  CPDF_Document* cpdf_doc = CPDFDocumentFromFPDFDocument(doc);
+  const CPDF_Dictionary* root = cpdf_doc ? cpdf_doc->GetRoot() : nullptr;
+  RetainPtr<const CPDF_Dictionary> acroform =
+      root ? root->GetDictFor("AcroForm") : nullptr;
+  RetainPtr<const CPDF_Dictionary> dr =
+      acroform ? acroform->GetDictFor("DR") : nullptr;
+  RetainPtr<const CPDF_Dictionary> fonts =
+      dr ? dr->GetDictFor("Font") : nullptr;
+  return fonts ? fonts->GetDictFor(alias.AsStringView()) : nullptr;
+}
+
+RetainPtr<const CPDF_Dictionary> GetType0FontDescriptor(
+    const CPDF_Dictionary* font_dict) {
+  RetainPtr<const CPDF_Array> descendants =
+      font_dict ? font_dict->GetArrayFor("DescendantFonts") : nullptr;
+  RetainPtr<const CPDF_Dictionary> cid_font =
+      descendants ? descendants->GetDictAt(0) : nullptr;
+  return cid_font ? cid_font->GetDictFor("FontDescriptor") : nullptr;
+}
+
+// The FontFile2 stream the appearance's /DA font embeds or references.
+RetainPtr<const CPDF_Stream> DefaultAppearanceProgram(FPDF_ANNOTATION annot) {
+  RetainPtr<const CPDF_Dictionary> font =
+      GetAppearanceFontDict(annot, GetDefaultAppearanceFontAlias(annot));
+  if (!font) {
+    return nullptr;
+  }
+  RetainPtr<const CPDF_Dictionary> descriptor =
+      GetType0FontDescriptor(font.Get());
+  return descriptor ? descriptor->GetStreamFor("FontFile2") : nullptr;
+}
+
+constexpr char kRegisteredFontHintKey[] = "EmbedPDFRegisteredFontId";
+
+// A saved-file shape of an EmbedPDF registered font: Type0 with the family
+// identity in the descriptor and a session hint on the dictionary. No program
+// is needed to exercise resolution.
+RetainPtr<CPDF_Dictionary> MakeRegisteredFontDictForTest(CPDF_Document* doc,
+                                                         const char* family,
+                                                         int weight,
+                                                         bool italic,
+                                                         EPDF_FONT_ID hint) {
+  auto descriptor = doc->NewIndirect<CPDF_Dictionary>();
+  descriptor->SetNewFor<CPDF_Name>("Type", "FontDescriptor");
+  descriptor->SetNewFor<CPDF_String>("FontFamily", ByteString(family));
+  descriptor->SetNewFor<CPDF_Number>("FontWeight", weight);
+  descriptor->SetNewFor<CPDF_Number>("ItalicAngle", italic ? -12 : 0);
+  auto cid_font = doc->NewIndirect<CPDF_Dictionary>();
+  cid_font->SetNewFor<CPDF_Name>("Type", "Font");
+  cid_font->SetNewFor<CPDF_Name>("Subtype", "CIDFontType2");
+  cid_font->SetNewFor<CPDF_Reference>("FontDescriptor", doc,
+                                      descriptor->GetObjNum());
+  auto font = doc->NewIndirect<CPDF_Dictionary>();
+  font->SetNewFor<CPDF_Name>("Type", "Font");
+  font->SetNewFor<CPDF_Name>("Subtype", "Type0");
+  font->SetNewFor<CPDF_Array>("DescendantFonts")
+      ->AppendNew<CPDF_Reference>(doc, cid_font->GetObjNum());
+  font->SetNewFor<CPDF_String>(kRegisteredFontHintKey,
+                               ByteString::Format("%u", hint));
+  return font;
+}
+
+// The pre-A1 /DR marker: a descriptor-less /Type1 stub with the hint.
+RetainPtr<CPDF_Dictionary> MakeLegacyMarkerForTest(CPDF_Document* doc,
+                                                   const char* base_font,
+                                                   EPDF_FONT_ID hint) {
+  auto marker = doc->NewIndirect<CPDF_Dictionary>();
+  marker->SetNewFor<CPDF_Name>("Type", "Font");
+  marker->SetNewFor<CPDF_Name>("Subtype", "Type1");
+  marker->SetNewFor<CPDF_Name>("BaseFont", base_font);
+  marker->SetNewFor<CPDF_Name>("Encoding", "WinAnsiEncoding");
+  marker->SetNewFor<CPDF_String>(kRegisteredFontHintKey,
+                                 ByteString::Format("%u", hint));
+  return marker;
+}
+
+// sfnt table directory helpers for the A2 tests: locate a table, and rewrite
+// the OS/2 fsType field of an in-memory TrueType font.
+struct SfntTable {
+  uint32_t offset = 0;
+  uint32_t length = 0;
+};
+
+std::optional<SfntTable> FindSfntTable(pdfium::span<const uint8_t> font,
+                                       const char* tag) {
+  if (font.size() < 12) {
+    return std::nullopt;
+  }
+  const size_t num_tables = (font[4] << 8) | font[5];
+  for (size_t i = 0; i < num_tables; ++i) {
+    const size_t record = 12 + i * 16;
+    if (record + 16 > font.size()) {
+      return std::nullopt;
+    }
+    if (memcmp(font.data() + record, tag, 4) != 0) {
+      continue;
+    }
+    SfntTable table;
+    table.offset = (font[record + 8] << 24) | (font[record + 9] << 16) |
+                   (font[record + 10] << 8) | font[record + 11];
+    table.length = (font[record + 12] << 24) | (font[record + 13] << 16) |
+                   (font[record + 14] << 8) | font[record + 15];
+    return table;
+  }
+  return std::nullopt;
+}
+
+std::vector<uint8_t> WithFsType(std::vector<uint8_t> font, uint16_t fs_type) {
+  std::optional<SfntTable> os2 = FindSfntTable(font, "OS/2");
+  if (!os2.has_value() || os2->offset + 10 > font.size()) {
+    ADD_FAILURE() << "no OS/2 table";
+    return {};
+  }
+  font[os2->offset + 8] = static_cast<uint8_t>(fs_type >> 8);
+  font[os2->offset + 9] = static_cast<uint8_t>(fs_type & 0xff);
+  return font;
+}
+
+std::vector<uint8_t> EmbeddedFontProgram(const CPDF_Dictionary* font_dict) {
+  RetainPtr<const CPDF_Dictionary> descriptor =
+      GetType0FontDescriptor(font_dict);
+  RetainPtr<const CPDF_Stream> program =
+      descriptor ? descriptor->GetStreamFor("FontFile2") : nullptr;
+  if (!program) {
+    return {};
+  }
+  auto acc = pdfium::MakeRetain<CPDF_StreamAcc>(std::move(program));
+  acc->LoadAllDataFiltered();
+  pdfium::span<const uint8_t> span = acc->GetSpan();
+  return std::vector<uint8_t>(span.begin(), span.end());
+}
+
+RetainPtr<CPDF_Dictionary> GetMutableDrFontResources(FPDF_DOCUMENT doc) {
+  CPDF_Document* cpdf_doc = CPDFDocumentFromFPDFDocument(doc);
+  return cpdf_doc->GetMutableRoot()
+      ->GetOrCreateDictFor("AcroForm")
+      ->GetOrCreateDictFor("DR")
+      ->GetOrCreateDictFor("Font");
+}
+
+}  // namespace
+
+// A1: /DR names the real embedded font the appearance uses. Before the
+// appearance exists nothing is written to /DR (no descriptor-less marker,
+// which made Acrobat report "Bad parameter" on edit); afterwards the /DR
+// entry and the appearance's font resource are the same Type0 subset, whose
+// descriptor carries the family/weight identity and whose dictionary carries
+// the private session hint.
+TEST_F(FPDFAnnotEmbedderTest, FreeTextRegisteredFontInstallsRealDrEntry) {
+  ScopedRegisteredFonts scoped_fonts;
+
+  std::vector<uint8_t> font_data = LoadRobotoFontData();
+  ASSERT_FALSE(font_data.empty());
+  EPDF_FONT_ID font_id =
+      EPDFFont_RegisterMemFont64("Roboto", /*weight=*/400, /*italic=*/0,
+                                 font_data.data(), font_data.size());
+  ASSERT_NE(0u, font_id);
+
+  ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+  ASSERT_TRUE(doc);
+  ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 400, 400));
+  ASSERT_TRUE(page);
+  ScopedFPDFAnnotation annot(
+      FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+  ASSERT_TRUE(annot);
+  const FS_RECTF rect{50.0f, 250.0f, 350.0f, 320.0f};
+  ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+  ScopedFPDFWideString contents = GetFPDFWideString(L"ABC");
+  ASSERT_TRUE(
+      FPDFAnnot_SetStringValue(annot.get(), "Contents", contents.get()));
+  ASSERT_TRUE(EPDFAnnot_SetDefaultAppearanceRegisteredFont(annot.get(), font_id,
+                                                           18.0f, 0, 0, 0));
+
+  const ByteString alias = GetDefaultAppearanceFontAlias(annot.get());
+  EXPECT_EQ(RegisteredFontAlias(font_id), alias);
+  // No placeholder before the appearance is generated.
+  EXPECT_FALSE(GetDrFontEntry(doc.get(), alias));
+
+  ASSERT_TRUE(EPDFAnnot_GenerateAppearance(annot.get()));
+
+  RetainPtr<const CPDF_Dictionary> dr_entry = GetDrFontEntry(doc.get(), alias);
+  ASSERT_TRUE(dr_entry);
+  RetainPtr<const CPDF_Dictionary> ap_font =
+      GetAppearanceFontDict(annot.get(), alias);
+  ASSERT_TRUE(ap_font);
+  EXPECT_EQ(dr_entry.Get(), ap_font.Get());
+  EXPECT_TRUE(AppearanceFontHasEmbeddedSubset(dr_entry.Get()));
+  EXPECT_EQ(ByteString::Format("%u", font_id),
+            dr_entry->GetByteStringFor(kRegisteredFontHintKey));
+
+  RetainPtr<const CPDF_Dictionary> descriptor =
+      GetType0FontDescriptor(dr_entry.Get());
+  ASSERT_TRUE(descriptor);
+  EXPECT_EQ(L"Roboto", descriptor->GetUnicodeTextFor("FontFamily"));
+  EXPECT_EQ(400, descriptor->GetIntegerFor("FontWeight"));
+  EXPECT_EQ(0, descriptor->GetIntegerFor("ItalicAngle"));
+  EXPECT_TRUE(descriptor->GetStreamFor("FontFile2"));
+}
+
+// A1-1: a document saved in one session resolves the right face in a session
+// where the same fonts were registered in a different order (different ids).
+// Identity is the family in the descriptor, not the numeric hint or the alias.
+TEST_F(FPDFAnnotEmbedderTest,
+       FreeTextRegisteredFontResolvesByFamilyAfterReregistration) {
+  ScopedRegisteredFonts scoped_fonts;
+
+  std::vector<uint8_t> roboto = LoadRobotoFontData();
+  std::vector<uint8_t> amiri = LoadAmiriFontData();
+  ASSERT_FALSE(roboto.empty());
+  ASSERT_FALSE(amiri.empty());
+
+  // Session 1: Roboto first, Amiri second; author with Amiri (both cover
+  // Latin, so the glyphs alone cannot tell them apart).
+  EPDF_FONT_ID roboto_id = EPDFFont_RegisterMemFont64(
+      "Roboto", /*weight=*/400, /*italic=*/0, roboto.data(), roboto.size());
+  EPDF_FONT_ID amiri_id = EPDFFont_RegisterMemFont64(
+      "Amiri", /*weight=*/400, /*italic=*/0, amiri.data(), amiri.size());
+  ASSERT_NE(0u, roboto_id);
+  ASSERT_NE(0u, amiri_id);
+
+  std::string saved_pdf;
+  {
+    ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+    ASSERT_TRUE(doc);
+    ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 400, 400));
+    ASSERT_TRUE(page);
+    ScopedFPDFAnnotation annot(
+        FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+    ASSERT_TRUE(annot);
+    const FS_RECTF rect{50.0f, 250.0f, 350.0f, 320.0f};
+    ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+    ScopedFPDFWideString contents = GetFPDFWideString(L"ABC");
+    ASSERT_TRUE(
+        FPDFAnnot_SetStringValue(annot.get(), "Contents", contents.get()));
+    ASSERT_TRUE(EPDFAnnot_SetDefaultAppearanceRegisteredFont(
+        annot.get(), amiri_id, 18.0f, 0, 0, 0));
+    ASSERT_TRUE(EPDFAnnot_GenerateAppearance(annot.get()));
+
+    unsigned long saved_size = 0;
+    void* saved_buffer =
+        EPDF_SaveDocumentToOwnedBuffer(doc.get(), /*flags=*/0, &saved_size);
+    ASSERT_TRUE(saved_buffer);
+    saved_pdf.assign(static_cast<const char*>(saved_buffer), saved_size);
+    EPDF_FreeBuffer(saved_buffer);
+  }
+
+  // Session 2: the registry is cleared and the fonts come back in the other
+  // order, so every numeric id differs from the hint in the saved file.
+  EPDFFont_ClearRegisteredFonts();
+  EPDF_FONT_ID amiri_id_2 = EPDFFont_RegisterMemFont64(
+      "Amiri", /*weight=*/400, /*italic=*/0, amiri.data(), amiri.size());
+  EPDF_FONT_ID roboto_id_2 = EPDFFont_RegisterMemFont64(
+      "Roboto", /*weight=*/400, /*italic=*/0, roboto.data(), roboto.size());
+  ASSERT_NE(0u, amiri_id_2);
+  ASSERT_NE(0u, roboto_id_2);
+  ASSERT_NE(amiri_id, amiri_id_2);
+  ASSERT_NE(roboto_id, roboto_id_2);
+  ASSERT_EQ(roboto_id_2, amiri_id + 2u);  // the stale hint must not win by luck
+
+  ScopedFPDFDocument doc(FPDF_LoadMemDocument(
+      saved_pdf.data(), static_cast<int>(saved_pdf.size()), nullptr));
+  ASSERT_TRUE(doc);
+  ScopedFPDFPage page(FPDF_LoadPage(doc.get(), 0));
+  ASSERT_TRUE(page);
+  ASSERT_EQ(1, FPDFPage_GetAnnotCount(page.get()));
+  ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(page.get(), 0));
+  ASSERT_TRUE(annot);
+
+  const ByteString alias = GetDefaultAppearanceFontAlias(annot.get());
+  EXPECT_EQ(RegisteredFontAlias(amiri_id), alias);  // stale alias, still fine
+  ScopedFPDFWideString contents = GetFPDFWideString(L"ABD");
+  ASSERT_TRUE(
+      FPDFAnnot_SetStringValue(annot.get(), "Contents", contents.get()));
+  ASSERT_TRUE(EPDFAnnot_GenerateAppearance(annot.get()));
+
+  RetainPtr<const CPDF_Dictionary> ap_font =
+      GetAppearanceFontDict(annot.get(), alias);
+  ASSERT_TRUE(ap_font);
+  EXPECT_TRUE(AppearanceFontHasEmbeddedSubset(ap_font.Get()));
+  EXPECT_TRUE(ap_font->GetNameFor("BaseFont").Contains("Amiri"));
+  EXPECT_FALSE(ap_font->GetNameFor("BaseFont").Contains("Roboto"));
+  EXPECT_TRUE(AppearanceFontMapsUnicode(ap_font.Get(), 'D'));
+
+  // /DR follows the regenerated appearance.
+  RetainPtr<const CPDF_Dictionary> dr_entry = GetDrFontEntry(doc.get(), alias);
+  ASSERT_TRUE(dr_entry);
+  EXPECT_EQ(dr_entry.Get(), ap_font.Get());
+  EXPECT_EQ(ByteString::Format("%u", amiri_id_2),
+            dr_entry->GetByteStringFor(kRegisteredFontHintKey));
+}
+
+// Files saved before A1 carry a descriptor-less /Type1 marker in /DR. They
+// still resolve, and regenerating the appearance replaces the marker with the
+// real subset and drops the marker object.
+TEST_F(FPDFAnnotEmbedderTest, FreeTextLegacyMarkerDrEntryUpgradesToRealFont) {
+  ScopedRegisteredFonts scoped_fonts;
+
+  std::vector<uint8_t> font_data = LoadRobotoFontData();
+  ASSERT_FALSE(font_data.empty());
+  EPDF_FONT_ID font_id =
+      EPDFFont_RegisterMemFont64("Roboto", /*weight=*/400, /*italic=*/0,
+                                 font_data.data(), font_data.size());
+  ASSERT_NE(0u, font_id);
+
+  ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+  ASSERT_TRUE(doc);
+  ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 400, 400));
+  ASSERT_TRUE(page);
+
+  CPDF_Document* cpdf_doc = CPDFDocumentFromFPDFDocument(doc.get());
+  ASSERT_TRUE(cpdf_doc);
+  RetainPtr<CPDF_Dictionary> font_resources =
+      cpdf_doc->GetMutableRoot()
+          ->GetOrCreateDictFor("AcroForm")
+          ->GetOrCreateDictFor("DR")
+          ->GetOrCreateDictFor("Font");
+  const ByteString alias = RegisteredFontAlias(font_id);
+  auto marker = cpdf_doc->NewIndirect<CPDF_Dictionary>();
+  marker->SetNewFor<CPDF_Name>("Type", "Font");
+  marker->SetNewFor<CPDF_Name>("Subtype", "Type1");
+  marker->SetNewFor<CPDF_Name>("BaseFont", "Roboto");
+  marker->SetNewFor<CPDF_Name>("Encoding", "WinAnsiEncoding");
+  marker->SetNewFor<CPDF_String>(kRegisteredFontHintKey,
+                                 ByteString::Format("%u", font_id));
+  const uint32_t marker_obj_num = marker->GetObjNum();
+  font_resources->SetNewFor<CPDF_Reference>(alias, cpdf_doc, marker_obj_num);
+  // The same marker object under a second name: replacing one reference must
+  // not touch the other (unreachable-object cleanup is a save-time concern).
+  font_resources->SetNewFor<CPDF_Reference>("SharedMarker", cpdf_doc,
+                                            marker_obj_num);
+
+  ScopedFPDFAnnotation annot(
+      FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+  ASSERT_TRUE(annot);
+  const FS_RECTF rect{50.0f, 250.0f, 350.0f, 320.0f};
+  ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+  ScopedFPDFWideString contents = GetFPDFWideString(L"ABC");
+  ASSERT_TRUE(
+      FPDFAnnot_SetStringValue(annot.get(), "Contents", contents.get()));
+  const std::wstring da_text =
+      L"0 g /" + std::wstring(alias.begin(), alias.end()) + L" 18 Tf";
+  ScopedFPDFWideString da = GetFPDFWideString(da_text);
+  ASSERT_TRUE(FPDFAnnot_SetStringValue(annot.get(), "DA", da.get()));
+
+  ASSERT_TRUE(EPDFAnnot_GenerateAppearance(annot.get()));
+
+  RetainPtr<const CPDF_Dictionary> dr_entry = GetDrFontEntry(doc.get(), alias);
+  ASSERT_TRUE(dr_entry);
+  EXPECT_EQ("Type0", dr_entry->GetNameFor("Subtype"));
+  EXPECT_TRUE(AppearanceFontHasEmbeddedSubset(dr_entry.Get()));
+  EXPECT_EQ(dr_entry.Get(), GetAppearanceFontDict(annot.get(), alias).Get());
+  EXPECT_TRUE(AppearanceFontMapsUnicode(dr_entry.Get(), 'A'));
+  RetainPtr<const CPDF_Dictionary> shared =
+      GetDrFontEntry(doc.get(), "SharedMarker");
+  ASSERT_TRUE(shared);
+  EXPECT_EQ(marker_obj_num, shared->GetObjNum());
+  EXPECT_EQ("Type1", shared->GetNameFor("Subtype"));
+  EXPECT_TRUE(cpdf_doc->GetIndirectObject(marker_obj_num));
+}
+
+// Resolution is by the stored family; a numeric hint that points at some
+// other registered font never wins (ids are session-local and get reused).
+TEST_F(FPDFAnnotEmbedderTest, RegisteredFontResolutionPrefersStoredFamily) {
+  ScopedRegisteredFonts scoped_fonts;
+  std::vector<uint8_t> roboto = LoadRobotoFontData();
+  std::vector<uint8_t> amiri = LoadAmiriFontData();
+  ASSERT_FALSE(roboto.empty());
+  ASSERT_FALSE(amiri.empty());
+  EPDF_FONT_ID roboto_id = EPDFFont_RegisterMemFont64(
+      "Roboto", /*weight=*/400, /*italic=*/0, roboto.data(), roboto.size());
+  EPDF_FONT_ID amiri_id = EPDFFont_RegisterMemFont64(
+      "Amiri", /*weight=*/400, /*italic=*/0, amiri.data(), amiri.size());
+  ASSERT_NE(0u, roboto_id);
+  ASSERT_NE(0u, amiri_id);
+
+  ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+  CPDF_Document* cpdf_doc = CPDFDocumentFromFPDFDocument(doc.get());
+
+  // Requested family present, hint elsewhere: the family wins.
+  RetainPtr<CPDF_Dictionary> amiri_with_roboto_hint =
+      MakeRegisteredFontDictForTest(cpdf_doc, "Amiri", 400, false, roboto_id);
+  EXPECT_EQ(amiri_id, CPDF_AnnotFontSubset::ResolveRegisteredFont(
+                          amiri_with_roboto_hint.Get()));
+
+  // Exact family spelling outranks a normalised match.
+  EPDF_FONT_ID noto_spaced = EPDFFont_RegisterMemFont64(
+      "Noto Sans", /*weight=*/400, /*italic=*/0, roboto.data(), roboto.size());
+  EPDF_FONT_ID noto_joined = EPDFFont_RegisterMemFont64(
+      "NotoSans", /*weight=*/400, /*italic=*/0, roboto.data(), roboto.size());
+  ASSERT_NE(0u, noto_spaced);
+  ASSERT_NE(0u, noto_joined);
+  RetainPtr<CPDF_Dictionary> joined =
+      MakeRegisteredFontDictForTest(cpdf_doc, "NotoSans", 400, false, 0);
+  EXPECT_EQ(noto_joined,
+            CPDF_AnnotFontSubset::ResolveRegisteredFont(joined.Get()));
+  RetainPtr<CPDF_Dictionary> spaced =
+      MakeRegisteredFontDictForTest(cpdf_doc, "Noto Sans", 400, false, 0);
+  EXPECT_EQ(noto_spaced,
+            CPDF_AnnotFontSubset::ResolveRegisteredFont(spaced.Get()));
+}
+
+TEST_F(FPDFAnnotEmbedderTest, RegisteredFontResolutionRefusesConflictingHint) {
+  ScopedRegisteredFonts scoped_fonts;
+  std::vector<uint8_t> roboto = LoadRobotoFontData();
+  ASSERT_FALSE(roboto.empty());
+  EPDF_FONT_ID roboto_id = EPDFFont_RegisterMemFont64(
+      "Roboto", /*weight=*/400, /*italic=*/0, roboto.data(), roboto.size());
+  ASSERT_NE(0u, roboto_id);
+
+  ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+  CPDF_Document* cpdf_doc = CPDFDocumentFromFPDFDocument(doc.get());
+
+  // Requested family absent, hint points at a live but different font.
+  RetainPtr<CPDF_Dictionary> saved_amiri =
+      MakeRegisteredFontDictForTest(cpdf_doc, "Amiri", 400, false, roboto_id);
+  EXPECT_FALSE(CPDF_AnnotFontSubset::ResolveRegisteredFont(saved_amiri.Get()));
+
+  // Legacy marker: /BaseFont is the identity, a conflicting hint loses.
+  RetainPtr<CPDF_Dictionary> marker_amiri =
+      MakeLegacyMarkerForTest(cpdf_doc, "Amiri", roboto_id);
+  EXPECT_FALSE(CPDF_AnnotFontSubset::ResolveRegisteredFont(marker_amiri.Get()));
+  RetainPtr<CPDF_Dictionary> marker_roboto =
+      MakeLegacyMarkerForTest(cpdf_doc, "Roboto", roboto_id);
+  EXPECT_EQ(roboto_id,
+            CPDF_AnnotFontSubset::ResolveRegisteredFont(marker_roboto.Get()));
+  // A marker whose base font is registered under another id resolves by name.
+  RetainPtr<CPDF_Dictionary> marker_stale_hint =
+      MakeLegacyMarkerForTest(cpdf_doc, "Roboto", roboto_id + 1000);
+  EXPECT_EQ(roboto_id, CPDF_AnnotFontSubset::ResolveRegisteredFont(
+                           marker_stale_hint.Get()));
+}
+
+// A stale /DA alias from another session can spell the same name a fallback
+// font would take in this session; the appearance must still give every
+// entry its own resource name.
+TEST_F(FPDFAnnotEmbedderTest,
+       FreeTextFallbackAliasNeverCollidesWithStaleDaAlias) {
+  ScopedRegisteredFonts scoped_fonts;
+  std::vector<uint8_t> roboto = LoadRobotoFontData();
+  ASSERT_FALSE(roboto.empty());
+  EPDF_FONT_ID roboto_id = EPDFFont_RegisterMemFont64(
+      "Roboto", /*weight=*/400, /*italic=*/0, roboto.data(), roboto.size());
+  ASSERT_NE(0u, roboto_id);
+  EPDF_FONT_ID droid_id = RegisterDroidSansFallbackFullFont();
+  ASSERT_NE(0u, droid_id);
+
+  ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+  ASSERT_TRUE(doc);
+  ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 400, 400));
+  ASSERT_TRUE(page);
+  ScopedFPDFAnnotation annot(
+      FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+  ASSERT_TRUE(annot);
+  const FS_RECTF rect{50.0f, 320.0f, 350.0f, 250.0f};
+  ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+  ScopedFPDFWideString latin = GetFPDFWideString(L"ABC");
+  ASSERT_TRUE(FPDFAnnot_SetStringValue(annot.get(), "Contents", latin.get()));
+  ASSERT_TRUE(EPDFAnnot_SetDefaultAppearanceRegisteredFont(
+      annot.get(), roboto_id, 18.0f, 0, 0, 0));
+  ASSERT_TRUE(EPDFAnnot_GenerateAppearance(annot.get()));
+
+  // Simulate the other session: the Roboto entry lives under the name the
+  // Droid fallback would take here.
+  const ByteString stale_alias = RegisteredFontAlias(droid_id);
+  RetainPtr<CPDF_Dictionary> font_resources =
+      GetMutableDrFontResources(doc.get());
+  RetainPtr<const CPDF_Dictionary> roboto_entry =
+      GetDrFontEntry(doc.get(), RegisteredFontAlias(roboto_id));
+  ASSERT_TRUE(roboto_entry);
+  font_resources->SetNewFor<CPDF_Reference>(
+      stale_alias, CPDFDocumentFromFPDFDocument(doc.get()),
+      roboto_entry->GetObjNum());
+  font_resources->RemoveFor(RegisteredFontAlias(roboto_id).AsStringView());
+  const std::wstring da_text =
+      L"0 g /" + std::wstring(stale_alias.begin(), stale_alias.end()) +
+      L" 18 Tf";
+  ScopedFPDFWideString da = GetFPDFWideString(da_text);
+  ASSERT_TRUE(FPDFAnnot_SetStringValue(annot.get(), "DA", da.get()));
+
+  ScopedFPDFWideString mixed = GetFPDFWideString(L"AB\xD55C\xAE00");
+  ASSERT_TRUE(FPDFAnnot_SetStringValue(annot.get(), "Contents", mixed.get()));
+  ASSERT_TRUE(EPDFAnnot_GenerateAppearance(annot.get()));
+
+  RetainPtr<const CPDF_Dictionary> default_font =
+      GetAppearanceFontDict(annot.get(), stale_alias);
+  ASSERT_TRUE(default_font);
+  EXPECT_TRUE(default_font->GetNameFor("BaseFont").Contains("Roboto"));
+  EXPECT_TRUE(AppearanceFontMapsUnicode(default_font.Get(), 'A'));
+  RetainPtr<const CPDF_Dictionary> fallback_font =
+      GetAppearanceFontDict(annot.get(), stale_alias + "_1");
+  ASSERT_TRUE(fallback_font);
+  EXPECT_TRUE(fallback_font->GetNameFor("BaseFont").Contains("DroidSans"));
+  EXPECT_TRUE(AppearanceFontMapsUnicode(fallback_font.Get(), L'\xD55C'));
+  EXPECT_NE(default_font.Get(), fallback_font.Get());
+}
+
+// An empty annotation still needs its /DA font in /DR, or the font identity
+// is lost on save; the minimal resource carries it across a reopen.
+TEST_F(FPDFAnnotEmbedderTest,
+       FreeTextEmptyContentsKeepsRegisteredDaFontAcrossSave) {
+  ScopedRegisteredFonts scoped_fonts;
+  std::vector<uint8_t> roboto = LoadRobotoFontData();
+  std::vector<uint8_t> amiri = LoadAmiriFontData();
+  ASSERT_FALSE(roboto.empty());
+  ASSERT_FALSE(amiri.empty());
+  EPDF_FONT_ID roboto_id = EPDFFont_RegisterMemFont64(
+      "Roboto", /*weight=*/400, /*italic=*/0, roboto.data(), roboto.size());
+  ASSERT_NE(0u, roboto_id);
+
+  std::string saved_pdf;
+  {
+    ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+    ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 400, 400));
+    ScopedFPDFAnnotation annot(
+        FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+    ASSERT_TRUE(annot);
+    const FS_RECTF rect{50.0f, 320.0f, 350.0f, 250.0f};
+    ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+    ScopedFPDFWideString empty = GetFPDFWideString(L"");
+    ASSERT_TRUE(FPDFAnnot_SetStringValue(annot.get(), "Contents", empty.get()));
+    ASSERT_TRUE(EPDFAnnot_SetDefaultAppearanceRegisteredFont(
+        annot.get(), roboto_id, 18.0f, 0, 0, 0));
+    ASSERT_TRUE(EPDFAnnot_GenerateAppearance(annot.get()));
+
+    RetainPtr<const CPDF_Dictionary> dr_entry =
+        GetDrFontEntry(doc.get(), RegisteredFontAlias(roboto_id));
+    ASSERT_TRUE(dr_entry);
+    EXPECT_EQ("Type0", dr_entry->GetNameFor("Subtype"));
+    RetainPtr<const CPDF_Dictionary> descriptor =
+        GetType0FontDescriptor(dr_entry.Get());
+    ASSERT_TRUE(descriptor);
+    EXPECT_EQ(L"Roboto", descriptor->GetUnicodeTextFor("FontFamily"));
+    RetainPtr<const CPDF_Stream> program =
+        descriptor->GetStreamFor("FontFile2");
+    ASSERT_TRUE(program);
+    // Minimal means minimal: glyph 0 only, not the whole program.
+    EXPECT_LT(program->GetRawSize(), roboto.size() / 10);
+
+    unsigned long saved_size = 0;
+    void* saved_buffer =
+        EPDF_SaveDocumentToOwnedBuffer(doc.get(), /*flags=*/0, &saved_size);
+    ASSERT_TRUE(saved_buffer);
+    saved_pdf.assign(static_cast<const char*>(saved_buffer), saved_size);
+    EPDF_FreeBuffer(saved_buffer);
+  }
+
+  EPDFFont_ClearRegisteredFonts();
+  ASSERT_NE(0u, EPDFFont_RegisterMemFont64("Amiri", 400, 0, amiri.data(),
+                                           amiri.size()));
+  EPDF_FONT_ID roboto_id_2 = EPDFFont_RegisterMemFont64(
+      "Roboto", /*weight=*/400, /*italic=*/0, roboto.data(), roboto.size());
+  ASSERT_NE(roboto_id, roboto_id_2);
+
+  ScopedFPDFDocument doc(FPDF_LoadMemDocument(
+      saved_pdf.data(), static_cast<int>(saved_pdf.size()), nullptr));
+  ASSERT_TRUE(doc);
+  ScopedFPDFPage page(FPDF_LoadPage(doc.get(), 0));
+  ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(page.get(), 0));
+  ASSERT_TRUE(annot);
+  ScopedFPDFWideString contents = GetFPDFWideString(L"ABC");
+  ASSERT_TRUE(
+      FPDFAnnot_SetStringValue(annot.get(), "Contents", contents.get()));
+  ASSERT_TRUE(EPDFAnnot_GenerateAppearance(annot.get()));
+  RetainPtr<const CPDF_Dictionary> ap_font =
+      GetAppearanceFontDict(annot.get(), RegisteredFontAlias(roboto_id));
+  ASSERT_TRUE(ap_font);
+  EXPECT_TRUE(ap_font->GetNameFor("BaseFont").Contains("Roboto"));
+  EXPECT_TRUE(AppearanceFontMapsUnicode(ap_font.Get(), 'A'));
+}
+
+// Text drawn entirely by a fallback font still keeps the /DA font's identity
+// in /DR, and the fallback resource renders the text.
+TEST_F(FPDFAnnotEmbedderTest, FreeTextAllFallbackTextKeepsRegisteredDaFont) {
+  ScopedRegisteredFonts scoped_fonts;
+  std::vector<uint8_t> roboto = LoadRobotoFontData();
+  ASSERT_FALSE(roboto.empty());
+  EPDF_FONT_ID roboto_id = EPDFFont_RegisterMemFont64(
+      "Roboto", /*weight=*/400, /*italic=*/0, roboto.data(), roboto.size());
+  ASSERT_NE(0u, roboto_id);
+  EPDF_FONT_ID droid_id = RegisterDroidSansFallbackFullFont();
+  ASSERT_NE(0u, droid_id);
+
+  ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+  ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 400, 400));
+  ScopedFPDFAnnotation annot(
+      FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+  ASSERT_TRUE(annot);
+  const FS_RECTF rect{50.0f, 320.0f, 350.0f, 250.0f};
+  ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+  ScopedFPDFWideString korean = GetFPDFWideString(L"\xD55C\xAE00");
+  ASSERT_TRUE(FPDFAnnot_SetStringValue(annot.get(), "Contents", korean.get()));
+  ASSERT_TRUE(EPDFAnnot_SetDefaultAppearanceRegisteredFont(
+      annot.get(), roboto_id, 18.0f, 0, 0, 0));
+  ASSERT_TRUE(EPDFAnnot_GenerateAppearance(annot.get()));
+
+  RetainPtr<const CPDF_Dictionary> dr_entry =
+      GetDrFontEntry(doc.get(), RegisteredFontAlias(roboto_id));
+  ASSERT_TRUE(dr_entry);
+  EXPECT_EQ("Type0", dr_entry->GetNameFor("Subtype"));
+  EXPECT_EQ(
+      L"Roboto",
+      GetType0FontDescriptor(dr_entry.Get())->GetUnicodeTextFor("FontFamily"));
+  EXPECT_EQ(
+      dr_entry.Get(),
+      GetAppearanceFontDict(annot.get(), RegisteredFontAlias(roboto_id)).Get());
+  ExpectRegisteredAppearanceMapsUnicode(annot.get(), droid_id,
+                                        {L'\xD55C', L'\xAE00'});
+}
+
+// Regenerating one annotation never rewrites another's appearance resources.
+TEST_F(FPDFAnnotEmbedderTest, FreeTextRegeneratingOneAnnotationLeavesTheOther) {
+  ScopedRegisteredFonts scoped_fonts;
+  std::vector<uint8_t> roboto = LoadRobotoFontData();
+  ASSERT_FALSE(roboto.empty());
+  EPDF_FONT_ID roboto_id = EPDFFont_RegisterMemFont64(
+      "Roboto", /*weight=*/400, /*italic=*/0, roboto.data(), roboto.size());
+  ASSERT_NE(0u, roboto_id);
+  const ByteString alias = RegisteredFontAlias(roboto_id);
+
+  ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+  ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 400, 400));
+  auto make = [&](const wchar_t* text, float top) {
+    ScopedFPDFAnnotation annot(
+        FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+    const FS_RECTF rect{50.0f, top, 350.0f, top - 60.0f};
+    EXPECT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+    ScopedFPDFWideString contents = GetFPDFWideString(text);
+    EXPECT_TRUE(
+        FPDFAnnot_SetStringValue(annot.get(), "Contents", contents.get()));
+    EXPECT_TRUE(EPDFAnnot_SetDefaultAppearanceRegisteredFont(
+        annot.get(), roboto_id, 18.0f, 0, 0, 0));
+    EXPECT_TRUE(EPDFAnnot_GenerateAppearance(annot.get()));
+    return annot;
+  };
+  ScopedFPDFAnnotation first = make(L"ABC", 380.0f);
+  ScopedFPDFAnnotation second = make(L"DEF", 300.0f);
+  RetainPtr<const CPDF_Dictionary> first_font =
+      GetAppearanceFontDict(first.get(), alias);
+  ASSERT_TRUE(first_font);
+  const uint32_t first_font_obj = first_font->GetObjNum();
+
+  ScopedFPDFWideString longer = GetFPDFWideString(L"DEFG");
+  ASSERT_TRUE(FPDFAnnot_SetStringValue(second.get(), "Contents", longer.get()));
+  ASSERT_TRUE(EPDFAnnot_GenerateAppearance(second.get()));
+
+  RetainPtr<const CPDF_Dictionary> first_font_after =
+      GetAppearanceFontDict(first.get(), alias);
+  ASSERT_TRUE(first_font_after);
+  EXPECT_EQ(first_font_obj, first_font_after->GetObjNum());
+  EXPECT_TRUE(AppearanceFontMapsUnicode(first_font_after.Get(), 'A'));
+  EXPECT_FALSE(AppearanceFontMapsUnicode(first_font_after.Get(), 'G'));
+  RetainPtr<const CPDF_Dictionary> second_font =
+      GetAppearanceFontDict(second.get(), alias);
+  ASSERT_TRUE(second_font);
+  EXPECT_TRUE(AppearanceFontMapsUnicode(second_font.Get(), 'G'));
+  // /DR follows the last generated appearance.
+  EXPECT_EQ(second_font.Get(), GetDrFontEntry(doc.get(), alias).Get());
+}
+
+// Rendering an annotation that has no appearance yet must not write /DR.
+TEST_F(FPDFAnnotEmbedderTest, FreeTextEphemeralAppearanceLeavesDrUntouched) {
+  ScopedRegisteredFonts scoped_fonts;
+  std::vector<uint8_t> roboto = LoadRobotoFontData();
+  ASSERT_FALSE(roboto.empty());
+  EPDF_FONT_ID roboto_id = EPDFFont_RegisterMemFont64(
+      "Roboto", /*weight=*/400, /*italic=*/0, roboto.data(), roboto.size());
+  ASSERT_NE(0u, roboto_id);
+
+  ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+  ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 400, 400));
+  ASSERT_TRUE(page);
+  ScopedFPDFAnnotation annot(
+      FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+  ASSERT_TRUE(annot);
+  const FS_RECTF rect{50.0f, 320.0f, 350.0f, 250.0f};
+  ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+  ScopedFPDFWideString contents = GetFPDFWideString(L"ABC");
+  ASSERT_TRUE(
+      FPDFAnnot_SetStringValue(annot.get(), "Contents", contents.get()));
+  ASSERT_TRUE(EPDFAnnot_SetDefaultAppearanceRegisteredFont(
+      annot.get(), roboto_id, 18.0f, 0, 0, 0));
+  EXPECT_FALSE(GetDrFontEntry(doc.get(), RegisteredFontAlias(roboto_id)));
+
+  ScopedFPDFBitmap bitmap =
+      EmbedderTest::RenderPageWithFlags(page.get(), nullptr, FPDF_ANNOT);
+  ASSERT_TRUE(bitmap);
+  EXPECT_FALSE(GetDrFontEntry(doc.get(), RegisteredFontAlias(roboto_id)));
+  EXPECT_TRUE(GetNormalAppearanceStreamBytes(annot.get()).IsEmpty());
+}
+
+// Widgets share the resolution path: their /DR entry is the real font too.
+TEST_F(FPDFAnnotEmbedderTest, WidgetRegisteredFontInstallsRealDrEntry) {
+  ScopedRegisteredFonts scoped_fonts;
+  std::vector<uint8_t> roboto = LoadRobotoFontData();
+  ASSERT_FALSE(roboto.empty());
+  EPDF_FONT_ID roboto_id = EPDFFont_RegisterMemFont64(
+      "Roboto", /*weight=*/400, /*italic=*/0, roboto.data(), roboto.size());
+  ASSERT_NE(0u, roboto_id);
+  const ByteString alias = RegisteredFontAlias(roboto_id);
+
+  CreateEmptyDocument();
+  {
+    ScopedFPDFPage page(FPDFPage_New(document(), 0, 400, 400));
+    ASSERT_TRUE(page);
+    ScopedFPDFAnnotation annot(
+        EPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_WIDGET));
+    ASSERT_TRUE(annot);
+    const FS_RECTF rect{50.0f, 320.0f, 350.0f, 250.0f};
+    ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+    ASSERT_TRUE(EPDFAnnot_SetDefaultAppearanceRegisteredFont(
+        annot.get(), roboto_id, 12.0f, 0, 0, 0));
+
+    ScopedFPDFWideString field_name = GetFPDFWideString(L"roboto_text");
+    const uint32_t field = EPDFForm_CreateField(
+        document(), 4 /* EPDF_FORMFIELD_FAMILY_TEXT */, field_name.get());
+    ASSERT_GT(field, 0u);
+    ASSERT_TRUE(EPDFForm_AttachWidget(
+        document(), field, EPDFAnnot_GetObjectNumber(annot.get()), nullptr));
+    ScopedFPDFWideString value = GetFPDFWideString(L"hello");
+    ASSERT_TRUE(EPDFForm_SetTextValue(document(), field, value.get(), nullptr,
+                                      0, nullptr));
+    ASSERT_TRUE(EPDFAnnot_GenerateFormFieldAP(annot.get()));
+
+    RetainPtr<const CPDF_Dictionary> dr_entry =
+        GetDrFontEntry(document(), alias);
+    ASSERT_TRUE(dr_entry);
+    // Form field text is embedded whole under the DEFAULT policy (Phase C
+    // note §2): the program is shared by every widget that fills in later.
+    EXPECT_TRUE(
+        AppearanceFontEmbedsWholeProgram(dr_entry.Get(), roboto.size()));
+    EXPECT_EQ(dr_entry.Get(), GetAppearanceFontDict(annot.get(), alias).Get());
+    EXPECT_TRUE(AppearanceFontMapsUnicode(dr_entry.Get(), 'h'));
+    EXPECT_EQ(L"Roboto", GetType0FontDescriptor(dr_entry.Get())
+                             ->GetUnicodeTextFor("FontFamily"));
+  }
+  CloseDocument();
+}
+
+// Redaction labels share it as well.
+TEST_F(FPDFAnnotEmbedderTest, RedactLabelRegisteredFontInstallsRealDrEntry) {
+  ScopedRegisteredFonts scoped_fonts;
+  std::vector<uint8_t> roboto = LoadRobotoFontData();
+  ASSERT_FALSE(roboto.empty());
+  EPDF_FONT_ID roboto_id = EPDFFont_RegisterMemFont64(
+      "Roboto", /*weight=*/400, /*italic=*/0, roboto.data(), roboto.size());
+  ASSERT_NE(0u, roboto_id);
+
+  ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+  ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 200, 200));
+  {
+    ScopedFPDFAnnotation annot =
+        CreateRedactAnnot(page.get(), {20, 150, 180, 50});
+    ASSERT_TRUE(annot);
+    ScopedFPDFWideString text = GetFPDFWideString(L"SECRET");
+    ASSERT_TRUE(EPDFAnnot_SetOverlayText(annot.get(), text.get()));
+    ASSERT_TRUE(EPDFAnnot_SetDefaultAppearanceRegisteredFont(
+        annot.get(), roboto_id, 12.0f, 255, 255, 255));
+    ASSERT_TRUE(EPDFAnnot_ApplyRedaction(page.get(), annot.get(), nullptr));
+  }
+  RetainPtr<const CPDF_Dictionary> dr_entry =
+      GetDrFontEntry(doc.get(), RegisteredFontAlias(roboto_id));
+  ASSERT_TRUE(dr_entry);
+  EXPECT_TRUE(AppearanceFontHasEmbeddedSubset(dr_entry.Get()));
+  EXPECT_TRUE(AppearanceFontMapsUnicode(dr_entry.Get(), 'S'));
+  EXPECT_EQ(
+      L"Roboto",
+      GetType0FontDescriptor(dr_entry.Get())->GetUnicodeTextFor("FontFamily"));
+}
+
+// Opt-in fixture for the manual Acrobat check of A1 (a FreeText in a
+// registered font whose /DR entry is the real subset). Skipped unless
+// EPDF_A1_FIXTURE_FONT (a TrueType file, e.g. Noto Sans) and
+// EPDF_A1_FIXTURE_PATH (output PDF) are set; EPDF_A1_FIXTURE_FAMILY names the
+// family Acrobat should re-resolve (default "Noto Sans").
+TEST_F(FPDFAnnotEmbedderTest, WriteA1AcrobatFixtureFromEnv) {
+  const char* font_path = getenv("EPDF_A1_FIXTURE_FONT");
+  const char* out_path = getenv("EPDF_A1_FIXTURE_PATH");
+  if (!font_path || !out_path) {
+    GTEST_SKIP() << "set EPDF_A1_FIXTURE_FONT and EPDF_A1_FIXTURE_PATH";
+  }
+  const char* family_env = getenv("EPDF_A1_FIXTURE_FAMILY");
+  const std::string family = family_env ? family_env : "Noto Sans";
+  // EPDF_A1_FIXTURE_TEXT="" writes an empty box: the minimal glyph-0 resource
+  // that keeps the /DA font's identity, for Acrobat to validate.
+  const char* text_env = getenv("EPDF_A1_FIXTURE_TEXT");
+  const std::string text = text_env ? text_env : "Hello";
+
+  ScopedRegisteredFonts scoped_fonts;
+  std::vector<uint8_t> font_data = GetFileContents(font_path);
+  ASSERT_FALSE(font_data.empty());
+  EPDF_FONT_ID font_id =
+      EPDFFont_RegisterMemFont64(family.c_str(), /*weight=*/400, /*italic=*/0,
+                                 font_data.data(), font_data.size());
+  ASSERT_NE(0u, font_id);
+
+  ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+  ASSERT_TRUE(doc);
+  ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 612, 792));
+  ASSERT_TRUE(page);
+  ScopedFPDFAnnotation annot(
+      FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+  ASSERT_TRUE(annot);
+  // FS_RECTF is {left, top, right, bottom}; keep the rect normalised so the
+  // fixture is exactly what Acrobat expects to see.
+  const FS_RECTF rect{72.0f, 650.0f, 420.0f, 570.0f};
+  ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+  ScopedFPDFWideString contents =
+      GetFPDFWideString(std::wstring(text.begin(), text.end()));
+  ASSERT_TRUE(
+      FPDFAnnot_SetStringValue(annot.get(), "Contents", contents.get()));
+  ASSERT_TRUE(EPDFAnnot_SetDefaultAppearanceRegisteredFont(annot.get(), font_id,
+                                                           24.0f, 0, 0, 0));
+  ASSERT_TRUE(EPDFAnnot_GenerateAppearance(annot.get()));
+  ASSERT_TRUE(FPDFPage_GenerateContent(page.get()));
+
+  unsigned long saved_size = 0;
+  void* saved_buffer =
+      EPDF_SaveDocumentToOwnedBuffer(doc.get(), /*flags=*/0, &saved_size);
+  ASSERT_TRUE(saved_buffer);
+  std::ofstream out(out_path, std::ios::binary);
+  out.write(static_cast<const char*>(saved_buffer), saved_size);
+  EPDF_FreeBuffer(saved_buffer);
+  ASSERT_TRUE(out.good());
+}
+
+// A2: fsType is read at registration. Restricted and bitmap-only licences
+// are refused; preview-and-print registers but may not author until the app
+// asserts a licence; editable and installable author freely.
+TEST_F(FPDFAnnotEmbedderTest, RegistryHonoursFsTypeEmbeddingPermissions) {
+  ScopedRegisteredFonts scoped_fonts;
+  std::vector<uint8_t> roboto = LoadRobotoFontData();
+  ASSERT_FALSE(roboto.empty());
+  ASSERT_TRUE(FindSfntTable(roboto, "OS/2").has_value());
+
+  auto register_with = [&](uint16_t fs_type) {
+    std::vector<uint8_t> font = WithFsType(roboto, fs_type);
+    return EPDFFont_RegisterMemFont64("Roboto", /*weight=*/400, /*italic=*/0,
+                                      font.data(), font.size());
+  };
+
+  EXPECT_EQ(0u, register_with(0x0002));  // restricted
+  EXPECT_EQ(0u, register_with(0x0200));  // bitmap only
+  EXPECT_EQ(0u, register_with(0x0202));  // bitmap only wins over any level
+
+  EPDF_FONT_ID installable = register_with(0x0000);
+  ASSERT_NE(0u, installable);
+  EXPECT_EQ(EPDF_FONT_EMBEDDING_INSTALLABLE,
+            EPDFFont_GetEmbeddingPermission(installable));
+  EXPECT_TRUE(EPDFFont_IsEditingAuthorized(installable));
+
+  EPDF_FONT_ID editable = register_with(0x0008);
+  ASSERT_NE(0u, editable);
+  EXPECT_EQ(EPDF_FONT_EMBEDDING_EDITABLE,
+            EPDFFont_GetEmbeddingPermission(editable));
+  EXPECT_TRUE(EPDFFont_IsEditingAuthorized(editable));
+
+  // Several level bits set: the least restrictive applies.
+  EPDF_FONT_ID mixed = register_with(0x000E);
+  ASSERT_NE(0u, mixed);
+  EXPECT_EQ(EPDF_FONT_EMBEDDING_EDITABLE,
+            EPDFFont_GetEmbeddingPermission(mixed));
+
+  EPDF_FONT_ID preview = register_with(0x0004);
+  ASSERT_NE(0u, preview);
+  EXPECT_EQ(EPDF_FONT_EMBEDDING_PREVIEW_AND_PRINT,
+            EPDFFont_GetEmbeddingPermission(preview));
+  EXPECT_FALSE(EPDFFont_IsEditingAuthorized(preview));
+  EXPECT_EQ(-1, EPDFFont_GetEmbeddingPermission(preview + 1000));
+  EXPECT_FALSE(EPDFFont_AuthorizeEditing(preview + 1000));
+
+  ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+  ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 400, 400));
+  ScopedFPDFAnnotation annot(
+      FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+  ASSERT_TRUE(annot);
+  const FS_RECTF rect{50.0f, 320.0f, 350.0f, 250.0f};
+  ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+  ScopedFPDFWideString contents = GetFPDFWideString(L"ABC");
+  ASSERT_TRUE(
+      FPDFAnnot_SetStringValue(annot.get(), "Contents", contents.get()));
+
+  // Preview-and-print may not author…
+  EXPECT_FALSE(EPDFAnnot_SetDefaultAppearanceRegisteredFont(
+      annot.get(), preview, 18.0f, 0, 0, 0));
+  // …until the app asserts a licence.
+  EXPECT_TRUE(EPDFFont_AuthorizeEditing(preview));
+  EXPECT_TRUE(EPDFFont_IsEditingAuthorized(preview));
+  EXPECT_TRUE(EPDFAnnot_SetDefaultAppearanceRegisteredFont(annot.get(), preview,
+                                                           18.0f, 0, 0, 0));
+  EXPECT_TRUE(EPDFAnnot_GenerateAppearance(annot.get()));
+  EXPECT_TRUE(AppearanceFontHasEmbeddedSubset(
+      GetAppearanceFontDict(annot.get(), RegisteredFontAlias(preview)).Get()));
+}
+
+// A preview-and-print fallback font renders existing page text but is not
+// used to write new text until authorized.
+TEST_F(FPDFAnnotEmbedderTest,
+       PreviewAndPrintFallbackDoesNotAuthorUntilAuthorized) {
+  ScopedRegisteredFonts scoped_fonts;
+  std::vector<uint8_t> roboto = LoadRobotoFontData();
+  std::vector<uint8_t> droid = LoadDroidSansFallbackFullFontData();
+  ASSERT_FALSE(roboto.empty());
+  ASSERT_FALSE(droid.empty());
+  EPDF_FONT_ID roboto_id = EPDFFont_RegisterMemFont64(
+      "Roboto", /*weight=*/400, /*italic=*/0, roboto.data(), roboto.size());
+  ASSERT_NE(0u, roboto_id);
+  std::vector<uint8_t> droid_preview = WithFsType(droid, 0x0004);
+  EPDF_FONT_ID droid_id = EPDFFont_RegisterMemFont64(
+      "DroidSansFallbackFull", /*weight=*/400, /*italic=*/0,
+      droid_preview.data(), droid_preview.size());
+  ASSERT_NE(0u, droid_id);
+  ASSERT_TRUE(EPDFFont_AddFallbackFont(droid_id));
+
+  ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+  ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 400, 400));
+  ScopedFPDFAnnotation annot(
+      FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+  ASSERT_TRUE(annot);
+  const FS_RECTF rect{50.0f, 320.0f, 350.0f, 250.0f};
+  ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+  ScopedFPDFWideString korean = GetFPDFWideString(L"AB\xD55C\xAE00");
+  ASSERT_TRUE(FPDFAnnot_SetStringValue(annot.get(), "Contents", korean.get()));
+  ASSERT_TRUE(EPDFAnnot_SetDefaultAppearanceRegisteredFont(
+      annot.get(), roboto_id, 18.0f, 0, 0, 0));
+
+  ASSERT_TRUE(EPDFAnnot_GenerateAppearance(annot.get()));
+  EXPECT_TRUE(
+      GetAppearanceFontDict(annot.get(), RegisteredFontAlias(roboto_id)));
+  EXPECT_FALSE(
+      GetAppearanceFontDict(annot.get(), RegisteredFontAlias(droid_id)));
+
+  ASSERT_TRUE(EPDFFont_AuthorizeEditing(droid_id));
+  ASSERT_TRUE(EPDFAnnot_GenerateAppearance(annot.get()));
+  ExpectRegisteredAppearanceMapsUnicode(annot.get(), droid_id,
+                                        {L'\xD55C', L'\xAE00'});
+}
+
+// fsType "no subsetting": the whole program is embedded, untagged.
+TEST_F(FPDFAnnotEmbedderTest, NoSubsettingFontEmbedsWholeProgram) {
+  ScopedRegisteredFonts scoped_fonts;
+  std::vector<uint8_t> roboto = LoadRobotoFontData();
+  ASSERT_FALSE(roboto.empty());
+  std::vector<uint8_t> no_subsetting = WithFsType(roboto, 0x0100);
+  EPDF_FONT_ID font_id =
+      EPDFFont_RegisterMemFont64("Roboto", /*weight=*/400, /*italic=*/0,
+                                 no_subsetting.data(), no_subsetting.size());
+  ASSERT_NE(0u, font_id);
+  EXPECT_EQ(EPDF_FONT_EMBEDDING_INSTALLABLE,
+            EPDFFont_GetEmbeddingPermission(font_id));
+
+  ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+  ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 400, 400));
+  ScopedFPDFAnnotation annot(
+      FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+  ASSERT_TRUE(annot);
+  const FS_RECTF rect{50.0f, 320.0f, 350.0f, 250.0f};
+  ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+  ScopedFPDFWideString contents = GetFPDFWideString(L"ABC");
+  ASSERT_TRUE(
+      FPDFAnnot_SetStringValue(annot.get(), "Contents", contents.get()));
+  ASSERT_TRUE(EPDFAnnot_SetDefaultAppearanceRegisteredFont(annot.get(), font_id,
+                                                           18.0f, 0, 0, 0));
+  ASSERT_TRUE(EPDFAnnot_GenerateAppearance(annot.get()));
+
+  RetainPtr<const CPDF_Dictionary> font_dict =
+      GetAppearanceFontDict(annot.get(), RegisteredFontAlias(font_id));
+  ASSERT_TRUE(font_dict);
+  EXPECT_EQ("Roboto", font_dict->GetNameFor("BaseFont"));  // no subset tag
+  std::vector<uint8_t> program = EmbeddedFontProgram(font_dict.Get());
+  EXPECT_EQ(no_subsetting.size(), program.size());
+  EXPECT_TRUE(AppearanceFontMapsUnicode(font_dict.Get(), 'A'));
+}
+
+// A2: a variable font is instanced once at registration. The registered
+// weight pins `wght`; everything downstream (layout, subset, embedding) sees a
+// static program.
+TEST_F(FPDFAnnotEmbedderTest, VariableFontIsInstancedAtRegistration) {
+  ScopedRegisteredFonts scoped_fonts;
+  std::vector<uint8_t> vf = LoadRobotoVariableAbcFontData();
+  ASSERT_FALSE(vf.empty());
+  ASSERT_TRUE(FindSfntTable(vf, "fvar").has_value());
+  std::vector<uint8_t> roboto = LoadRobotoFontData();
+  ASSERT_FALSE(roboto.empty());
+
+  EPDF_FONT_ID regular = EPDFFont_RegisterMemFont64(
+      "Roboto VF", /*weight=*/400, /*italic=*/0, vf.data(), vf.size());
+  EPDF_FONT_ID bold = EPDFFont_RegisterMemFont64(
+      "Roboto VF", /*weight=*/700, /*italic=*/0, vf.data(), vf.size());
+  EPDF_FONT_ID static_font = EPDFFont_RegisterMemFont64(
+      "Roboto", /*weight=*/400, /*italic=*/0, roboto.data(), roboto.size());
+  ASSERT_NE(0u, regular);
+  ASSERT_NE(0u, bold);
+  ASSERT_NE(0u, static_font);
+  EXPECT_TRUE(EPDFFont_IsInstanced(regular));
+  EXPECT_TRUE(EPDFFont_IsInstanced(bold));
+  EXPECT_FALSE(EPDFFont_IsInstanced(static_font));
+  EXPECT_EQ(32u, CFX_FontRegistry::GetSourceHash(regular).size());
+  EXPECT_NE(
+      std::vector<uint8_t>(CFX_FontRegistry::GetSourceHash(regular).begin(),
+                           CFX_FontRegistry::GetSourceHash(regular).end()),
+      std::vector<uint8_t>(CFX_FontRegistry::GetSourceHash(bold).begin(),
+                           CFX_FontRegistry::GetSourceHash(bold).end()));
+
+  // The two instances are different static programs: 'A' is wider at 700.
+  auto glyph_width_of_a = [](EPDF_FONT_ID id) -> int {
+    std::unique_ptr<CFX_Font> font = CFX_FontRegistry::CreateFont(id);
+    if (!font) {
+      return -1;
+    }
+    for (const auto& item : font->GetCharCodesAndIndices(0x7f)) {
+      if (item.char_code == 'A') {
+        return font->GetGlyphWidth(item.glyph_index);
+      }
+    }
+    return -1;
+  };
+  const int regular_a = glyph_width_of_a(regular);
+  const int bold_a = glyph_width_of_a(bold);
+  ASSERT_GT(regular_a, 0);
+  ASSERT_GT(bold_a, 0);
+  EXPECT_GT(bold_a, regular_a);
+
+  // What gets embedded is static too.
+  ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+  ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 400, 400));
+  ScopedFPDFAnnotation annot(
+      FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+  ASSERT_TRUE(annot);
+  const FS_RECTF rect{50.0f, 320.0f, 350.0f, 250.0f};
+  ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+  ScopedFPDFWideString contents = GetFPDFWideString(L"ABC");
+  ASSERT_TRUE(
+      FPDFAnnot_SetStringValue(annot.get(), "Contents", contents.get()));
+  ASSERT_TRUE(EPDFAnnot_SetDefaultAppearanceRegisteredFont(annot.get(), bold,
+                                                           18.0f, 0, 0, 0));
+  ASSERT_TRUE(EPDFAnnot_GenerateAppearance(annot.get()));
+  RetainPtr<const CPDF_Dictionary> font_dict =
+      GetAppearanceFontDict(annot.get(), RegisteredFontAlias(bold));
+  ASSERT_TRUE(font_dict);
+  std::vector<uint8_t> program = EmbeddedFontProgram(font_dict.Get());
+  ASSERT_FALSE(program.empty());
+  EXPECT_FALSE(FindSfntTable(program, "fvar").has_value());
+  EXPECT_FALSE(FindSfntTable(program, "gvar").has_value());
+  EXPECT_TRUE(FindSfntTable(program, "glyf").has_value());
+  EXPECT_TRUE(AppearanceFontMapsUnicode(font_dict.Get(), 'A'));
+  RetainPtr<const CPDF_Dictionary> descriptor =
+      GetType0FontDescriptor(font_dict.Get());
+  ASSERT_TRUE(descriptor);
+  EXPECT_EQ(700, descriptor->GetIntegerFor("FontWeight"));
+}
+
+namespace {
+
+std::string GetRichTextJson(FPDF_ANNOTATION annot) {
+  const unsigned long length = EPDFAnnot_GetRichTextJSON(annot, nullptr, 0);
+  if (length == 0) {
+    return std::string();
+  }
+  std::vector<char> buffer(length);
+  EXPECT_EQ(length, EPDFAnnot_GetRichTextJSON(annot, buffer.data(), length));
+  return std::string(buffer.data());
+}
+
+}  // namespace
+
+// B: without /RC the rich text model is synthesised from /Contents and /DA,
+// so callers always get one shape.
+TEST_F(FPDFAnnotEmbedderTest, RichTextJsonFromContentsOnly) {
+  ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+  ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 400, 400));
+  ScopedFPDFAnnotation annot(
+      FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+  ASSERT_TRUE(annot);
+  const FS_RECTF rect{50.0f, 320.0f, 350.0f, 250.0f};
+  ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+  ScopedFPDFWideString contents = GetFPDFWideString(L"Hello\rWorld");
+  ASSERT_TRUE(
+      FPDFAnnot_SetStringValue(annot.get(), "Contents", contents.get()));
+  ASSERT_TRUE(EPDFAnnot_SetDefaultAppearance(annot.get(), FPDF_FONT_HELVETICA,
+                                             12.0f, 255, 0, 0));
+
+  const std::string json = GetRichTextJson(annot.get());
+  EXPECT_NE(std::string::npos, json.find("\"source\":\"contents\""));
+  EXPECT_NE(std::string::npos, json.find("\"family\":\"Helvetica\""));
+  EXPECT_NE(std::string::npos, json.find("\"size\":12"));
+  EXPECT_NE(std::string::npos, json.find("\"color\":\"#FF0000\""));
+  EXPECT_NE(std::string::npos, json.find("{\"text\":\"Hello\"}"));
+  EXPECT_NE(std::string::npos, json.find("{\"text\":\"World\"}"));
+  EXPECT_NE(std::string::npos, json.find("\"diagnostics\":[]"));
+}
+
+TEST_F(FPDFAnnotEmbedderTest, RichTextJsonFromRCAndDS) {
+  ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+  ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 400, 400));
+  ScopedFPDFAnnotation annot(
+      FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+  ASSERT_TRUE(annot);
+  const FS_RECTF rect{50.0f, 320.0f, 350.0f, 250.0f};
+  ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+  ScopedFPDFWideString contents = GetFPDFWideString(L"bold plain");
+  ASSERT_TRUE(
+      FPDFAnnot_SetStringValue(annot.get(), "Contents", contents.get()));
+  ASSERT_TRUE(EPDFAnnot_SetDefaultAppearance(annot.get(), FPDF_FONT_HELVETICA,
+                                             12.0f, 0, 0, 0));
+  ScopedFPDFWideString ds = GetFPDFWideString(
+      L"font: 'Noto Sans',sans-serif 20.0pt; text-align:right");
+  ASSERT_TRUE(FPDFAnnot_SetStringValue(annot.get(), "DS", ds.get()));
+  ScopedFPDFWideString rc = GetFPDFWideString(
+      L"<?xml version=\"1.0\"?><body xmlns=\"http://www.w3.org/1999/xhtml\" "
+      L"style=\"color:#0000FF\"><p dir=\"ltr\"><span "
+      L"style=\"font-weight:bold\">"
+      L"bold</span> plain</p></body>");
+  ASSERT_TRUE(FPDFAnnot_SetStringValue(annot.get(), "RC", rc.get()));
+
+  const std::string json = GetRichTextJson(annot.get());
+  EXPECT_NE(std::string::npos, json.find("\"source\":\"rc\""));
+  EXPECT_NE(std::string::npos, json.find("\"family\":\"Noto Sans\""));  // DS
+  EXPECT_NE(std::string::npos, json.find("\"size\":20"));               // DS
+  EXPECT_NE(std::string::npos, json.find("\"color\":\"#0000FF\""));     // body
+  EXPECT_NE(std::string::npos, json.find("\"align\":\"right\""));       // DS
+  EXPECT_NE(std::string::npos,
+            json.find("{\"text\":\"bold\",\"style\":{\"weight\":700}}"));
+  EXPECT_NE(std::string::npos, json.find("{\"text\":\" plain\"}"));
+}
+
+// Acrobat-authored fixtures (experiments 05 / 07 / 04 of the plan).
+TEST_F(FPDFAnnotEmbedderTest, RichTextJsonFromAcrobatDecorations) {
+  ASSERT_TRUE(OpenDocument("freetext_rich_text_acrobat_decorations.pdf"));
+  ScopedPage page = LoadScopedPage(0);
+  ASSERT_TRUE(page);
+  std::string json;
+  for (int i = 0; i < FPDFPage_GetAnnotCount(page.get()); ++i) {
+    ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(page.get(), i));
+    if (FPDFAnnot_GetSubtype(annot.get()) == FPDF_ANNOT_FREETEXT) {
+      json = GetRichTextJson(annot.get());
+    }
+  }
+  ASSERT_FALSE(json.empty());
+  EXPECT_NE(std::string::npos, json.find("\"source\":\"rc\""));
+  EXPECT_NE(std::string::npos, json.find("\"family\":\"Helvetica\""));
+  EXPECT_NE(std::string::npos,
+            json.find("\"weight\":400,\"italic\":false,\"size\":24"));
+  EXPECT_NE(std::string::npos,
+            json.find("{\"text\":\"hello\",\"style\":{\"weight\":700}}"));
+  EXPECT_NE(
+      std::string::npos,
+      json.find("{\"text\":\"how\",\"style\":{\"decoration\":[\"word\"]}}"));
+  EXPECT_NE(std::string::npos,
+            json.find("{\"text\":\"are\",\"style\":{\"italic\":true}}"));
+  EXPECT_NE(std::string::npos, json.find("{\"text\":\" you \"}"));
+  EXPECT_NE(std::string::npos,
+            json.find("{\"text\":\"doing?\",\"style\":{\"decoration\":[\"line-"
+                      "through\"]}}"));
+  EXPECT_NE(std::string::npos, json.find("\"diagnostics\":[]"));
+}
+
+TEST_F(FPDFAnnotEmbedderTest, RichTextJsonFromAcrobatProperties) {
+  ASSERT_TRUE(OpenDocument("freetext_rich_text_acrobat_properties.pdf"));
+  ScopedPage page = LoadScopedPage(0);
+  ASSERT_TRUE(page);
+  bool saw_center = false;
+  bool saw_scripts = false;
+  bool saw_empty = false;
+  for (int i = 0; i < FPDFPage_GetAnnotCount(page.get()); ++i) {
+    ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(page.get(), i));
+    if (FPDFAnnot_GetSubtype(annot.get()) != FPDF_ANNOT_FREETEXT) {
+      continue;
+    }
+    const std::string json = GetRichTextJson(annot.get());
+    ASSERT_FALSE(json.empty());
+    if (json.find("Welcome") != std::string::npos) {
+      saw_center = true;
+      EXPECT_NE(std::string::npos,
+                json.find("\"weight\":700,\"italic\":false,\"size\":26"));
+      EXPECT_NE(std::string::npos,
+                json.find("\"align\":\"center\",\"runs\""));  // differs from the body
+      EXPECT_NE(std::string::npos, json.find("{\"text\":\"Welcome\\r\\r\"}"));
+      EXPECT_NE(std::string::npos,
+                json.find("\"style\":{\"weight\":400,\"size\":18}"));
+    } else if (json.find("\"script\":\"sub\"") != std::string::npos) {
+      saw_scripts = true;
+      EXPECT_NE(
+          std::string::npos,
+          json.find("{\"text\":\"hello\\r\",\"style\":{\"script\":\"sub\"}}"));
+      EXPECT_NE(
+          std::string::npos,
+          json.find("{\"text\":\"hello\",\"style\":{\"script\":\"super\"}}"));
+    } else {
+      // The never-typed box: no RC, no Contents, DS names the family.
+      saw_empty = true;
+      EXPECT_NE(std::string::npos, json.find("\"source\":\"contents\""));
+      EXPECT_NE(std::string::npos, json.find("\"family\":\"Helvetica\""));
+      EXPECT_NE(std::string::npos, json.find("\"size\":18"));
+    }
+  }
+  EXPECT_TRUE(saw_center);
+  EXPECT_TRUE(saw_scripts);
+  EXPECT_TRUE(saw_empty);
+}
+
+TEST_F(FPDFAnnotEmbedderTest, RichTextJsonFromAcrobatBareLineBreak) {
+  ASSERT_TRUE(OpenDocument("freetext_rich_text_acrobat_lines.pdf"));
+  ScopedPage page = LoadScopedPage(0);
+  ASSERT_TRUE(page);
+  ASSERT_EQ(1, FPDFPage_GetAnnotCount(page.get()));
+  ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(page.get(), 0));
+  const std::string json = GetRichTextJson(annot.get());
+  EXPECT_NE(std::string::npos, json.find("\"size\":22"));
+  EXPECT_NE(
+      std::string::npos,
+      json.find(
+          "{\"text\":\"How are you doing this is great! \\rnow a new line\"}"));
+}
+
+namespace {
+
+RetainPtr<const CPDF_Dictionary> GetType0DescendantFont(
+    const CPDF_Dictionary* font_dict) {
+  RetainPtr<const CPDF_Array> descendants =
+      font_dict ? font_dict->GetArrayFor("DescendantFonts") : nullptr;
+  return descendants ? descendants->GetDictAt(0) : nullptr;
+}
+
+ScopedFPDFAnnotation AuthorFreeText(FPDF_PAGE page,
+                                    EPDF_FONT_ID font_id,
+                                    const wchar_t* text) {
+  ScopedFPDFAnnotation annot(FPDFPage_CreateAnnot(page, FPDF_ANNOT_FREETEXT));
+  if (!annot) {
+    return annot;
+  }
+  const FS_RECTF rect{50.0f, 320.0f, 350.0f, 250.0f};
+  EXPECT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+  ScopedFPDFWideString contents = GetFPDFWideString(text);
+  EXPECT_TRUE(
+      FPDFAnnot_SetStringValue(annot.get(), "Contents", contents.get()));
+  EXPECT_TRUE(EPDFAnnot_SetDefaultAppearanceRegisteredFont(annot.get(), font_id,
+                                                           24.0f, 0, 0, 0));
+  EXPECT_TRUE(EPDFAnnot_GenerateAppearance(annot.get()));
+  return annot;
+}
+
+}  // namespace
+
+// D landing 1: an OpenType/CFF program is written as a Type 0 CIDFont with a
+// FontFile3 /OpenType stream (ISO 32000-2 Table 124, 9.7.4.2), subset by
+// HarfBuzz, and renders.
+TEST_F(FPDFAnnotEmbedderTest, RegisteredCffFontEmitsCidFontType0) {
+  ScopedRegisteredFonts scoped_fonts;
+  std::vector<uint8_t> cff = LoadCffLatinFontData();
+  ASSERT_FALSE(cff.empty());
+  ASSERT_EQ(CPDF_AnnotFontSubset::ProgramFormat::kOpenTypeCFF,
+            CPDF_AnnotFontSubset::DetectProgramFormat(cff));
+  EPDF_FONT_ID font_id = EPDFFont_RegisterMemFont64(
+      "CffLatin", /*weight=*/400, /*italic=*/0, cff.data(), cff.size());
+  ASSERT_NE(0u, font_id);
+
+  ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+  ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 400, 400));
+  ScopedFPDFAnnotation annot = AuthorFreeText(page.get(), font_id, L"ABC");
+  ASSERT_TRUE(annot);
+
+  RetainPtr<const CPDF_Dictionary> font_dict =
+      GetAppearanceFontDict(annot.get(), RegisteredFontAlias(font_id));
+  ASSERT_TRUE(font_dict);
+  EXPECT_EQ("Type0", font_dict->GetNameFor("Subtype"));
+  EXPECT_EQ("Identity-H", font_dict->GetNameFor("Encoding"));
+  RetainPtr<const CPDF_Dictionary> cid_font =
+      GetType0DescendantFont(font_dict.Get());
+  ASSERT_TRUE(cid_font);
+  EXPECT_EQ("CIDFontType0", cid_font->GetNameFor("Subtype"));
+  EXPECT_FALSE(cid_font->KeyExist("CIDToGIDMap"));
+  RetainPtr<const CPDF_Dictionary> descriptor =
+      cid_font->GetDictFor("FontDescriptor");
+  ASSERT_TRUE(descriptor);
+  EXPECT_FALSE(descriptor->KeyExist("FontFile2"));
+  RetainPtr<const CPDF_Stream> program = descriptor->GetStreamFor("FontFile3");
+  ASSERT_TRUE(program);
+  EXPECT_EQ("OpenType", program->GetDict()->GetNameFor("Subtype"));
+  auto acc = pdfium::MakeRetain<CPDF_StreamAcc>(program);
+  acc->LoadAllDataFiltered();
+  pdfium::span<const uint8_t> bytes = acc->GetSpan();
+  ASSERT_GE(bytes.size(), 4u);
+  EXPECT_EQ('O', bytes[0]);
+  EXPECT_EQ('T', bytes[1]);
+  EXPECT_EQ('T', bytes[2]);
+  EXPECT_EQ('O', bytes[3]);
+  EXPECT_LT(bytes.size(), cff.size());  // CFF subsetting is compiled in
+  EXPECT_TRUE(font_dict->GetNameFor("BaseFont").Contains("+CffLatin"));
+  EXPECT_TRUE(AppearanceFontMapsUnicode(font_dict.Get(), 'A'));
+
+  ScopedFPDFBitmap bitmap =
+      EmbedderTest::RenderPageWithFlags(page.get(), nullptr, FPDF_ANNOT);
+  ASSERT_TRUE(bitmap);
+  EXPECT_GT(CountInkPixels(bitmap.get(), 50, 80, 350, 150, 0xFFFFFFFFu), 0);
+}
+
+// D landing 1: a CID-keyed CFF program keeps its CIDs. The appearance bytes
+// carry the CID (not the GID), /W is keyed by CID, ToUnicode by charcode,
+// the subset keeps the GID, and the reader maps CID → GID through the charset.
+TEST_F(FPDFAnnotEmbedderTest, RegisteredCidKeyedCffKeepsCidsInAppearance) {
+  ScopedRegisteredFonts scoped_fonts;
+  std::vector<uint8_t> cjk = LoadNotoSansSCFontData();
+  ASSERT_FALSE(cjk.empty());
+  EPDF_FONT_ID font_id = EPDFFont_RegisterMemFont64(
+      "Noto Sans SC", /*weight=*/400, /*italic=*/0, cjk.data(), cjk.size());
+  ASSERT_NE(0u, font_id);
+
+  // The fixture maps U+4E00 to CID 9831 at GID 3: the two differ.
+  {
+    std::unique_ptr<CFX_Font> font = CFX_FontRegistry::CreateFont(font_id);
+    ASSERT_TRUE(font);
+    CPDF_AnnotFontSubset::GlyphIdentity identity(font.get());
+    EXPECT_FALSE(identity.IsIdentity());
+    EXPECT_EQ(3u, identity.GidOf(9831).value());
+    EXPECT_EQ(9831, identity.CidOf(3).value());
+  }
+
+  ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+  ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 400, 400));
+  ScopedFPDFAnnotation annot = AuthorFreeText(page.get(), font_id, L"\x4e00");
+  ASSERT_TRUE(annot);
+
+  const ByteString stream = GetNormalAppearanceStreamBytes(annot.get());
+  ASSERT_FALSE(stream.IsEmpty());
+  // The rich emitter writes two-byte codes as hex strings (Acrobat's shape).
+  EXPECT_TRUE(stream.Contains("2667"));   // CID 9831
+  EXPECT_FALSE(stream.Contains("0003"));  // not GID 3
+
+  RetainPtr<const CPDF_Dictionary> font_dict =
+      GetAppearanceFontDict(annot.get(), RegisteredFontAlias(font_id));
+  ASSERT_TRUE(font_dict);
+  RetainPtr<const CPDF_Dictionary> cid_font =
+      GetType0DescendantFont(font_dict.Get());
+  ASSERT_TRUE(cid_font);
+  EXPECT_EQ("CIDFontType0", cid_font->GetNameFor("Subtype"));
+  RetainPtr<const CPDF_Array> widths = cid_font->GetArrayFor("W");
+  ASSERT_TRUE(widths);
+  bool keyed_by_cid = false;
+  for (size_t i = 0; i < widths->size(); ++i) {
+    if (widths->GetIntegerAt(i) == 9831) {
+      keyed_by_cid = true;
+    }
+  }
+  EXPECT_TRUE(keyed_by_cid);
+  EXPECT_TRUE(AppearanceFontMapsUnicode(font_dict.Get(), L'\x4e00'));
+  CPDF_ToUnicodeMap to_unicode(font_dict->GetStreamFor("ToUnicode"));
+  EXPECT_EQ(9831u, to_unicode.ReverseLookup(L'\x4e00'));
+
+  // The embedded subset still holds the glyph at GID 3.
+  RetainPtr<const CPDF_Stream> program =
+      cid_font->GetDictFor("FontDescriptor")->GetStreamFor("FontFile3");
+  ASSERT_TRUE(program);
+  auto acc = pdfium::MakeRetain<CPDF_StreamAcc>(program);
+  acc->LoadAllDataFiltered();
+  EXPECT_EQ(CPDF_AnnotFontSubset::ProgramFormat::kOpenTypeCFF,
+            CPDF_AnnotFontSubset::DetectProgramFormat(acc->GetSpan()));
+
+  // And our own reader draws it (CID → GID through the charset).
+  ScopedFPDFBitmap bitmap =
+      EmbedderTest::RenderPageWithFlags(page.get(), nullptr, FPDF_ANNOT);
+  ASSERT_TRUE(bitmap);
+  EXPECT_GT(CountInkPixels(bitmap.get(), 50, 80, 350, 150, 0xFFFFFFFFu), 0);
+}
+
+// D landing 1: writing a FontFile3 /OpenType program raises an older file to
+// PDF 1.6; a 1.7 file is left alone.
+TEST_F(FPDFAnnotEmbedderTest, CffProgramRaisesPdfVersionTo16) {
+  ScopedRegisteredFonts scoped_fonts;
+  std::vector<uint8_t> cff = LoadCffLatinFontData();
+  ASSERT_FALSE(cff.empty());
+  EPDF_FONT_ID font_id = EPDFFont_RegisterMemFont64(
+      "CffLatin", /*weight=*/400, /*italic=*/0, cff.data(), cff.size());
+  ASSERT_NE(0u, font_id);
+
+  // A 1.4 file: a fresh document saved with that version and reloaded.
+  std::string old_pdf;
+  {
+    ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+    ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 400, 400));
+    ASSERT_TRUE(FPDFPage_GenerateContent(page.get()));
+    ASSERT_TRUE(FPDF_SaveWithVersion(doc.get(), this, 0, 14));
+    old_pdf = GetString();
+    ClearString();
+  }
+  ASSERT_EQ(0u, old_pdf.find("%PDF-1.4"));
+
+  ScopedFPDFDocument doc(FPDF_LoadMemDocument(
+      old_pdf.data(), static_cast<int>(old_pdf.size()), nullptr));
+  ASSERT_TRUE(doc);
+  ScopedFPDFPage page(FPDF_LoadPage(doc.get(), 0));
+  ASSERT_TRUE(page);
+  ScopedFPDFAnnotation annot = AuthorFreeText(page.get(), font_id, L"ABC");
+  ASSERT_TRUE(annot);
+
+  CPDF_Document* cpdf_doc = CPDFDocumentFromFPDFDocument(doc.get());
+  EXPECT_EQ("1.6", cpdf_doc->GetRoot()->GetNameFor("Version"));
+
+  // A TrueType program does not touch the version.
+  std::vector<uint8_t> roboto = LoadRobotoFontData();
+  EPDF_FONT_ID roboto_id = EPDFFont_RegisterMemFont64(
+      "Roboto", /*weight=*/400, /*italic=*/0, roboto.data(), roboto.size());
+  ScopedFPDFDocument doc2(FPDF_LoadMemDocument(
+      old_pdf.data(), static_cast<int>(old_pdf.size()), nullptr));
+  ScopedFPDFPage page2(FPDF_LoadPage(doc2.get(), 0));
+  ScopedFPDFAnnotation annot2 = AuthorFreeText(page2.get(), roboto_id, L"ABC");
+  ASSERT_TRUE(annot2);
+  EXPECT_FALSE(
+      CPDFDocumentFromFPDFDocument(doc2.get())->GetRoot()->KeyExist("Version"));
+}
+
+namespace {
+
+std::string SerializeObject(const CPDF_Object* object) {
+  fxcrt::ostringstream buffer;
+  CPDF_StringArchiveStream archive(&buffer);
+  EXPECT_TRUE(object && object->WriteTo(&archive, nullptr));
+  return std::string(buffer.str().data(), buffer.str().size());
+}
+
+std::string SerializeDrDict(FPDF_DOCUMENT doc) {
+  const CPDF_Dictionary* root = CPDFDocumentFromFPDFDocument(doc)->GetRoot();
+  RetainPtr<const CPDF_Dictionary> acroform = root->GetDictFor("AcroForm");
+  RetainPtr<const CPDF_Dictionary> dr =
+      acroform ? acroform->GetDictFor("DR") : nullptr;
+  return dr ? SerializeObject(dr.Get()) : std::string("<no DR>");
+}
+
+// |sfnt| wrapped as a one-font TrueType collection: a 16-byte 'ttcf' header
+// in front, every table record offset moved by it. FreeType opens face 0 of
+// such a file; the registry refuses the format (Phase C note §3).
+std::vector<uint8_t> WrapAsCollection(pdfium::span<const uint8_t> sfnt) {
+  static constexpr size_t kHeaderSize = 16;
+  std::vector<uint8_t> ttc = {'t', 't', 'c', 'f', 0, 1, 0, 0,
+                              0,   0,   0,   1,   0, 0, 0, kHeaderSize};
+  ttc.insert(ttc.end(), sfnt.begin(), sfnt.end());
+  const size_t num_tables = (sfnt[4] << 8) | sfnt[5];
+  for (size_t i = 0; i < num_tables; ++i) {
+    const size_t record = kHeaderSize + 12 + i * 16;
+    uint32_t offset = (ttc[record + 8] << 24) | (ttc[record + 9] << 16) |
+                      (ttc[record + 10] << 8) | ttc[record + 11];
+    offset += kHeaderSize;
+    ttc[record + 8] = offset >> 24;
+    ttc[record + 9] = offset >> 16;
+    ttc[record + 10] = offset >> 8;
+    ttc[record + 11] = offset;
+  }
+  return ttc;
+}
+
+}  // namespace
+
+// D8 (Phase C note §6): a font resource that fails to stage after another
+// was staged leaves the document exactly as it was. The FreeText below needs
+// two registered fonts (the /DA font and a CJK fallback); the injection makes
+// the second one fail. Nothing of the first may remain: no object number,
+// no /DR entry, no alias, no change to the annotation.
+TEST_F(FPDFAnnotEmbedderTest,
+       FreeTextStagedFontFailureLeavesDocumentUntouched) {
+  ScopedRegisteredFonts scoped_fonts;
+  std::vector<uint8_t> roboto = LoadRobotoFontData();
+  std::vector<uint8_t> noto = LoadNotoSansSCFontData();
+  ASSERT_FALSE(roboto.empty());
+  ASSERT_FALSE(noto.empty());
+  EPDF_FONT_ID roboto_id = EPDFFont_RegisterMemFont64(
+      "Roboto", /*weight=*/400, /*italic=*/0, roboto.data(), roboto.size());
+  EPDF_FONT_ID noto_id = EPDFFont_RegisterMemFont64(
+      "NotoSansSC", /*weight=*/400, /*italic=*/0, noto.data(), noto.size());
+  ASSERT_NE(0u, roboto_id);
+  ASSERT_NE(0u, noto_id);
+  ASSERT_TRUE(EPDFFont_AddFallbackFont(noto_id));
+
+  ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+  ASSERT_TRUE(doc);
+  ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 400, 400));
+  ASSERT_TRUE(page);
+  ScopedFPDFAnnotation annot(
+      FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+  ASSERT_TRUE(annot);
+  const FS_RECTF rect{50.0f, 320.0f, 350.0f, 250.0f};
+  ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+  ScopedFPDFWideString contents = GetFPDFWideString(L"AB\x4e00");
+  ASSERT_TRUE(
+      FPDFAnnot_SetStringValue(annot.get(), "Contents", contents.get()));
+  ASSERT_TRUE(EPDFAnnot_SetDefaultAppearanceRegisteredFont(
+      annot.get(), roboto_id, 24.0f, 0, 0, 0));
+
+  CPDF_Document* cpdf_doc = CPDFDocumentFromFPDFDocument(doc.get());
+  const CPDF_Dictionary* annot_dict =
+      CPDFAnnotContextFromFPDFAnnotation(annot.get())->GetAnnotDict();
+  const std::string annot_before = SerializeObject(annot_dict);
+  const std::string dr_before = SerializeDrDict(doc.get());
+  const uint32_t last_obj_before = cpdf_doc->GetLastObjNum();
+  const ByteString da_alias = RegisteredFontAlias(roboto_id);
+  ASSERT_EQ(roboto_id, cpdf_doc->LookupSessionFontAlias(da_alias));
+
+  CPDF_AnnotFontMap::FailAfterStagedFontsForTesting(1);
+  EXPECT_FALSE(EPDFAnnot_GenerateAppearance(annot.get()));
+  CPDF_AnnotFontMap::FailAfterStagedFontsForTesting(0);
+
+  EXPECT_EQ(annot_before, SerializeObject(annot_dict));
+  EXPECT_EQ(dr_before, SerializeDrDict(doc.get()));
+  EXPECT_EQ(last_obj_before, cpdf_doc->GetLastObjNum());
+  EXPECT_FALSE(GetDrFontEntry(doc.get(), da_alias));
+  EXPECT_EQ(roboto_id, cpdf_doc->LookupSessionFontAlias(da_alias));
+  EXPECT_FALSE(cpdf_doc->LookupSessionFontAlias(RegisteredFontAlias(noto_id))
+                   .has_value());
+
+  // Without the injection the same annotation publishes both fonts.
+  ASSERT_TRUE(EPDFAnnot_GenerateAppearance(annot.get()));
+  EXPECT_GT(cpdf_doc->GetLastObjNum(), last_obj_before);
+  RetainPtr<const CPDF_Dictionary> da_font =
+      GetAppearanceFontDict(annot.get(), da_alias);
+  RetainPtr<const CPDF_Dictionary> fallback_font =
+      GetAppearanceFontDict(annot.get(), RegisteredFontAlias(noto_id));
+  ASSERT_TRUE(da_font);
+  ASSERT_TRUE(fallback_font);
+  EXPECT_TRUE(AppearanceFontHasEmbeddedSubset(da_font.Get()));
+  EXPECT_TRUE(AppearanceFontMapsUnicode(da_font.Get(), 'A'));
+  EXPECT_TRUE(AppearanceFontMapsUnicode(fallback_font.Get(), L'\x4e00'));
+  EXPECT_EQ(da_font.Get(), GetDrFontEntry(doc.get(), da_alias).Get());
+}
+
+// Laying out with a registered font allocates no document object: the
+// layout font's streams live in a scratch holder of their own.
+TEST_F(FPDFAnnotEmbedderTest, RegisteredLayoutFontAllocatesNoDocumentObject) {
+  ScopedRegisteredFonts scoped_fonts;
+  std::vector<uint8_t> roboto = LoadRobotoFontData();
+  ASSERT_FALSE(roboto.empty());
+  EPDF_FONT_ID roboto_id = EPDFFont_RegisterMemFont64(
+      "Roboto", /*weight=*/400, /*italic=*/0, roboto.data(), roboto.size());
+  ASSERT_NE(0u, roboto_id);
+
+  ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+  CPDF_Document* cpdf_doc = CPDFDocumentFromFPDFDocument(doc.get());
+  const uint32_t last_obj_before = cpdf_doc->GetLastObjNum();
+  {
+    CPDF_AnnotFontSubset::LayoutFont layout =
+        CPDF_AnnotFontSubset::CreateLayoutFont(cpdf_doc, roboto_id);
+    ASSERT_TRUE(layout.font);
+    ASSERT_TRUE(layout.scratch);
+    EXPECT_NE(0u, layout.font->CharCodeFromUnicode('A'));
+    EXPECT_GT(layout.font->GetCharWidthF(layout.font->CharCodeFromUnicode('A')),
+              0);
+    EXPECT_EQ(0u, layout.font->GetFontDict()->GetObjNum());
+  }
+  EXPECT_EQ(last_obj_before, cpdf_doc->GetLastObjNum());
+}
+
+// Phase C note §2: the document's embedding policy. DEFAULT subsets
+// annotation text; FULL embeds the whole program, untagged; SUBSET subsets
+// form field text too, which DEFAULT embeds whole.
+TEST_F(FPDFAnnotEmbedderTest, FontEmbeddingPolicyGovernsRegisteredResources) {
+  ScopedRegisteredFonts scoped_fonts;
+  std::vector<uint8_t> roboto = LoadRobotoFontData();
+  ASSERT_FALSE(roboto.empty());
+  EPDF_FONT_ID roboto_id = EPDFFont_RegisterMemFont64(
+      "Roboto", /*weight=*/400, /*italic=*/0, roboto.data(), roboto.size());
+  ASSERT_NE(0u, roboto_id);
+  const ByteString alias = RegisteredFontAlias(roboto_id);
+
+  EXPECT_EQ(-1, EPDFDoc_GetFontEmbeddingPolicy(nullptr));
+  EXPECT_FALSE(EPDFDoc_SetFontEmbeddingPolicy(nullptr, 0));
+
+  CreateEmptyDocument();
+  {
+    EXPECT_EQ(EPDF_FONT_EMBEDDING_POLICY_DEFAULT,
+              EPDFDoc_GetFontEmbeddingPolicy(document()));
+    EXPECT_FALSE(EPDFDoc_SetFontEmbeddingPolicy(document(), 3));
+    EXPECT_FALSE(EPDFDoc_SetFontEmbeddingPolicy(document(), -1));
+    EXPECT_EQ(EPDF_FONT_EMBEDDING_POLICY_DEFAULT,
+              EPDFDoc_GetFontEmbeddingPolicy(document()));
+
+    ScopedFPDFPage page(FPDFPage_New(document(), 0, 400, 400));
+    ASSERT_TRUE(page);
+
+    // DEFAULT: FreeText subset.
+    ScopedFPDFAnnotation subset_annot =
+        AuthorFreeText(page.get(), roboto_id, L"ABC");
+    ASSERT_TRUE(subset_annot);
+    EXPECT_TRUE(AppearanceFontHasEmbeddedSubset(
+        GetAppearanceFontDict(subset_annot.get(), alias).Get()));
+
+    // FULL: the same annotation regenerated carries the whole program.
+    ASSERT_TRUE(EPDFDoc_SetFontEmbeddingPolicy(
+        document(), EPDF_FONT_EMBEDDING_POLICY_FULL));
+    EXPECT_EQ(EPDF_FONT_EMBEDDING_POLICY_FULL,
+              EPDFDoc_GetFontEmbeddingPolicy(document()));
+    ASSERT_TRUE(EPDFAnnot_GenerateAppearance(subset_annot.get()));
+    RetainPtr<const CPDF_Dictionary> full_font =
+        GetAppearanceFontDict(subset_annot.get(), alias);
+    EXPECT_TRUE(
+        AppearanceFontEmbedsWholeProgram(full_font.Get(), roboto.size()));
+    EXPECT_TRUE(AppearanceFontMapsUnicode(full_font.Get(), 'A'));
+    EXPECT_EQ(full_font.Get(), GetDrFontEntry(document(), alias).Get());
+
+    // An empty annotation (no glyph drawn, so no ToUnicode) under FULL also
+    // carries the whole program, untagged: its /DA font must survive a save.
+    // Under SUBSET it is the minimal glyph-0 subset, tagged like any other.
+    auto program_length = [](const CPDF_Dictionary* font_dict) {
+      RetainPtr<const CPDF_Dictionary> descriptor =
+          GetType0FontDescriptor(font_dict);
+      RetainPtr<const CPDF_Stream> program =
+          descriptor ? descriptor->GetStreamFor("FontFile2") : nullptr;
+      return program ? program->GetDict()->GetIntegerFor("Length1") : -1;
+    };
+    ScopedFPDFAnnotation empty_annot =
+        AuthorFreeText(page.get(), roboto_id, L"");
+    ASSERT_TRUE(empty_annot);
+    RetainPtr<const CPDF_Dictionary> whole_font =
+        GetAppearanceFontDict(empty_annot.get(), alias);
+    ASSERT_TRUE(whole_font);
+    EXPECT_FALSE(AppearanceFontIsSubsetTagged(whole_font.Get()));
+    EXPECT_EQ(static_cast<int>(roboto.size()),
+              program_length(whole_font.Get()));
+    ASSERT_TRUE(EPDFDoc_SetFontEmbeddingPolicy(
+        document(), EPDF_FONT_EMBEDDING_POLICY_SUBSET));
+    ASSERT_TRUE(EPDFAnnot_GenerateAppearance(empty_annot.get()));
+    RetainPtr<const CPDF_Dictionary> minimal_font =
+        GetAppearanceFontDict(empty_annot.get(), alias);
+    ASSERT_TRUE(minimal_font);
+    EXPECT_TRUE(AppearanceFontIsSubsetTagged(minimal_font.Get()));
+    EXPECT_GT(program_length(minimal_font.Get()), 0);
+    EXPECT_LT(program_length(minimal_font.Get()),
+              static_cast<int>(roboto.size() / 10));
+
+    // SUBSET: a form field, which DEFAULT embeds whole, is subset too.
+    ScopedFPDFAnnotation widget(
+        EPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_WIDGET));
+    ASSERT_TRUE(widget);
+    const FS_RECTF rect{50.0f, 200.0f, 350.0f, 150.0f};
+    ASSERT_TRUE(FPDFAnnot_SetRect(widget.get(), &rect));
+    ASSERT_TRUE(EPDFAnnot_SetDefaultAppearanceRegisteredFont(
+        widget.get(), roboto_id, 12.0f, 0, 0, 0));
+    ScopedFPDFWideString field_name = GetFPDFWideString(L"policy_text");
+    const uint32_t field = EPDFForm_CreateField(
+        document(), 4 /* EPDF_FORMFIELD_FAMILY_TEXT */, field_name.get());
+    ASSERT_GT(field, 0u);
+    ASSERT_TRUE(EPDFForm_AttachWidget(
+        document(), field, EPDFAnnot_GetObjectNumber(widget.get()), nullptr));
+    ScopedFPDFWideString value = GetFPDFWideString(L"hello");
+    ASSERT_TRUE(EPDFForm_SetTextValue(document(), field, value.get(), nullptr,
+                                      0, nullptr));
+    ASSERT_TRUE(EPDFAnnot_GenerateFormFieldAP(widget.get()));
+    EXPECT_TRUE(AppearanceFontHasEmbeddedSubset(
+        GetAppearanceFontDict(widget.get(), alias).Get()));
+  }
+  CloseDocument();
+}
+
+// Phase C note §3 and §9: only TrueType and OpenType/CFF sfnts are
+// registered. A collection FreeType would open is refused at the door, and
+// so are bytes that are not an sfnt at all.
+TEST_F(FPDFAnnotEmbedderTest, RegistrationRefusesUnsupportedProgramFormats) {
+  ScopedRegisteredFonts scoped_fonts;
+  std::vector<uint8_t> roboto = LoadRobotoFontData();
+  ASSERT_FALSE(roboto.empty());
+  EXPECT_EQ(CFX_FontRegistry::ProgramFormat::kTrueType,
+            CFX_FontRegistry::DetectProgramFormat(roboto));
+
+  const std::vector<uint8_t> ttc = WrapAsCollection(roboto);
+  EXPECT_EQ(CFX_FontRegistry::ProgramFormat::kUnsupported,
+            CFX_FontRegistry::DetectProgramFormat(ttc));
+  {
+    CFX_Font font;  // the refusal is policy, not an unloadable file
+    EXPECT_TRUE(font.LoadEmbedded(ttc, /*force_vertical=*/false,
+                                  /*object_tag=*/0));
+  }
+  EXPECT_EQ(0u, EPDFFont_RegisterMemFont64("Roboto TTC", 400, 0, ttc.data(),
+                                           ttc.size()));
+
+  const std::string type1 = "%!PS-AdobeFont-1.0: NotAFont";
+  EXPECT_EQ(CFX_FontRegistry::ProgramFormat::kUnsupported,
+            CFX_FontRegistry::DetectProgramFormat(pdfium::as_byte_span(type1)));
+  EXPECT_EQ(0u, EPDFFont_RegisterMemFont64("Type1", 400, 0, type1.data(),
+                                           type1.size()));
+
+  // The real thing still registers.
+  EXPECT_NE(0u, EPDFFont_RegisterMemFont64("Roboto", 400, 0, roboto.data(),
+                                           roboto.size()));
+}
+
+namespace {
+
+// ---- Rich text (Phase D landing 2)
+// ---------------------------------------------
+
+// A text-showing segment of an appearance stream: where it starts and what
+// it draws, so Acrobat's appearance and ours can be compared glyph by glyph.
+struct TextSegment {
+  std::string text;  // 1-byte codes as characters (standard-14 fixtures)
+  float x = 0;
+  float y = 0;
+  float size = 0;
+  std::string font;
+};
+
+std::string DecodePdfString(const std::string& token) {
+  std::string out;
+  if (token.size() >= 2 && token.front() == '<') {
+    int nibble = -1;
+    for (size_t i = 1; i + 1 < token.size(); ++i) {
+      const char ch = token[i];
+      int value;
+      if (ch >= '0' && ch <= '9') {
+        value = ch - '0';
+      } else if (ch >= 'a' && ch <= 'f') {
+        value = ch - 'a' + 10;
+      } else if (ch >= 'A' && ch <= 'F') {
+        value = ch - 'A' + 10;
+      } else {
+        continue;
+      }
+      if (nibble < 0) {
+        nibble = value;
+      } else {
+        out += static_cast<char>((nibble << 4) | value);
+        nibble = -1;
+      }
+    }
+    return out;
+  }
+  for (size_t i = 1; i + 1 < token.size(); ++i) {
+    char ch = token[i];
+    if (ch != '\\') {
+      out += ch;
+      continue;
+    }
+    ++i;
+    if (i + 1 >= token.size()) {
+      break;
+    }
+    ch = token[i];
+    switch (ch) {
+      case 'n':
+        out += '\n';
+        break;
+      case 'r':
+        out += '\r';
+        break;
+      case 't':
+        out += '\t';
+        break;
+      case 'b':
+        out += '\b';
+        break;
+      case 'f':
+        out += '\f';
+        break;
+      default:
+        if (ch >= '0' && ch <= '7') {
+          int value = 0;
+          int digits = 0;
+          while (digits < 3 && i + 1 < token.size() && token[i] >= '0' &&
+                 token[i] <= '7') {
+            value = value * 8 + (token[i] - '0');
+            ++i;
+            ++digits;
+          }
+          --i;
+          out += static_cast<char>(value);
+        } else {
+          out += ch;
+        }
+    }
+  }
+  return out;
+}
+
+// Tokenises just enough of a content stream: numbers, names, strings,
+// arrays, and the text operators BT, Tf, Td, TD, Tm, T*, Tj, TJ, '.
+std::vector<TextSegment> ParseTextSegments(const std::string& content) {
+  std::vector<TextSegment> segments;
+  std::vector<std::string> operands;
+  float origin_x = 0;
+  float origin_y = 0;
+  float leading = 0;
+  float rise = 0;  // Ts; Acrobat moves sub/superscripts with Td instead
+  float size = 0;
+  std::string font;
+  size_t i = 0;
+  auto read_token = [&]() -> std::string {
+    while (i < content.size() &&
+           isspace(static_cast<unsigned char>(content[i]))) {
+      ++i;
+    }
+    if (i >= content.size()) {
+      return std::string();
+    }
+    const size_t start = i;
+    const char ch = content[i];
+    if (ch == '(') {
+      int depth = 0;
+      for (; i < content.size(); ++i) {
+        if (content[i] == '\\') {
+          ++i;
+          continue;
+        }
+        if (content[i] == '(') {
+          ++depth;
+        } else if (content[i] == ')') {
+          if (--depth == 0) {
+            ++i;
+            break;
+          }
+        }
+      }
+      return content.substr(start, i - start);
+    }
+    if (ch == '<' && i + 1 < content.size() && content[i + 1] != '<') {
+      while (i < content.size() && content[i] != '>') {
+        ++i;
+      }
+      ++i;
+      return content.substr(start, i - start);
+    }
+    if (ch == '[' || ch == ']') {
+      ++i;
+      return std::string(1, ch);
+    }
+    if (ch == '<' || ch == '>') {
+      i += 2;
+      return content.substr(start, 2);
+    }
+    while (i < content.size() &&
+           !isspace(static_cast<unsigned char>(content[i])) &&
+           content[i] != '(' && content[i] != '<' && content[i] != '[' &&
+           content[i] != ']' && (i == start || content[i] != '/')) {
+      ++i;
+    }
+    return content.substr(start, i - start);
+  };
+  auto number = [](const std::string& token) {
+    return static_cast<float>(atof(token.c_str()));
+  };
+  auto push_segment = [&](const std::string& text) {
+    TextSegment segment;
+    segment.text = text;
+    segment.x = origin_x;
+    segment.y = origin_y + rise;
+    segment.size = size;
+    segment.font = font;
+    segments.push_back(segment);
+  };
+  while (true) {
+    const std::string token = read_token();
+    if (token.empty()) {
+      break;
+    }
+    const char first = token[0];
+    if (first == '(' || first == '<' || first == '[' || first == ']' ||
+        first == '/' || first == '-' || first == '.' || isdigit(first)) {
+      operands.push_back(token);
+      continue;
+    }
+    if (token == "BT") {
+      origin_x = origin_y = 0;
+      rise = 0;
+    } else if (token == "Ts" && !operands.empty()) {
+      rise = number(operands.back());
+    } else if (token == "Tf" && operands.size() >= 2) {
+      font = operands[operands.size() - 2].substr(1);
+      size = number(operands.back());
+    } else if ((token == "Td" || token == "TD") && operands.size() >= 2) {
+      origin_x += number(operands[operands.size() - 2]);
+      origin_y += number(operands.back());
+      if (token == "TD") {
+        leading = -number(operands.back());
+      }
+    } else if (token == "TL" && !operands.empty()) {
+      leading = number(operands.back());
+    } else if (token == "T*") {
+      origin_y -= leading;
+    } else if (token == "Tm" && operands.size() >= 6) {
+      origin_x = number(operands[operands.size() - 2]);
+      origin_y = number(operands.back());
+    } else if (token == "Tj" && !operands.empty()) {
+      push_segment(DecodePdfString(operands.back()));
+    } else if (token == "'" && !operands.empty()) {
+      origin_y -= leading;
+      push_segment(DecodePdfString(operands.back()));
+    } else if (token == "TJ") {
+      std::string text;
+      for (const std::string& operand : operands) {
+        if (!operand.empty() && (operand[0] == '(' || operand[0] == '<')) {
+          text += DecodePdfString(operand);
+        }
+      }
+      push_segment(text);
+    }
+    operands.clear();
+  }
+  return segments;
+}
+
+// One drawn character with its position, expanded from the segments with
+// the font's own widths (both appearances name standard-14 fonts).
+struct PlacedChar {
+  char ch;
+  float x;
+  float y;
+  float size;
+};
+
+std::vector<PlacedChar> PlaceCharacters(FPDF_DOCUMENT doc,
+                                        FPDF_ANNOTATION annot,
+                                        const std::string& content) {
+  std::vector<PlacedChar> placed;
+  CPDF_Document* cpdf_doc = CPDFDocumentFromFPDFDocument(doc);
+  for (const TextSegment& segment : ParseTextSegments(content)) {
+    RetainPtr<const CPDF_Dictionary> font_dict =
+        GetAppearanceFontDict(annot, ByteString(segment.font.c_str()));
+    RetainPtr<CPDF_Font> font =
+        font_dict
+            ? CPDF_Font::GetStockFont(
+                  cpdf_doc, font_dict->GetNameFor("BaseFont").AsStringView())
+            : nullptr;
+    float x = segment.x;
+    for (char ch : segment.text) {
+      if (ch != ' ') {
+        placed.push_back({ch, x, segment.y, segment.size});
+      }
+      const int width =
+          font ? font->GetCharWidthF(static_cast<uint8_t>(ch)) : 0;
+      x += width * segment.size / 1000.0f;
+    }
+  }
+  return placed;
+}
+
+// A stroked horizontal segment ("w", "m", "l S") after ET: a decoration.
+struct StrokedSegment {
+  float width = 0;
+  float x0 = 0;
+  float x1 = 0;
+  float y = 0;
+};
+
+std::vector<StrokedSegment> ParseStrokedSegments(const std::string& content) {
+  std::vector<StrokedSegment> segments;
+  const size_t et = content.find("\nET\n");
+  if (et == std::string::npos) {
+    return segments;
+  }
+  std::istringstream in(content.substr(et + 4));
+  std::vector<std::string> operands;
+  StrokedSegment current;
+  std::string token;
+  while (in >> token) {
+    if (token == "w" && !operands.empty()) {
+      current.width = static_cast<float>(atof(operands.back().c_str()));
+    } else if (token == "m" && operands.size() >= 2) {
+      current.x0 =
+          static_cast<float>(atof(operands[operands.size() - 2].c_str()));
+      current.y = static_cast<float>(atof(operands.back().c_str()));
+    } else if (token == "l" && operands.size() >= 2) {
+      current.x1 =
+          static_cast<float>(atof(operands[operands.size() - 2].c_str()));
+    } else if (token == "S") {
+      segments.push_back(current);
+    } else if (isdigit(static_cast<unsigned char>(token[0])) ||
+               token[0] == '-' || token[0] == '.') {
+      operands.push_back(token);
+      continue;
+    }
+    operands.clear();
+  }
+  return segments;
+}
+
+// The first clipping rectangle of a content stream: the `x y w h re` that a
+// `W` follows — Acrobat's text plate (`re\nW\nn`) and ours (`re W n`).
+std::optional<CFX_FloatRect> ParseClipRect(const std::string& content) {
+  std::istringstream in(content);
+  std::vector<std::string> operands;
+  std::optional<CFX_FloatRect> last_re;
+  std::string previous;
+  std::string token;
+  while (in >> token) {
+    if (token == "re" && operands.size() >= 4) {
+      const float x =
+          static_cast<float>(atof(operands[operands.size() - 4].c_str()));
+      const float y =
+          static_cast<float>(atof(operands[operands.size() - 3].c_str()));
+      const float w =
+          static_cast<float>(atof(operands[operands.size() - 2].c_str()));
+      const float h = static_cast<float>(atof(operands.back().c_str()));
+      last_re = CFX_FloatRect(x, y, x + w, y + h);
+    } else if (token == "W" && previous == "re" && last_re.has_value()) {
+      return last_re;
+    } else if (isdigit(static_cast<unsigned char>(token[0])) ||
+               token[0] == '-' || token[0] == '.') {
+      operands.push_back(token);
+      previous = token;
+      continue;
+    }
+    operands.clear();
+    previous = token;
+  }
+  return std::nullopt;
+}
+
+std::string RichTextJsonRuns(const std::string& json) {
+  const size_t start = json.find("\"paragraphs\"");
+  return start == std::string::npos ? std::string() : json.substr(start);
+}
+
+}  // namespace
+
+// D3 (Phase C note §7): the three Acrobat fixtures regenerated by our
+// engine place every glyph within 0.05 pt of where Acrobat placed it, at
+// the same size, in the same order. Acrobat's own appearance is read back
+// from the file before the regeneration replaces it.
+class RichTextParityTest : public FPDFAnnotEmbedderTest {
+ protected:
+  struct Deviation {
+    // Characters of one line Acrobat centred in a width 2 pt wider than
+    // the text area (the line "I want to tell" of the properties fixture,
+    // measured 110.05 against the 109.05 every other line's rule gives).
+    // Recorded, not reproduced.
+    std::string chars;
+    float acrobat_extra_x;
+  };
+
+  void CompareFixture(const char* fixture,
+                      int annot_index,
+                      const std::vector<Deviation>& deviations) {
+    ASSERT_TRUE(OpenDocument(fixture));
+    CompareOpenAnnot(annot_index, deviations);
+  }
+
+  // One annotation of the OPEN document: our regenerated appearance places
+  // every glyph where Acrobat's did, and clips the text to the same plate.
+  void CompareOpenAnnot(int annot_index,
+                        const std::vector<Deviation>& deviations) {
+    ScopedPage page = LoadScopedPage(0);
+    ASSERT_TRUE(page);
+    ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(page.get(), annot_index));
+    ASSERT_TRUE(annot);
+    const ByteString acrobat_stream =
+        GetNormalAppearanceStreamBytes(annot.get());
+    ASSERT_FALSE(acrobat_stream.IsEmpty());
+    const std::vector<PlacedChar> acrobat = PlaceCharacters(
+        document(), annot.get(), std::string(acrobat_stream.c_str()));
+    ASSERT_FALSE(acrobat.empty());
+
+    ASSERT_TRUE(EPDFAnnot_GenerateAppearance(annot.get()));
+    const ByteString our_stream = GetNormalAppearanceStreamBytes(annot.get());
+    EXPECT_NE(acrobat_stream, our_stream);
+    const std::vector<PlacedChar> ours = PlaceCharacters(
+        document(), annot.get(), std::string(our_stream.c_str()));
+
+    // The plate: the box deflated by twice the border width, on every side.
+    const std::optional<CFX_FloatRect> acrobat_clip =
+        ParseClipRect(std::string(acrobat_stream.c_str()));
+    const std::optional<CFX_FloatRect> our_clip =
+        ParseClipRect(std::string(our_stream.c_str()));
+    ASSERT_TRUE(acrobat_clip.has_value());
+    ASSERT_TRUE(our_clip.has_value());
+    EXPECT_NEAR(acrobat_clip->left, our_clip->left, 0.02f);
+    EXPECT_NEAR(acrobat_clip->bottom, our_clip->bottom, 0.02f);
+    EXPECT_NEAR(acrobat_clip->right, our_clip->right, 0.02f);
+    EXPECT_NEAR(acrobat_clip->top, our_clip->top, 0.02f);
+
+    std::string acrobat_text;
+    std::string our_text;
+    for (const PlacedChar& c : acrobat) {
+      acrobat_text += c.ch;
+    }
+    for (const PlacedChar& c : ours) {
+      our_text += c.ch;
+    }
+    ASSERT_EQ(acrobat_text, our_text);
+    size_t deviation_index = 0;
+    size_t deviation_pos = 0;
+    for (size_t i = 0; i < acrobat.size(); ++i) {
+      float tolerance = 0.06f;
+      float expected_x = acrobat[i].x;
+      if (deviation_index < deviations.size()) {
+        const Deviation& deviation = deviations[deviation_index];
+        if (deviation_pos == 0) {
+          deviation_pos = acrobat_text.find(deviation.chars, i);
+        }
+        if (i >= deviation_pos && i < deviation_pos + deviation.chars.size()) {
+          expected_x = acrobat[i].x - deviation.acrobat_extra_x;
+          tolerance = 0.06f;
+          if (i + 1 == deviation_pos + deviation.chars.size()) {
+            ++deviation_index;
+            deviation_pos = 0;
+          }
+        }
+      }
+      EXPECT_NEAR(expected_x, ours[i].x, tolerance)
+          << "char '" << acrobat[i].ch << "' at index " << i;
+      EXPECT_NEAR(acrobat[i].y, ours[i].y, 0.05f)
+          << "char '" << acrobat[i].ch << "' at index " << i;
+      EXPECT_NEAR(acrobat[i].size, ours[i].size, 0.01f)
+          << "char '" << acrobat[i].ch << "' at index " << i;
+    }
+    EXPECT_EQ(acrobat.size(), ours.size());
+  }
+};
+
+TEST_F(RichTextParityTest, LinesFixtureMatchesAcrobat) {
+  // Helvetica 22, five wrapped lines and a hard break: the 0.830 ascent,
+  // the 1.2 em pitch, Arial-vs-AFM widths within 0.02 pt per word.
+  CompareFixture("freetext_rich_text_acrobat_lines.pdf", 0, {});
+}
+
+TEST_F(RichTextParityTest, DecorationsFixtureMatchesAcrobat) {
+  // Bold, italic, word-underline and line-through runs in one line: run
+  // splits and the decoration geometry.
+  CompareFixture("freetext_rich_text_acrobat_decorations.pdf", 0, {});
+  ScopedPage page = LoadScopedPage(0);
+  ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(page.get(), 0));
+  // Acrobat: "0.652 w 214.564 588.283 m 258.591 588.283 l S" under "how",
+  // "0.797 w 351.978 597.847 m 424.048 597.847 l S" through "doing?".
+  // Ours: the same segments from the 0.44/0.16 descent and 0.39/0.04 ascent
+  // rules, Arial-vs-AFM widths aside.
+  const std::vector<StrokedSegment> strokes = ParseStrokedSegments(
+      std::string(GetNormalAppearanceStreamBytes(annot.get()).c_str()));
+  ASSERT_EQ(2u, strokes.size());
+  EXPECT_NEAR(0.652f, strokes[0].width, 0.002f);
+  EXPECT_NEAR(214.564f, strokes[0].x0, 0.05f);
+  EXPECT_NEAR(258.591f, strokes[0].x1, 0.05f);
+  EXPECT_NEAR(588.283f, strokes[0].y, 0.01f);
+  EXPECT_NEAR(0.797f, strokes[1].width, 0.002f);
+  EXPECT_NEAR(351.978f, strokes[1].x0, 0.05f);
+  EXPECT_NEAR(424.048f, strokes[1].x1, 0.05f);
+  EXPECT_NEAR(597.847f, strokes[1].y, 0.01f);
+}
+
+TEST_F(RichTextParityTest, PropertiesFixtureMatchesAcrobat) {
+  // Centred paragraph, an empty line, a size change mid-paragraph.
+  CompareFixture("freetext_rich_text_acrobat_properties.pdf", 0, {});
+}
+
+TEST_F(RichTextParityTest, BorderWidthsFixtureMatchesAcrobat) {
+  // Thirteen boxes, Helvetica 24, borders 1–12 pt (index 0: 10 pt, seven
+  // wrapped lines). The plate is the box deflated by 2 × the border width,
+  // so both the clip and the line breaks follow Acrobat at every width —
+  // "border + 1" only ever matched the 1 pt fixtures.
+  ASSERT_TRUE(OpenDocument("freetext_rich_text_acrobat_border_widths.pdf"));
+  for (int i = 0; i < 13; ++i) {
+    SCOPED_TRACE(testing::Message() << "annotation " << i);
+    CompareOpenAnnot(i, {});
+  }
+}
+
+TEST_F(RichTextParityTest, CalloutWidthsFixtureMatchesAcrobat) {
+  // Six callouts, borders 1–7 pt: the text box is /Rect inset by /RD, and
+  // the plate is that box deflated by 2 × the border width — the same rule
+  // as a plain box (the callout constant was never measured).
+  ASSERT_TRUE(OpenDocument("freetext_rich_text_acrobat_callout_widths.pdf"));
+  for (int i = 0; i < 6; ++i) {
+    SCOPED_TRACE(testing::Message() << "annotation " << i);
+    CompareOpenAnnot(i, {});
+  }
+}
+
+TEST_F(RichTextParityTest, SubSuperscriptFixtureMatchesAcrobat) {
+  // 0.66 × size, rise −0.15 / +0.31 em, the last run's descent, the
+  // superscript raising its line.
+  CompareFixture("freetext_rich_text_acrobat_properties.pdf", 2, {});
+}
+
+// D2 / §6 of the Phase C note: the set-API writes RC, DS, DA, Contents and
+// the appearance in one go, in Acrobat's shapes, and reads back the same
+// document.
+TEST_F(FPDFAnnotEmbedderTest, SetRichTextJSONWritesAllFourForms) {
+  ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+  ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 400, 400));
+  ScopedFPDFAnnotation annot(
+      FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+  ASSERT_TRUE(annot);
+  const FS_RECTF rect{50.0f, 320.0f, 350.0f, 250.0f};
+  ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+
+  const char kJson[] =
+      "{\"body\":{\"family\":\"Helvetica\",\"weight\":400,\"italic\":false,"
+      "\"size\":18,\"color\":\"#102030\",\"align\":\"left\"},"
+      "\"paragraphs\":[{\"runs\":[{\"text\":\"Hello \"},"
+      "{\"text\":\"bold\",\"style\":{\"weight\":700}},"
+      "{\"text\":\" red\",\"style\":{\"color\":\"#FF0000\"}}]},"
+      "{\"align\":\"center\",\"runs\":[{\"text\":\"H\"},"
+      "{\"text\":\"2\",\"style\":{\"script\":\"sub\"}},{\"text\":\"O\"}]}]}";
+  ASSERT_TRUE(EPDFAnnot_SetRichTextJSON(annot.get(), kJson));
+
+  CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot.get());
+  const CPDF_Dictionary* dict = context->GetAnnotDict();
+  EXPECT_EQ("0 0 0 rg /Helv 18 Tf", dict->GetByteStringFor("DA"));
+  EXPECT_EQ(
+      L"font: Helvetica,sans-serif 18.0pt; text-align:left; "
+      L"color:#000000",
+      dict->GetUnicodeTextFor("DS"));
+  EXPECT_EQ(L"Hello bold red\rH2O", dict->GetUnicodeTextFor("Contents"));
+  const WideString rc = dict->GetUnicodeTextFor("RC");
+  EXPECT_TRUE(rc.Contains(
+      L"<?xml version=\"1.0\"?><body xmlns=\"http://www.w3.org/1999/xhtml\" "
+      L"xmlns:xfa=\"http://www.xfa.org/schema/xfa-data/1.0/\" "
+      L"xfa:APIVersion=\"EmbedPDF:1.0\" xfa:spec=\"2.0.2\" "
+      L"style=\"font-size:18.0pt;text-align:left;color:#102030;"
+      L"font-weight:normal;font-style:normal;font-family:Helvetica;"
+      L"font-stretch:normal\">"));
+  EXPECT_TRUE(
+      rc.Contains(L"<p dir=\"ltr\">Hello <span style=\"font-weight:"
+                  L"bold\">bold</span><span style=\"color:#FF0000\">"
+                  L" red</span></p>"));
+  EXPECT_TRUE(
+      rc.Contains(L"<p dir=\"ltr\" style=\"text-align:center\">H<span "
+                  L"style=\"vertical-align:-0.0pt\">2</span>O</p>"));
+
+  // Fonts: Helvetica for the body and Helvetica-Bold for the bold run,
+  // under Acrobat's aliases; /DR carries the DA font.
+  EXPECT_TRUE(GetAppearanceFontDict(annot.get(), "Helv"));
+  EXPECT_TRUE(GetAppearanceFontDict(annot.get(), "HeBo"));
+  EXPECT_EQ("Helvetica-Bold",
+            GetAppearanceFontDict(annot.get(), "HeBo")->GetNameFor("BaseFont"));
+  EXPECT_TRUE(GetDrFontEntry(doc.get(), "Helv"));
+  const std::wstring ap = GetNormalAppearance(annot.get());
+  EXPECT_THAT(ap, HasSubstr(L"/Helv 18 Tf"));
+  EXPECT_THAT(ap, HasSubstr(L"/HeBo 18 Tf"));
+  EXPECT_THAT(ap, HasSubstr(L"1 0 0 rg"));
+  EXPECT_THAT(ap, HasSubstr(L"/Helv 11.88 Tf"));
+  EXPECT_THAT(ap, HasSubstr(L"-2.7 Ts"));
+
+  // Round trip through the getter.
+  const std::string json = GetRichTextJson(annot.get());
+  EXPECT_NE(std::string::npos, json.find("\"source\":\"rc\""));
+  EXPECT_NE(std::string::npos, json.find("\"family\":\"Helvetica\""));
+  EXPECT_NE(std::string::npos, json.find("\"color\":\"#102030\""));
+  EXPECT_NE(std::string::npos,
+            json.find("{\"text\":\"bold\",\"style\":{\"weight\":700}}"));
+  EXPECT_NE(std::string::npos,
+            json.find("{\"text\":\"2\",\"style\":{\"script\":\"sub\"}}"));
+}
+
+TEST_F(FPDFAnnotEmbedderTest, SetRichTextJSONWithoutBodyKeepsCurrentBody) {
+  ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+  ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 400, 400));
+  ScopedFPDFAnnotation annot(
+      FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+  ASSERT_TRUE(annot);
+  const FS_RECTF rect{50.0f, 320.0f, 350.0f, 250.0f};
+  ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+  ASSERT_TRUE(EPDFAnnot_SetDefaultAppearance(annot.get(), FPDF_FONT_TIMES_BOLD,
+                                             14.0f, 255, 0, 0));
+  // A plain-text replacement (plan §4.7, "contents only"): one run, no body.
+  ASSERT_TRUE(EPDFAnnot_SetRichTextJSON(
+      annot.get(), "{\"paragraphs\":[{\"runs\":[{\"text\":\"Plain\"}]}]}"));
+  CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot.get());
+  const CPDF_Dictionary* dict = context->GetAnnotDict();
+  const ByteString da = dict->GetByteStringFor("DA");
+  EXPECT_TRUE(da.Contains("1 0 0 rg")) << da;
+  EXPECT_TRUE(da.Contains(" 14 Tf")) << da;
+  EXPECT_EQ(L"Plain", dict->GetUnicodeTextFor("Contents"));
+  EXPECT_TRUE(dict->GetUnicodeTextFor("RC").Contains(
+      L"font-size:14.0pt;text-align:left;color:#FF0000;font-weight:bold;"
+      L"font-style:normal;font-family:Times"));
+  EXPECT_TRUE(dict->GetUnicodeTextFor("DS").Contains(L"font: bold Times"));
+}
+
+TEST_F(FPDFAnnotEmbedderTest, SetRichTextJSONRejectsInvalidInputUnchanged) {
+  ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+  ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 400, 400));
+  ScopedFPDFAnnotation annot(
+      FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+  ASSERT_TRUE(annot);
+  const FS_RECTF rect{50.0f, 320.0f, 350.0f, 250.0f};
+  ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+  ASSERT_TRUE(EPDFAnnot_SetDefaultAppearance(annot.get(), FPDF_FONT_HELVETICA,
+                                             12.0f, 0, 0, 0));
+  CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot.get());
+  const std::string before = SerializeObject(context->GetAnnotDict());
+  const uint32_t last_obj =
+      CPDFDocumentFromFPDFDocument(doc.get())->GetLastObjNum();
+
+  EXPECT_FALSE(EPDFAnnot_SetRichTextJSON(annot.get(), "not json"));
+  EXPECT_FALSE(EPDFAnnot_SetRichTextJSON(annot.get(), "{}"));
+  EXPECT_FALSE(EPDFAnnot_SetRichTextJSON(
+      annot.get(), "{\"paragraphs\":[{\"runs\":[{\"text\":5}]}]}"));
+  EXPECT_FALSE(EPDFAnnot_SetRichTextJSON(
+      annot.get(),
+      "{\"paragraphs\":[{\"runs\":[{\"text\":\"a\",\"style\":{\"color\":"
+      "\"red\"}}]}]}"));
+  EXPECT_FALSE(EPDFAnnot_SetRichTextJSON(annot.get(), nullptr));
+  EXPECT_FALSE(EPDFAnnot_SetRichTextXHTML(annot.get(), nullptr));
+  // A prolog with no element at all: nothing to lay out (an unclosed tag
+  // is tolerated by the XML parser, as it is by Acrobat).
+  ScopedFPDFWideString malformed =
+      GetFPDFWideString(L"<?xml version=\"1.0\"?>");
+  EXPECT_FALSE(EPDFAnnot_SetRichTextXHTML(annot.get(), malformed.get()));
+
+  EXPECT_EQ(before, SerializeObject(context->GetAnnotDict()));
+  EXPECT_EQ(last_obj, CPDFDocumentFromFPDFDocument(doc.get())->GetLastObjNum());
+
+  // An empty rect is a failure too.
+  const FS_RECTF empty{50.0f, 320.0f, 50.0f, 320.0f};
+  ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &empty));
+  EXPECT_FALSE(EPDFAnnot_SetRichTextJSON(
+      annot.get(), "{\"paragraphs\":[{\"runs\":[{\"text\":\"a\"}]}]}"));
+}
+
+TEST_F(FPDFAnnotEmbedderTest, SetRichTextXHTMLImportsOverDefaults) {
+  ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+  ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 400, 400));
+  ScopedFPDFAnnotation annot(
+      FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+  ASSERT_TRUE(annot);
+  const FS_RECTF rect{50.0f, 320.0f, 350.0f, 250.0f};
+  ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+  ASSERT_TRUE(EPDFAnnot_SetDefaultAppearance(annot.get(), FPDF_FONT_HELVETICA,
+                                             16.0f, 0, 0, 0));
+  ScopedFPDFWideString xhtml = GetFPDFWideString(
+      L"<body xmlns=\"http://www.w3.org/1999/xhtml\"><p>Imported <span "
+      L"style=\"font-style:italic;color:#00FF00\">text</span></p></body>");
+  ASSERT_TRUE(EPDFAnnot_SetRichTextXHTML(annot.get(), xhtml.get()));
+  CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot.get());
+  const CPDF_Dictionary* dict = context->GetAnnotDict();
+  EXPECT_EQ(L"Imported text", dict->GetUnicodeTextFor("Contents"));
+  EXPECT_TRUE(dict->GetUnicodeTextFor("RC").Contains(
+      L"<span style=\"color:#00FF00;font-style:italic\">text</span>"));
+  EXPECT_TRUE(GetAppearanceFontDict(annot.get(), "HeOb"));
+  const std::string json = GetRichTextJson(annot.get());
+  EXPECT_NE(std::string::npos, json.find("\"size\":16"));
+}
+
+TEST_F(FPDFAnnotEmbedderTest, SetRichTextJSONWithRegisteredBodyFont) {
+  ScopedRegisteredFonts scoped_fonts;
+  std::vector<uint8_t> roboto = LoadRobotoFontData();
+  ASSERT_FALSE(roboto.empty());
+  EPDF_FONT_ID roboto_id = EPDFFont_RegisterMemFont64(
+      "Roboto", /*weight=*/400, /*italic=*/0, roboto.data(), roboto.size());
+  ASSERT_NE(0u, roboto_id);
+  const ByteString alias = RegisteredFontAlias(roboto_id);
+
+  std::string saved;
+  {
+    ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+    ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 400, 400));
+    ScopedFPDFAnnotation annot(
+        FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+    ASSERT_TRUE(annot);
+    const FS_RECTF rect{50.0f, 320.0f, 350.0f, 250.0f};
+    ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+    ASSERT_TRUE(EPDFAnnot_SetRichTextJSON(
+        annot.get(),
+        "{\"body\":{\"family\":\"Roboto\",\"size\":20},"
+        "\"paragraphs\":[{\"runs\":[{\"text\":\"Registered \"},"
+        "{\"text\":\"Helvetica\",\"style\":{\"family\":\"Helvetica\"}}]}]}"));
+    CPDF_AnnotContext* context =
+        CPDFAnnotContextFromFPDFAnnotation(annot.get());
+    const CPDF_Dictionary* dict = context->GetAnnotDict();
+    EXPECT_EQ("0 0 0 rg /" + alias + " 20 Tf", dict->GetByteStringFor("DA"));
+    // The alias was reserved at Publish and /DR names the real subset.
+    EXPECT_EQ(
+        roboto_id,
+        CPDFDocumentFromFPDFDocument(doc.get())->LookupSessionFontAlias(alias));
+    RetainPtr<const CPDF_Dictionary> dr_entry =
+        GetDrFontEntry(doc.get(), alias);
+    ASSERT_TRUE(dr_entry);
+    EXPECT_TRUE(AppearanceFontHasEmbeddedSubset(dr_entry.Get()));
+    EXPECT_EQ(dr_entry.Get(), GetAppearanceFontDict(annot.get(), alias).Get());
+    EXPECT_TRUE(AppearanceFontMapsUnicode(dr_entry.Get(), 'R'));
+    EXPECT_TRUE(GetAppearanceFontDict(annot.get(), "Helv"));
+    const std::wstring ap = GetNormalAppearance(annot.get());
+    EXPECT_THAT(ap, HasSubstr(L"/" + std::wstring(alias.begin(), alias.end()) +
+                              L" 20 Tf"));
+    EXPECT_THAT(ap, HasSubstr(L"/Helv 20 Tf"));
+
+    unsigned long saved_size = 0;
+    void* saved_buffer =
+        EPDF_SaveDocumentToOwnedBuffer(doc.get(), /*flags=*/0, &saved_size);
+    ASSERT_TRUE(saved_buffer);
+    saved.assign(static_cast<const char*>(saved_buffer), saved_size);
+    EPDF_FreeBuffer(saved_buffer);
+  }
+  // Reopened: the body family reads back from the descriptor.
+  ScopedFPDFDocument doc(FPDF_LoadMemDocument(
+      saved.data(), static_cast<int>(saved.size()), nullptr));
+  ASSERT_TRUE(doc);
+  ScopedFPDFPage page(FPDF_LoadPage(doc.get(), 0));
+  ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(page.get(), 0));
+  const std::string json = GetRichTextJson(annot.get());
+  EXPECT_NE(std::string::npos, json.find("\"family\":\"Roboto\""));
+  EXPECT_NE(std::string::npos, json.find("\"source\":\"rc\""));
+}
+
+// D8 at the writer level (Phase C note §6): the second of two font
+// resources fails after the first was staged; nothing is written, not even
+// the /DA alias reservation, and the same call succeeds afterwards.
+// Alignment lives on the annotation (/Q, then the /DS and /RC body). Paragraphs
+// the JSON sends without an alignment — the editor's commit, the toggle's
+// body write — keep following it, across the plain → rich transition and on
+// a rich box; and the echo names a paragraph's alignment only where it
+// differs from the body, so nothing pins a block to a resolved value.
+TEST_F(FPDFAnnotEmbedderTest, RichTextAlignmentFollowsTheAnnotation) {
+  ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+  ASSERT_TRUE(doc);
+  ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 400, 400));
+  ASSERT_TRUE(page);
+  static constexpr const char* kAlignNames[] = {"left", "center", "right"};
+  float x[3] = {0, 0, 0};
+  for (int q = 0; q < 3; ++q) {
+    SCOPED_TRACE(kAlignNames[q]);
+    ScopedFPDFAnnotation annot(
+        FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+    ASSERT_TRUE(annot);
+    const FS_RECTF rect{50.0f, 300.0f, 350.0f, 250.0f};
+    ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+    ASSERT_TRUE(EPDFAnnot_SetDefaultAppearance(
+        annot.get(), FPDF_FONT_HELVETICA, 12.0f, 0, 0, 0));
+    ASSERT_TRUE(EPDFAnnot_SetTextAlignment(annot.get(), static_cast<FPDF_TEXT_ALIGNMENT>(q)));
+    // A plain box becoming rich: paragraphs only, no body, no alignment.
+    ASSERT_TRUE(EPDFAnnot_SetRichTextJSON(
+        annot.get(), "{\"paragraphs\":[{\"runs\":[{\"text\":\"aligned\"}]}]}"));
+    EXPECT_EQ(q, static_cast<int>(EPDFAnnot_GetTextAlignment(annot.get())));
+    const std::string json = GetRichTextJson(annot.get());
+    EXPECT_NE(std::string::npos,
+              json.find(std::string("\"align\":\"") + kAlignNames[q] +
+                        "\",\"dir\":\"ltr\""))
+        << json;
+    EXPECT_NE(std::string::npos, json.find("\"paragraphs\":[{\"runs\""))
+        << json;
+    const std::vector<PlacedChar> placed = PlaceCharacters(
+        doc.get(), annot.get(),
+        std::string(GetNormalAppearanceStreamBytes(annot.get()).c_str()));
+    ASSERT_FALSE(placed.empty());
+    x[q] = placed[0].x;
+  }
+  // Left, centre and right of the same plate: the centred line starts
+  // halfway between the other two.
+  EXPECT_LT(x[0] + 20.0f, x[1]);
+  EXPECT_LT(x[1] + 20.0f, x[2]);
+  EXPECT_NEAR((x[0] + x[2]) / 2, x[1], 0.05f);
+
+  // A body without an alignment (what a formatting toggle sends) keeps the
+  // annotation's too.
+  ScopedFPDFAnnotation bold(
+      FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+  ASSERT_TRUE(bold);
+  const FS_RECTF rect{50.0f, 200.0f, 350.0f, 150.0f};
+  ASSERT_TRUE(FPDFAnnot_SetRect(bold.get(), &rect));
+  ASSERT_TRUE(EPDFAnnot_SetDefaultAppearance(bold.get(), FPDF_FONT_HELVETICA,
+                                             12.0f, 0, 0, 0));
+  ASSERT_TRUE(EPDFAnnot_SetTextAlignment(bold.get(), static_cast<FPDF_TEXT_ALIGNMENT>(1)));
+  ASSERT_TRUE(EPDFAnnot_SetRichTextJSON(
+      bold.get(),
+      "{\"body\":{\"weight\":700},"
+      "\"paragraphs\":[{\"runs\":[{\"text\":\"aligned\"}]}]}"));
+  const std::string bold_json = GetRichTextJson(bold.get());
+  EXPECT_NE(std::string::npos,
+            bold_json.find("\"weight\":700,\"italic\":false"))
+      << bold_json;
+  EXPECT_NE(std::string::npos,
+            bold_json.find("\"align\":\"center\",\"dir\":\"ltr\""))
+      << bold_json;
+  EXPECT_NE(std::string::npos, bold_json.find("\"paragraphs\":[{\"runs\""))
+      << bold_json;
+  // A paragraph that says otherwise still wins.
+  ASSERT_TRUE(EPDFAnnot_SetRichTextJSON(
+      bold.get(),
+      "{\"paragraphs\":[{\"align\":\"right\",\"runs\":[{\"text\":\"r\"}]}]}"));
+  const std::string right_json = GetRichTextJson(bold.get());
+  EXPECT_NE(std::string::npos,
+            right_json.find("\"paragraphs\":[{\"align\":\"right\",\"runs\""))
+      << right_json;
+}
+
+// The plate rule for boxes we generate ourselves, at every width, including
+// a border that swallows the box (an empty plate: the border still paints,
+// no text is laid out). Plain /Contents and /RC boxes share the one engine.
+TEST_F(FPDFAnnotEmbedderTest, FreeTextPlateFollowsBorderWidth) {
+  {
+    ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+    ASSERT_TRUE(doc);
+    ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 400, 400));
+    ASSERT_TRUE(page);
+    for (const float width : {0.0f, 1.0f, 2.0f, 5.0f}) {
+      SCOPED_TRACE(testing::Message() << "border " << width);
+      ScopedFPDFAnnotation annot(
+          FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+      ASSERT_TRUE(annot);
+      const FS_RECTF rect{/*left=*/100.0f, /*top=*/300.0f, /*right=*/300.0f,
+                          /*bottom=*/200.0f};
+      ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+      ASSERT_TRUE(EPDFAnnot_SetDefaultAppearance(
+          annot.get(), FPDF_FONT_HELVETICA, 12.0f, 0, 0, 0));
+      ScopedFPDFWideString contents = GetFPDFWideString(L"plate");
+      ASSERT_TRUE(
+          FPDFAnnot_SetStringValue(annot.get(), "Contents", contents.get()));
+      ASSERT_TRUE(EPDFAnnot_SetBorderStyle(annot.get(), FPDF_ANNOT_BS_SOLID, width));
+      ASSERT_TRUE(EPDFAnnot_GenerateAppearance(annot.get()));
+      const std::string stream(
+          GetNormalAppearanceStreamBytes(annot.get()).c_str());
+      const float inset = 2 * width;
+      // The first Td is the plate's left edge; the baseline sits below the
+      // plate's top by the ascent; the clip is the plate.
+      const std::vector<PlacedChar> placed =
+          PlaceCharacters(doc.get(), annot.get(), stream);
+      ASSERT_FALSE(placed.empty());
+      EXPECT_NEAR(100.0f + inset, placed[0].x, 0.02f);
+      EXPECT_LT(placed[0].y, 300.0f - inset);
+      EXPECT_GT(placed[0].y, 300.0f - inset - 1.2f * 12.0f);
+      const std::optional<CFX_FloatRect> clip = ParseClipRect(stream);
+      ASSERT_TRUE(clip.has_value());
+      EXPECT_NEAR(100.0f + inset, clip->left, 0.01f);
+      EXPECT_NEAR(200.0f + inset, clip->bottom, 0.01f);
+      EXPECT_NEAR(300.0f - inset, clip->right, 0.01f);
+      EXPECT_NEAR(300.0f - inset, clip->top, 0.01f);
+    }
+    // A 60 pt border on a 200 × 100 box: the plate is empty. The
+    // appearance still generates (fill and border), and no glyph is placed.
+    ScopedFPDFAnnotation swallowed(
+        FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+    ASSERT_TRUE(swallowed);
+    const FS_RECTF rect{100.0f, 300.0f, 300.0f, 200.0f};
+    ASSERT_TRUE(FPDFAnnot_SetRect(swallowed.get(), &rect));
+    ASSERT_TRUE(EPDFAnnot_SetDefaultAppearance(
+        swallowed.get(), FPDF_FONT_HELVETICA, 12.0f, 0, 0, 0));
+    ScopedFPDFWideString contents = GetFPDFWideString(L"gone");
+    ASSERT_TRUE(
+        FPDFAnnot_SetStringValue(swallowed.get(), "Contents", contents.get()));
+    ASSERT_TRUE(
+        EPDFAnnot_SetBorderStyle(swallowed.get(), FPDF_ANNOT_BS_SOLID, 60.0f));
+    ASSERT_TRUE(EPDFAnnot_GenerateAppearance(swallowed.get()));
+    const std::string stream(
+        GetNormalAppearanceStreamBytes(swallowed.get()).c_str());
+    EXPECT_NE(std::string::npos, stream.find(" re"));  // the border
+    EXPECT_EQ(std::string::npos, stream.find("BT"));
+  }
+}
+
+// The document-level typographic features switch (kerning/ligatures off by
+// default for Acrobat parity).
+TEST_F(FPDFAnnotEmbedderTest, TypographicFeaturesSwitch) {
+  ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+  EXPECT_FALSE(EPDFDoc_GetTypographicFeatures(doc.get()));
+  EXPECT_TRUE(EPDFDoc_SetTypographicFeatures(doc.get(), true));
+  EXPECT_TRUE(EPDFDoc_GetTypographicFeatures(doc.get()));
+  EXPECT_TRUE(EPDFDoc_SetTypographicFeatures(doc.get(), false));
+  EXPECT_FALSE(EPDFDoc_GetTypographicFeatures(doc.get()));
+}
+
+TEST_F(FPDFAnnotEmbedderTest, RichTextWriterFailureLeavesDocumentUntouched) {
+  ScopedRegisteredFonts scoped_fonts;
+  std::vector<uint8_t> roboto = LoadRobotoFontData();
+  std::vector<uint8_t> amiri = LoadAmiriFontData();
+  ASSERT_FALSE(roboto.empty());
+  ASSERT_FALSE(amiri.empty());
+  EPDF_FONT_ID roboto_id = EPDFFont_RegisterMemFont64(
+      "Roboto", /*weight=*/400, /*italic=*/0, roboto.data(), roboto.size());
+  EPDF_FONT_ID amiri_id = EPDFFont_RegisterMemFont64(
+      "Amiri", /*weight=*/400, /*italic=*/0, amiri.data(), amiri.size());
+  ASSERT_NE(0u, roboto_id);
+  ASSERT_NE(0u, amiri_id);
+
+  ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+  ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 400, 400));
+  ScopedFPDFAnnotation annot(
+      FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+  ASSERT_TRUE(annot);
+  const FS_RECTF rect{50.0f, 320.0f, 350.0f, 250.0f};
+  ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+  CPDF_Document* cpdf_doc = CPDFDocumentFromFPDFDocument(doc.get());
+  CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot.get());
+  const std::string annot_before = SerializeObject(context->GetAnnotDict());
+  const std::string dr_before = SerializeDrDict(doc.get());
+  const uint32_t last_obj_before = cpdf_doc->GetLastObjNum();
+
+  const char kJson[] =
+      "{\"body\":{\"family\":\"Roboto\",\"size\":18},"
+      "\"paragraphs\":[{\"runs\":[{\"text\":\"Two \"},"
+      "{\"text\":\"fonts\",\"style\":{\"family\":\"Amiri\"}}]}]}";
+  CPDF_RichTextWriter::FailAfterStagedFontsForTesting(1);
+  EXPECT_FALSE(EPDFAnnot_SetRichTextJSON(annot.get(), kJson));
+  CPDF_RichTextWriter::FailAfterStagedFontsForTesting(0);
+
+  EXPECT_EQ(annot_before, SerializeObject(context->GetAnnotDict()));
+  EXPECT_EQ(dr_before, SerializeDrDict(doc.get()));
+  EXPECT_EQ(last_obj_before, cpdf_doc->GetLastObjNum());
+  EXPECT_FALSE(cpdf_doc->LookupSessionFontAlias(RegisteredFontAlias(roboto_id))
+                   .has_value());
+  EXPECT_FALSE(cpdf_doc->LookupSessionFontAlias(RegisteredFontAlias(amiri_id))
+                   .has_value());
+
+  ASSERT_TRUE(EPDFAnnot_SetRichTextJSON(annot.get(), kJson));
+  EXPECT_EQ(roboto_id,
+            cpdf_doc->LookupSessionFontAlias(RegisteredFontAlias(roboto_id)));
+  EXPECT_TRUE(
+      GetAppearanceFontDict(annot.get(), RegisteredFontAlias(roboto_id)));
+  EXPECT_TRUE(
+      GetAppearanceFontDict(annot.get(), RegisteredFontAlias(amiri_id)));
+  EXPECT_TRUE(GetDrFontEntry(doc.get(), RegisteredFontAlias(roboto_id)));
+}
+
+// D5, the right-to-left case: an Arabic run is shaped, written in visual
+// order under an ActualText span, and extracts as its logical text after
+// flattening.
+TEST_F(FPDFAnnotEmbedderTest, RichTextRtlRunCarriesActualTextAndExtracts) {
+  ScopedRegisteredFonts scoped_fonts;
+  std::vector<uint8_t> amiri = LoadAmiriFontData();
+  ASSERT_FALSE(amiri.empty());
+  ASSERT_NE(
+      0u, EPDFFont_RegisterMemFont64("Amiri", /*weight=*/400,
+                                     /*italic=*/0, amiri.data(), amiri.size()));
+  std::string saved;
+  {
+    ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+    ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 400, 400));
+    ScopedFPDFAnnotation annot(
+        FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+    ASSERT_TRUE(annot);
+    const FS_RECTF rect{50.0f, 320.0f, 350.0f, 250.0f};
+    ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+    ASSERT_TRUE(EPDFAnnot_SetRichTextJSON(
+        annot.get(),
+        "{\"body\":{\"family\":\"Amiri\",\"size\":24},"
+        "\"paragraphs\":[{\"dir\":\"rtl\",\"runs\":[{\"text\":"
+        "\"\\u0634\\u0643\\u0631\\u0627\"}]}]}"));
+    const std::wstring ap = GetNormalAppearance(annot.get());
+    EXPECT_THAT(ap,
+                HasSubstr(L"/Span <</ActualText <FEFF0634064306310627>>> BDC"));
+    EXPECT_THAT(ap, HasSubstr(L"EMC"));
+    ASSERT_TRUE(FPDFPage_Flatten(page.get(), FLAT_NORMALDISPLAY));
+    unsigned long saved_size = 0;
+    void* saved_buffer =
+        EPDF_SaveDocumentToOwnedBuffer(doc.get(), /*flags=*/0, &saved_size);
+    ASSERT_TRUE(saved_buffer);
+    saved.assign(static_cast<const char*>(saved_buffer), saved_size);
+    EPDF_FreeBuffer(saved_buffer);
+  }
+  ScopedFPDFDocument doc(FPDF_LoadMemDocument(
+      saved.data(), static_cast<int>(saved.size()), nullptr));
+  ASSERT_TRUE(doc);
+  ScopedFPDFPage page(FPDF_LoadPage(doc.get(), 0));
+  ASSERT_TRUE(page);
+  ScopedFPDFTextPage text_page(FPDFText_LoadPage(page.get()));
+  ASSERT_TRUE(text_page);
+  const int count = FPDFText_CountChars(text_page.get());
+  std::wstring extracted;
+  for (int i = 0; i < count; ++i) {
+    extracted += static_cast<wchar_t>(FPDFText_GetUnicode(text_page.get(), i));
+  }
+  std::string codepoints;
+  for (wchar_t ch : extracted) {
+    codepoints += ByteString::Format("U+%04X ", static_cast<int>(ch)).c_str();
+  }
+  EXPECT_NE(std::wstring::npos, extracted.find(L"\x0634\x0643\x0631\x0627"))
+      << "extracted: " << codepoints;
+}
+
+// Rung 2 of plan §3.3 (C note §1.3): a family that is no longer registered
+// but whose program is already in the document resolves to that program,
+// through a new Type0 dictionary that references the existing stream.
+TEST_F(FPDFAnnotEmbedderTest, RichTextResolvesDocumentProgramWhenUnregistered) {
+  ScopedRegisteredFonts scoped_fonts;
+  std::vector<uint8_t> roboto = LoadRobotoFontData();
+  ASSERT_FALSE(roboto.empty());
+  EPDF_FONT_ID roboto_id = EPDFFont_RegisterMemFont64(
+      "Roboto", /*weight=*/400, /*italic=*/0, roboto.data(), roboto.size());
+  ASSERT_NE(0u, roboto_id);
+
+  ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+  ASSERT_TRUE(EPDFDoc_SetFontEmbeddingPolicy(doc.get(),
+                                             EPDF_FONT_EMBEDDING_POLICY_FULL));
+  ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 400, 400));
+  ScopedFPDFAnnotation first(
+      FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+  ASSERT_TRUE(first);
+  const FS_RECTF rect{50.0f, 320.0f, 350.0f, 250.0f};
+  ASSERT_TRUE(FPDFAnnot_SetRect(first.get(), &rect));
+  ASSERT_TRUE(EPDFAnnot_SetRichTextJSON(
+      first.get(),
+      "{\"body\":{\"family\":\"Roboto\",\"size\":16},"
+      "\"paragraphs\":[{\"runs\":[{\"text\":\"ABC\"}]}]}"));
+  RetainPtr<const CPDF_Dictionary> first_font =
+      GetAppearanceFontDict(first.get(), RegisteredFontAlias(roboto_id));
+  ASSERT_TRUE(first_font);
+  RetainPtr<const CPDF_Stream> program =
+      GetType0FontDescriptor(first_font.Get())->GetStreamFor("FontFile2");
+  ASSERT_TRUE(program);
+  EXPECT_EQ(static_cast<int>(roboto.size()),
+            program->GetDict()->GetIntegerFor("Length1"));
+
+  // A later session without the registration: the family still resolves,
+  // to the program the file carries, with no second copy of it.
+  EPDFFont_ClearRegisteredFonts();
+  const uint32_t last_obj_before =
+      CPDFDocumentFromFPDFDocument(doc.get())->GetLastObjNum();
+  ScopedFPDFAnnotation second(
+      FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+  ASSERT_TRUE(second);
+  const FS_RECTF rect2{50.0f, 200.0f, 350.0f, 130.0f};
+  ASSERT_TRUE(FPDFAnnot_SetRect(second.get(), &rect2));
+  ASSERT_TRUE(EPDFAnnot_SetRichTextJSON(
+      second.get(),
+      "{\"body\":{\"family\":\"Roboto\",\"size\":16},"
+      "\"paragraphs\":[{\"runs\":[{\"text\":\"XYZ\"}]}]}"));
+  CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(second.get());
+  const ByteString alias = ByteString::Format("EDocF%u", program->GetObjNum());
+  EXPECT_EQ("0 0 0 rg /" + alias + " 16 Tf",
+            context->GetAnnotDict()->GetByteStringFor("DA"));
+  RetainPtr<const CPDF_Dictionary> second_font =
+      GetAppearanceFontDict(second.get(), alias);
+  ASSERT_TRUE(second_font);
+  EXPECT_NE(first_font.Get(), second_font.Get());
+  EXPECT_EQ("Type0", second_font->GetNameFor("Subtype"));
+  EXPECT_EQ(program.Get(), GetType0FontDescriptor(second_font.Get())
+                               ->GetStreamFor("FontFile2")
+                               .Get());
+  EXPECT_TRUE(AppearanceFontMapsUnicode(second_font.Get(), 'X'));
+  EXPECT_EQ(second_font.Get(), GetDrFontEntry(doc.get(), alias).Get());
+  EXPECT_EQ(L"Roboto", GetType0FontDescriptor(second_font.Get())
+                           ->GetUnicodeTextFor("FontFamily"));
+  // New dictionaries only: no font program was added.
+  int streams_added = 0;
+  CPDF_Document* cpdf_doc = CPDFDocumentFromFPDFDocument(doc.get());
+  for (uint32_t n = last_obj_before + 1; n <= cpdf_doc->GetLastObjNum(); ++n) {
+    RetainPtr<const CPDF_Object> object = cpdf_doc->GetIndirectObject(n);
+    if (object && object->IsStream() &&
+        object->AsStream()->GetDict()->KeyExist("Length1")) {
+      ++streams_added;
+    }
+  }
+  EXPECT_EQ(0, streams_added);
+  const std::string json = GetRichTextJson(second.get());
+  EXPECT_NE(std::string::npos, json.find("\"family\":\"Roboto\""));
+  // The regeneration pass every TS create runs (colour, geometry) resolves
+  // the family again with the /DA font now in /DR: every font the new
+  // appearance names is still there.
+  ASSERT_TRUE(EPDFAnnot_GenerateAppearance(second.get()));
+  ExpectAppearanceFontsResolve(second.get());
+  EXPECT_THAT(GetNormalAppearance(second.get()), Not(HasSubstr(L"<0000>")));
+}
+
+// A subset the document carries is not an authoring face for text it cannot
+// map. The fixture's ABCDEF+Helvetica (glyf/loca/hmtx only, renumbered, no
+// cmap, as producers emit for Identity-H) used to be borrowed for the family:
+// every character became glyph 0, and the regeneration pass then named a
+// font the appearance did not carry — an invisible box. Helvetica resolves
+// past it to the standard face, in both passes, visibly, through a save.
+TEST_F(FPDFAnnotEmbedderTest, RichTextSkipsDocumentSubsetWithoutCmap) {
+  ASSERT_TRUE(OpenDocument("freetext_document_subset_helvetica.pdf"));
+  FPDF_PAGE page = LoadPage(0);
+  ASSERT_TRUE(page);
+  const ScopedFPDFBitmap before = RenderLoadedPageWithFlags(page, FPDF_ANNOT);
+  // A border-less box over a blank part of the page: any ink is the text's.
+  const FS_RECTF rect{20.0f, 200.0f, 280.0f, 120.0f};
+  EXPECT_EQ(0, DarkPixels(before.get(), rect, /*inside=*/true));
+  {
+    ScopedFPDFAnnotation annot(FPDFPage_CreateAnnot(page, FPDF_ANNOT_FREETEXT));
+    ASSERT_TRUE(annot);
+    ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+    ASSERT_TRUE(FPDFAnnot_SetBorder(annot.get(), 0, 0, 0));
+    ASSERT_TRUE(EPDFAnnot_SetRichTextJSON(
+        annot.get(), RichTextJsonFor("Helvetica", 24, "Hello world").c_str()));
+    CPDF_AnnotContext* context =
+        CPDFAnnotContextFromFPDFAnnotation(annot.get());
+    EXPECT_EQ("0 0 0 rg /Helv 24 Tf",
+              context->GetAnnotDict()->GetByteStringFor("DA"));
+    std::wstring ap = GetNormalAppearance(annot.get());
+    EXPECT_THAT(ap, HasSubstr(L"/Helv 24 Tf"));
+    EXPECT_THAT(ap, Not(HasSubstr(L"EDocF")));
+    EXPECT_THAT(ap, Not(HasSubstr(L"<0000>")));
+    ExpectAppearanceFontsResolve(annot.get());
+
+    // The regeneration pass (every TS create regenerates after setting
+    // colour and geometry): the /DA font is now in /DR, the answer is the
+    // same.
+    ASSERT_TRUE(EPDFAnnot_GenerateAppearance(annot.get()));
+    ap = GetNormalAppearance(annot.get());
+    EXPECT_THAT(ap, HasSubstr(L"/Helv 24 Tf"));
+    EXPECT_THAT(ap, Not(HasSubstr(L"EDocF")));
+    EXPECT_THAT(ap, Not(HasSubstr(L"<0000>")));
+    ExpectAppearanceFontsResolve(annot.get());
+  }
+  // The subset was never borrowed: no /DR entry over its stream (object 8).
+  EXPECT_FALSE(GetDrFontEntry(document(), "EDocF8"));
+
+  // Visible: ink inside the box, nothing changed outside it.
+  const ScopedFPDFBitmap after = RenderLoadedPageWithFlags(page, FPDF_ANNOT);
+  EXPECT_GT(DarkPixels(after.get(), rect, /*inside=*/true), 100);
+  EXPECT_EQ(0, PixelsChangedOutside(before.get(), after.get(), rect));
+
+  // Through a save: still visible, and the text extracts once flattened.
+  unsigned long saved_size = 0;
+  void* saved_buffer =
+      EPDF_SaveDocumentToOwnedBuffer(document(), /*flags=*/0, &saved_size);
+  ASSERT_TRUE(saved_buffer);
+  std::string saved(static_cast<const char*>(saved_buffer), saved_size);
+  EPDF_FreeBuffer(saved_buffer);
+  UnloadPage(page);
+  {
+    ScopedFPDFDocument reloaded(FPDF_LoadMemDocument(
+        saved.data(), static_cast<int>(saved.size()), nullptr));
+    ASSERT_TRUE(reloaded);
+    ScopedFPDFPage reloaded_page(FPDF_LoadPage(reloaded.get(), 0));
+    ASSERT_TRUE(reloaded_page);
+    const ScopedFPDFBitmap rendered =
+        RenderPageWithFlags(reloaded_page.get(), nullptr, FPDF_ANNOT);
+    EXPECT_GT(DarkPixels(rendered.get(), rect, /*inside=*/true), 100);
+    ASSERT_TRUE(FPDFPage_Flatten(reloaded_page.get(), FLAT_NORMALDISPLAY));
+    unsigned long flat_size = 0;
+    void* flat_buffer =
+        EPDF_SaveDocumentToOwnedBuffer(reloaded.get(), /*flags=*/0, &flat_size);
+    ASSERT_TRUE(flat_buffer);
+    saved.assign(static_cast<const char*>(flat_buffer), flat_size);
+    EPDF_FreeBuffer(flat_buffer);
+  }
+  ScopedFPDFDocument flat(FPDF_LoadMemDocument(
+      saved.data(), static_cast<int>(saved.size()), nullptr));
+  ASSERT_TRUE(flat);
+  ScopedFPDFPage flat_page(FPDF_LoadPage(flat.get(), 0));
+  ASSERT_TRUE(flat_page);
+  EXPECT_NE(std::wstring::npos,
+            ExtractPageText(flat_page.get()).find(L"Hello world"));
+}
+
+// Coverage is trivially true for empty text, so eligibility on the bytes is
+// what keeps a cmap-less subset out of an empty box's /DA: a program that
+// maps nothing authors nothing, not even a glyph-0 placeholder.
+TEST_F(FPDFAnnotEmbedderTest, RichTextEmptyBoxNeverNamesACmaplessSubset) {
+  ASSERT_TRUE(OpenDocument("freetext_document_subset_helvetica.pdf"));
+  FPDF_PAGE page = LoadPage(0);
+  ASSERT_TRUE(page);
+  ScopedFPDFAnnotation annot(FPDFPage_CreateAnnot(page, FPDF_ANNOT_FREETEXT));
+  ASSERT_TRUE(annot);
+  const FS_RECTF rect{20.0f, 200.0f, 280.0f, 120.0f};
+  ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+  ASSERT_TRUE(EPDFAnnot_SetRichTextJSON(
+      annot.get(),
+      "{\"body\":{\"family\":\"Helvetica\",\"size\":24},\"paragraphs\":[]}"));
+  CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot.get());
+  EXPECT_EQ("0 0 0 rg /Helv 24 Tf",
+            context->GetAnnotDict()->GetByteStringFor("DA"));
+  EXPECT_TRUE(GetDrFontEntry(document(), "Helv"));
+  EXPECT_FALSE(GetDrFontEntry(document(), "EDocF8"));
+  UnloadPage(page);
+}
+
+// Our own subsets, in a later session without the registration (C note
+// §1.3): the subset is the face of text it covers and of nothing else. Text
+// it does not cover goes whole to the next rung — no glyph 0 for the
+// characters it lacks — and a plain box pinned to that subset by its /DA
+// falls through the same way while its /DA stays as written.
+TEST_F(FPDFAnnotEmbedderTest, RichTextDocumentSubsetDrawsOnlyWhatItCovers) {
+  ScopedRegisteredFonts scoped_fonts;
+  std::vector<uint8_t> roboto = LoadRobotoFontData();
+  ASSERT_FALSE(roboto.empty());
+  ASSERT_NE(0u, EPDFFont_RegisterMemFont64("Roboto", /*weight=*/400,
+                                           /*italic=*/0, roboto.data(),
+                                           roboto.size()));
+  std::string saved;
+  {
+    ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+    ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 400, 400));
+    ScopedFPDFAnnotation annot(
+        FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+    ASSERT_TRUE(annot);
+    const FS_RECTF rect{50.0f, 380.0f, 350.0f, 320.0f};
+    ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+    ASSERT_TRUE(EPDFAnnot_SetRichTextJSON(
+        annot.get(), RichTextJsonFor("Roboto", 16, "Hello").c_str()));
+    unsigned long saved_size = 0;
+    void* saved_buffer =
+        EPDF_SaveDocumentToOwnedBuffer(doc.get(), /*flags=*/0, &saved_size);
+    ASSERT_TRUE(saved_buffer);
+    saved.assign(static_cast<const char*>(saved_buffer), saved_size);
+    EPDF_FreeBuffer(saved_buffer);
+  }
+  EPDFFont_ClearRegisteredFonts();
+  ScopedFPDFDocument doc(FPDF_LoadMemDocument(
+      saved.data(), static_cast<int>(saved.size()), nullptr));
+  ASSERT_TRUE(doc);
+  ScopedFPDFPage page(FPDF_LoadPage(doc.get(), 0));
+  ASSERT_TRUE(page);
+  auto make_box = [&](float top) {
+    ScopedFPDFAnnotation annot(
+        FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+    const FS_RECTF rect{50.0f, top, 350.0f, top - 60.0f};
+    EXPECT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+    return annot;
+  };
+
+  // Covered: the subset (H, e, l, o) is the face, through its stream.
+  ScopedFPDFAnnotation covered = make_box(300.0f);
+  ASSERT_TRUE(EPDFAnnot_SetRichTextJSON(
+      covered.get(), RichTextJsonFor("Roboto", 16, "Hello").c_str()));
+  RetainPtr<const CPDF_Stream> program =
+      DefaultAppearanceProgram(covered.get());
+  ASSERT_TRUE(program);
+  const ByteString alias = ByteString::Format("EDocF%u", program->GetObjNum());
+  EXPECT_EQ(alias, GetDefaultAppearanceFontAlias(covered.get()));
+  EXPECT_THAT(GetNormalAppearance(covered.get()), Not(HasSubstr(L"<0000>")));
+  ExpectAppearanceFontsResolve(covered.get());
+
+  // Not covered (W, r, d): the whole request yields to the next rung, here
+  // the Helvetica substitute, and nothing is drawn as glyph 0.
+  ScopedFPDFAnnotation uncovered = make_box(220.0f);
+  ASSERT_TRUE(EPDFAnnot_SetRichTextJSON(
+      uncovered.get(), RichTextJsonFor("Roboto", 16, "World").c_str()));
+  EXPECT_EQ("Helv", GetDefaultAppearanceFontAlias(uncovered.get()));
+  std::wstring ap = GetNormalAppearance(uncovered.get());
+  EXPECT_THAT(ap, HasSubstr(L"/Helv 16 Tf"));
+  EXPECT_THAT(ap, Not(HasSubstr(L"EDocF")));
+  EXPECT_THAT(ap, Not(HasSubstr(L"<0000>")));
+  ExpectAppearanceFontsResolve(uncovered.get());
+  // The request keeps naming Roboto: a session with the font restores it.
+  EXPECT_NE(std::string::npos,
+            GetRichTextJson(uncovered.get()).find("\"family\":\"Roboto\""));
+
+  // A plain box whose /DA names the subset: covered text keeps the pinned
+  // face; an edit the subset cannot draw falls through, and regeneration
+  // never rewrites /DA.
+  ScopedFPDFAnnotation plain = make_box(140.0f);
+  const ByteString da = "0 0 0 rg /" + alias + " 16 Tf";
+  ScopedFPDFWideString da_value =
+      GetFPDFWideString(WideString::FromUTF8(da.AsStringView()).c_str());
+  ASSERT_TRUE(FPDFAnnot_SetStringValue(plain.get(), "DA", da_value.get()));
+  ScopedFPDFWideString hello = GetFPDFWideString(L"Hello");
+  ASSERT_TRUE(FPDFAnnot_SetStringValue(plain.get(), "Contents", hello.get()));
+  ASSERT_TRUE(EPDFAnnot_GenerateAppearance(plain.get()));
+  EXPECT_THAT(GetNormalAppearance(plain.get()),
+              HasSubstr(WideString::FromUTF8(("/" + alias + " 16 Tf").AsStringView()).c_str()));
+  ExpectAppearanceFontsResolve(plain.get());
+  ScopedFPDFWideString held = GetFPDFWideString(L"Held");
+  ASSERT_TRUE(FPDFAnnot_SetStringValue(plain.get(), "Contents", held.get()));
+  ASSERT_TRUE(EPDFAnnot_GenerateAppearance(plain.get()));
+  ap = GetNormalAppearance(plain.get());
+  EXPECT_THAT(ap, HasSubstr(L"/Helv 16 Tf"));
+  EXPECT_THAT(ap, Not(HasSubstr(L"<0000>")));
+  ExpectAppearanceFontsResolve(plain.get());
+  CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(plain.get());
+  EXPECT_EQ(da, context->GetAnnotDict()->GetByteStringFor("DA"));
+}
+
+// Two subsets of one family in the file, cut for different text: the one
+// that covers the request is its face, whatever order the resolver meets
+// them in; text neither covers goes to the next rung.
+TEST_F(FPDFAnnotEmbedderTest, RichTextPicksTheDocumentSubsetThatCoversTheText) {
+  ScopedRegisteredFonts scoped_fonts;
+  std::vector<uint8_t> roboto = LoadRobotoFontData();
+  ASSERT_FALSE(roboto.empty());
+  std::string saved;
+  auto author = [&](const char* text, float top) {
+    ASSERT_NE(0u, EPDFFont_RegisterMemFont64("Roboto", /*weight=*/400,
+                                             /*italic=*/0, roboto.data(),
+                                             roboto.size()));
+    ScopedFPDFDocument doc(saved.empty()
+                               ? FPDF_CreateNewDocument()
+                               : FPDF_LoadMemDocument(
+                                     saved.data(),
+                                     static_cast<int>(saved.size()), nullptr));
+    ASSERT_TRUE(doc);
+    ScopedFPDFPage page(saved.empty()
+                            ? FPDFPage_New(doc.get(), 0, 400, 400)
+                            : FPDF_LoadPage(doc.get(), 0));
+    ASSERT_TRUE(page);
+    ScopedFPDFAnnotation annot(
+        FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+    const FS_RECTF rect{50.0f, top, 350.0f, top - 60.0f};
+    ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+    ASSERT_TRUE(EPDFAnnot_SetRichTextJSON(
+        annot.get(), RichTextJsonFor("Roboto", 16, text).c_str()));
+    unsigned long saved_size = 0;
+    void* saved_buffer =
+        EPDF_SaveDocumentToOwnedBuffer(doc.get(), /*flags=*/0, &saved_size);
+    ASSERT_TRUE(saved_buffer);
+    saved.assign(static_cast<const char*>(saved_buffer), saved_size);
+    EPDF_FreeBuffer(saved_buffer);
+    EPDFFont_ClearRegisteredFonts();
+  };
+  author("Hello", 380.0f);  // subset 1: H e l o
+  author("World", 300.0f);  // subset 2: W o r l d
+  ScopedFPDFDocument doc(FPDF_LoadMemDocument(
+      saved.data(), static_cast<int>(saved.size()), nullptr));
+  ASSERT_TRUE(doc);
+  ScopedFPDFPage page(FPDF_LoadPage(doc.get(), 0));
+  ASSERT_TRUE(page);
+  std::vector<uint32_t> streams;
+  {
+    ScopedFPDFAnnotation first(FPDFPage_GetAnnot(page.get(), 0));
+    ScopedFPDFAnnotation second(FPDFPage_GetAnnot(page.get(), 1));
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(second);
+    RetainPtr<const CPDF_Stream> one = DefaultAppearanceProgram(first.get());
+    RetainPtr<const CPDF_Stream> two = DefaultAppearanceProgram(second.get());
+    ASSERT_TRUE(one);
+    ASSERT_TRUE(two);
+    ASSERT_NE(one.Get(), two.Get());
+    streams = {one->GetObjNum(), two->GetObjNum()};
+  }
+  auto resolve = [&](const char* text, float top) {
+    ScopedFPDFAnnotation annot(
+        FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+    const FS_RECTF rect{50.0f, top, 350.0f, top - 50.0f};
+    EXPECT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+    EXPECT_TRUE(EPDFAnnot_SetRichTextJSON(
+        annot.get(), RichTextJsonFor("Roboto", 16, text).c_str()));
+    EXPECT_THAT(GetNormalAppearance(annot.get()), Not(HasSubstr(L"<0000>")));
+    ExpectAppearanceFontsResolve(annot.get());
+    return GetDefaultAppearanceFontAlias(annot.get());
+  };
+  EXPECT_EQ(ByteString::Format("EDocF%u", streams[1]), resolve("World", 220.0f));
+  EXPECT_EQ(ByteString::Format("EDocF%u", streams[0]), resolve("Hello", 160.0f));
+  EXPECT_EQ("Helv", resolve("Held", 100.0f));
+}
+
+// C note §6, made true at the map: an appearance never names a font that is
+// not there. An entry the content named for glyph 0 alone still gets its
+// resource, and a named fallback is never installed as the /DA font.
+TEST_F(FPDFAnnotEmbedderTest, AnnotFontMapStagesEveryNamedFont) {
+  ScopedRegisteredFonts scoped_fonts;
+  std::vector<uint8_t> roboto = LoadRobotoFontData();
+  ASSERT_FALSE(roboto.empty());
+  EPDF_FONT_ID roboto_id = EPDFFont_RegisterMemFont64(
+      "Roboto", /*weight=*/400, /*italic=*/0, roboto.data(), roboto.size());
+  ASSERT_NE(0u, roboto_id);
+  ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+  ASSERT_TRUE(EPDFDoc_SetFontEmbeddingPolicy(doc.get(),
+                                             EPDF_FONT_EMBEDDING_POLICY_FULL));
+  ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 400, 400));
+  ScopedFPDFAnnotation seed(FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_FREETEXT));
+  ASSERT_TRUE(seed);
+  const FS_RECTF rect{50.0f, 320.0f, 350.0f, 250.0f};
+  ASSERT_TRUE(FPDFAnnot_SetRect(seed.get(), &rect));
+  ASSERT_TRUE(EPDFAnnot_SetRichTextJSON(
+      seed.get(), RichTextJsonFor("Roboto", 16, "ABC").c_str()));
+  EPDFFont_ClearRegisteredFonts();
+  const ByteString da_alias = RegisteredFontAlias(roboto_id);
+  RetainPtr<const CPDF_Dictionary> da_font_before =
+      GetDrFontEntry(doc.get(), da_alias);
+  ASSERT_TRUE(da_font_before);
+
+  CPDF_Document* cpdf_doc = CPDFDocumentFromFPDFDocument(doc.get());
+  CPDF_AnnotFontMap map(cpdf_doc, /*default_font=*/nullptr, da_alias,
+                        /*allow_registered_fallbacks=*/true,
+                        CFX_FontRegistry::kInvalidFontId,
+                        /*install_dr_entry=*/true);
+  const int entry = map.ResolveRichFace(L"Roboto", 400, false);
+  ASSERT_GT(entry, 0);  // rung 2: the whole program the seed embedded
+  const ByteString named = map.GetPDFFontAlias(entry);
+  ASSERT_FALSE(named.IsEmpty());
+  bool shared = false;
+  EXPECT_EQ(0u, map.EncodeRichGlyph(entry, /*gid=*/0, 0xFFFD, &shared));
+  std::optional<CPDF_AnnotFontMap::PreparedFontResources> prepared =
+      map.PrepareFontResources();
+  ASSERT_TRUE(prepared.has_value());
+  RetainPtr<CPDF_Dictionary> resources =
+      map.PublishFontResources(std::move(*prepared));
+  ASSERT_TRUE(resources);
+  EXPECT_TRUE(resources->KeyExist(named.AsStringView()));
+  EXPECT_EQ(da_font_before.Get(), GetDrFontEntry(doc.get(), da_alias).Get());
+  EXPECT_FALSE(GetDrFontEntry(doc.get(), named));
+}
+
+// Coverage is decided on Unicode scalars, not code units: a supplementary
+// character is one scalar to the coverage checks and to ToUnicode on every
+// platform, including one whose wchar_t is 16 bits and carries it as a
+// surrogate pair (neither half has a glyph anywhere). The document's whole
+// EmojiTest program maps U+1F600, so it is the request's face, and the
+// appearance draws its glyph with the character behind it.
+TEST_F(FPDFAnnotEmbedderTest, RichTextCoversSupplementaryCharactersByScalar) {
+  ASSERT_TRUE(OpenDocument("freetext_document_supplementary_font.pdf"));
+  FPDF_PAGE page = LoadPage(0);
+  ASSERT_TRUE(page);
+  ScopedFPDFAnnotation annot(FPDFPage_CreateAnnot(page, FPDF_ANNOT_FREETEXT));
+  ASSERT_TRUE(annot);
+  const FS_RECTF rect{20.0f, 200.0f, 280.0f, 120.0f};
+  ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+  // "A" then U+1F600 (UTF-8 F0 9F 98 80), a surrogate pair where wchar_t is
+  // 16 bits and one scalar elsewhere.
+  ASSERT_TRUE(EPDFAnnot_SetRichTextJSON(
+      annot.get(),
+      RichTextJsonFor("EmojiTest", 24, "A\xF0\x9F\x98\x80").c_str()));
+  EXPECT_EQ("EDocF8", GetDefaultAppearanceFontAlias(annot.get()));
+  const std::wstring ap = GetNormalAppearance(annot.get());
+  EXPECT_THAT(ap, HasSubstr(L"/EDocF8 24 Tf"));
+  EXPECT_THAT(ap, HasSubstr(L"<0001"));  // both characters draw glyph 1
+  EXPECT_THAT(ap, Not(HasSubstr(L"<0000>")));
+  ExpectAppearanceFontsResolve(annot.get());
+  // The glyph's ToUnicode entry is the letter it was first drawn for; the
+  // run carries the full text as ActualText since one glyph serves two
+  // scalars (the pair, never a lone surrogate).
+  EXPECT_THAT(ap, HasSubstr(L"/Span <</ActualText <FEFF0041D83DDE00>>> BDC"));
+  RetainPtr<const CPDF_Dictionary> font =
+      GetAppearanceFontDict(annot.get(), "EDocF8");
+  ASSERT_TRUE(font);
+  EXPECT_TRUE(AppearanceFontMapsUnicode(font.Get(), L'A'));
+  UnloadPage(page);
+}
+
+// The identity a host maps back to its own keys: family (given, else the
+// font's own), weight and italic, as the document will name the face.
+TEST_F(FPDFAnnotEmbedderTest, RegisteredFontIdentityGetters) {
+  ScopedRegisteredFonts scoped_fonts;
+  std::vector<uint8_t> roboto = LoadRobotoFontData();
+  ASSERT_FALSE(roboto.empty());
+  EPDF_FONT_ID named = EPDFFont_RegisterMemFont64(
+      "My Roboto", /*weight=*/700, /*italic=*/1, roboto.data(), roboto.size());
+  EPDF_FONT_ID inferred = EPDFFont_RegisterMemFont64(
+      "", /*weight=*/0, /*italic=*/-1, roboto.data(), roboto.size());
+  ASSERT_NE(0u, named);
+  ASSERT_NE(0u, inferred);
+
+  char buffer[64] = {};
+  const unsigned long length = EPDFFont_GetFamilyName(named, nullptr, 0);
+  ASSERT_EQ(strlen("My Roboto") + 1, length);
+  ASSERT_EQ(length, EPDFFont_GetFamilyName(named, buffer, sizeof(buffer)));
+  EXPECT_STREQ("My Roboto", buffer);
+  EXPECT_EQ(700, EPDFFont_GetWeight(named));
+  EXPECT_TRUE(EPDFFont_IsItalic(named));
+
+  ASSERT_LT(0u, EPDFFont_GetFamilyName(inferred, buffer, sizeof(buffer)));
+  EXPECT_STREQ("Roboto", buffer);
+  EXPECT_EQ(400, EPDFFont_GetWeight(inferred));
+  EXPECT_FALSE(EPDFFont_IsItalic(inferred));
+
+  EXPECT_EQ(0u, EPDFFont_GetFamilyName(999, buffer, sizeof(buffer)));
+  EXPECT_EQ(0, EPDFFont_GetWeight(999));
+  EXPECT_FALSE(EPDFFont_IsItalic(999));
+}
+
 TEST_F(FPDFAnnotEmbedderTest, FreeTextRegisteredFontMarkerSurvivesAliasSuffix) {
   ScopedRegisteredFonts scoped_fonts;
 
@@ -1304,7 +4597,8 @@ TEST_F(FPDFAnnotEmbedderTest, TextFieldKoreanUsesRegisteredDroidFallbackFont) {
     // The annotation-plane companion regenerates the same appearance.
     ASSERT_TRUE(EPDFAnnot_GenerateFormFieldAP(annot.get()));
     ExpectRegisteredAppearanceMapsUnicode(annot.get(), font_id,
-                                          {L'\xD55C', L'\xAE00'});
+                                          {L'\xD55C', L'\xAE00'},
+                                          /*expect_subset=*/false);
   }
   CloseDocument();
 }
@@ -1344,7 +4638,8 @@ TEST_F(FPDFAnnotEmbedderTest, ComboBoxKoreanUsesRegisteredDroidFallbackFont) {
 
     ASSERT_TRUE(EPDFAnnot_GenerateFormFieldAP(annot.get()));
     ExpectRegisteredAppearanceMapsUnicode(annot.get(), font_id,
-                                          {L'\xD55C', L'\xAE00'});
+                                          {L'\xD55C', L'\xAE00'},
+                                          /*expect_subset=*/false);
   }
   CloseDocument();
 }
@@ -1384,7 +4679,8 @@ TEST_F(FPDFAnnotEmbedderTest, ListBoxKoreanUsesRegisteredDroidFallbackFont) {
 
     ASSERT_TRUE(EPDFAnnot_GenerateFormFieldAP(annot.get()));
     ExpectRegisteredAppearanceMapsUnicode(annot.get(), font_id,
-                                          {L'\xD55C', L'\xAE00'});
+                                          {L'\xD55C', L'\xAE00'},
+                                          /*expect_subset=*/false);
   }
   CloseDocument();
 }
@@ -4997,6 +8293,438 @@ TEST_F(FPDFAnnotEmbedderTest, RedactInQuadsRejectsNonFiniteInput) {
   EXPECT_EQ(before, ExtractPageText(page.get()));
 }
 
+namespace {
+
+// Union of the text-page character boxes for `count` characters starting at
+// `start`, as an axis-aligned FS_QUADPOINTSF in PDF slot order
+// (upper-start, upper-end, lower-start, lower-end). This is how search hits
+// and selections hand regions to the redactor.
+FS_QUADPOINTSF QuadForCharRange(FPDF_TEXTPAGE text_page, int start, int count) {
+  double left = 0;
+  double right = 0;
+  double bottom = 0;
+  double top = 0;
+  for (int i = start; i < start + count; ++i) {
+    double l = 0;
+    double r = 0;
+    double b = 0;
+    double t = 0;
+    EXPECT_TRUE(FPDFText_GetCharBox(text_page, i, &l, &r, &b, &t));
+    if (i == start) {
+      left = l;
+      right = r;
+      bottom = b;
+      top = t;
+      continue;
+    }
+    left = std::min(left, l);
+    right = std::max(right, r);
+    bottom = std::min(bottom, b);
+    top = std::max(top, t);
+  }
+  FS_QUADPOINTSF quad;
+  quad.x1 = static_cast<float>(left);
+  quad.y1 = static_cast<float>(top);
+  quad.x2 = static_cast<float>(right);
+  quad.y2 = static_cast<float>(top);
+  quad.x3 = static_cast<float>(left);
+  quad.y3 = static_cast<float>(bottom);
+  quad.x4 = static_cast<float>(right);
+  quad.y4 = static_cast<float>(bottom);
+  return quad;
+}
+
+FS_RECTF RectForQuad(const FS_QUADPOINTSF& quad) {
+  return {std::min({quad.x1, quad.x2, quad.x3, quad.x4}),
+          std::max({quad.y1, quad.y2, quad.y3, quad.y4}),
+          std::max({quad.x1, quad.x2, quad.x3, quad.x4}),
+          std::min({quad.y1, quad.y2, quad.y3, quad.y4})};
+}
+
+}  // namespace
+
+// Two regions on ONE text object where the first region removes the object's
+// leading glyphs. The leading-gap shift must not displace the hit tests of
+// the glyphs that follow, otherwise the second region removes the wrong
+// glyphs: redacted text survives and neighbouring text is destroyed.
+TEST_F(FPDFAnnotEmbedderTest, RedactInQuadsMultipleRegionsOnOneTextObject) {
+  ASSERT_TRUE(OpenDocument("redact_multi_region_line.pdf"));
+  ScopedPage page = LoadScopedPage(0);
+  ASSERT_TRUE(page);
+
+  const std::wstring before = ExtractPageText(page.get());
+  const size_t first = before.find(L"SECRET1");
+  const size_t second = before.find(L"SECRET2");
+  ASSERT_EQ(0u, first);
+  ASSERT_NE(std::wstring::npos, second);
+
+  FS_QUADPOINTSF quads[2];
+  {
+    ScopedFPDFTextPage text_page(FPDFText_LoadPage(page.get()));
+    ASSERT_TRUE(text_page);
+    quads[0] = QuadForCharRange(text_page.get(), static_cast<int>(first), 7);
+    quads[1] = QuadForCharRange(text_page.get(), static_cast<int>(second), 7);
+  }
+
+  ASSERT_TRUE(EPDFText_RedactInQuads(page.get(), quads, 2,
+                                     /*recurse_forms=*/true,
+                                     /*draw_black_boxes=*/false));
+  ASSERT_TRUE(FPDFPage_GenerateContent(page.get()));
+  ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, 0));
+
+  ASSERT_TRUE(OpenSavedDocument());
+  FPDF_PAGE saved_page = LoadSavedPage(0);
+  ASSERT_TRUE(saved_page);
+  const std::wstring after = ExtractPageText(saved_page);
+  CloseSavedPage(saved_page);
+
+  EXPECT_EQ(std::wstring::npos, after.find(L"SECRET")) << after;
+  EXPECT_EQ(std::wstring::npos, after.find(L"ECRET")) << after;
+  EXPECT_NE(std::wstring::npos, after.find(L"keep this")) << after;
+  EXPECT_NE(std::wstring::npos, after.find(L"tail")) << after;
+}
+
+// Same scenario through the annotation-driven apply path, which batches every
+// REDACT annotation on the page into one sanitizer call.
+TEST_F(FPDFAnnotEmbedderTest, ApplyPageRedactionsTwoMarksOnOneTextObject) {
+  ASSERT_TRUE(OpenDocument("redact_multi_region_line.pdf"));
+  ScopedPage page = LoadScopedPage(0);
+  ASSERT_TRUE(page);
+
+  const std::wstring before = ExtractPageText(page.get());
+  const size_t first = before.find(L"SECRET1");
+  const size_t second = before.find(L"SECRET2");
+  ASSERT_EQ(0u, first);
+  ASSERT_NE(std::wstring::npos, second);
+
+  FS_QUADPOINTSF quads[2];
+  {
+    ScopedFPDFTextPage text_page(FPDFText_LoadPage(page.get()));
+    ASSERT_TRUE(text_page);
+    quads[0] = QuadForCharRange(text_page.get(), static_cast<int>(first), 7);
+    quads[1] = QuadForCharRange(text_page.get(), static_cast<int>(second), 7);
+  }
+  for (const FS_QUADPOINTSF& quad : quads) {
+    ScopedFPDFAnnotation annot(
+        FPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_REDACT));
+    ASSERT_TRUE(annot);
+    ASSERT_TRUE(FPDFAnnot_AppendAttachmentPoints(annot.get(), &quad));
+    const FS_RECTF rect = RectForQuad(quad);
+    ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+  }
+  ASSERT_EQ(2, FPDFPage_GetAnnotCount(page.get()));
+
+  uint32_t removed = 0;
+  ASSERT_TRUE(EPDFPage_ApplyRedactions(page.get(), &removed));
+  EXPECT_EQ(0u, removed);
+  ASSERT_EQ(0, FPDFPage_GetAnnotCount(page.get()));
+  ASSERT_TRUE(FPDFPage_GenerateContent(page.get()));
+  ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, 0));
+
+  ASSERT_TRUE(OpenSavedDocument());
+  FPDF_PAGE saved_page = LoadSavedPage(0);
+  ASSERT_TRUE(saved_page);
+  const std::wstring after = ExtractPageText(saved_page);
+  CloseSavedPage(saved_page);
+
+  EXPECT_EQ(std::wstring::npos, after.find(L"SECRET")) << after;
+  EXPECT_EQ(std::wstring::npos, after.find(L"ECRET")) << after;
+  EXPECT_NE(std::wstring::npos, after.find(L"keep this")) << after;
+  EXPECT_NE(std::wstring::npos, after.find(L"tail")) << after;
+}
+
+// A region that touches nothing must leave every text object exactly where it
+// was, including vertical CJK text, even though callers regenerate the page
+// content afterwards.
+TEST_F(FPDFAnnotEmbedderTest, RedactFarFromVerticalTextLeavesItInPlace) {
+  ASSERT_TRUE(OpenDocument("vertical_text.pdf"));
+  ScopedPage page = LoadScopedPage(0);
+  ASSERT_TRUE(page);
+
+  const std::wstring before = ExtractPageText(page.get());
+  ASSERT_NE(std::wstring::npos, before.find(L"Hello"));
+  double left_before = 0;
+  double right_before = 0;
+  double bottom_before = 0;
+  double top_before = 0;
+  {
+    ScopedFPDFTextPage text_page(FPDFText_LoadPage(page.get()));
+    ASSERT_TRUE(text_page);
+    ASSERT_TRUE(FPDFText_GetCharBox(text_page.get(), 0, &left_before,
+                                    &right_before, &bottom_before,
+                                    &top_before));
+  }
+
+  // Bottom-right corner of the 200x200 page; the text hangs from the top-left.
+  const FS_RECTF far_away = {150.0f, 40.0f, 190.0f, 10.0f};
+  EXPECT_FALSE(EPDFText_RedactInRect(page.get(), &far_away,
+                                     /*recurse_forms=*/true,
+                                     /*draw_black_boxes=*/false));
+  ASSERT_TRUE(FPDFPage_GenerateContent(page.get()));
+  ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, 0));
+
+  ASSERT_TRUE(OpenSavedDocument());
+  FPDF_PAGE saved_page = LoadSavedPage(0);
+  ASSERT_TRUE(saved_page);
+  EXPECT_EQ(before, ExtractPageText(saved_page));
+  double left_after = 0;
+  double right_after = 0;
+  double bottom_after = 0;
+  double top_after = 0;
+  {
+    ScopedFPDFTextPage text_page(FPDFText_LoadPage(saved_page));
+    ASSERT_TRUE(text_page);
+    ASSERT_TRUE(FPDFText_GetCharBox(text_page.get(), 0, &left_after,
+                                    &right_after, &bottom_after, &top_after));
+  }
+  CloseSavedPage(saved_page);
+  EXPECT_NEAR(left_before, left_after, 0.01);
+  EXPECT_NEAR(right_before, right_after, 0.01);
+  EXPECT_NEAR(bottom_before, bottom_after, 0.01);
+  EXPECT_NEAR(top_before, top_after, 0.01);
+}
+
+// Text that lives inside a Form XObject is sanitized through the form
+// recursion, and the original (unsanitized) form stream must not survive in
+// the saved file.
+TEST_F(FPDFAnnotEmbedderTest, RedactInQuadsRemovesTextInsideFormXObject) {
+  ASSERT_TRUE(OpenDocument("form_object_with_text.pdf"));
+  ScopedPage page = LoadScopedPage(0);
+  ASSERT_TRUE(page);
+
+  const std::wstring before = ExtractPageText(page.get());
+  ASSERT_NE(std::wstring::npos, before.find(L"Hello, world!")) << before;
+  ASSERT_NE(std::wstring::npos, before.find(L"Goodbye, world!")) << before;
+  const size_t hello_world = before.find(L"world");
+  ASSERT_NE(std::wstring::npos, hello_world);
+
+  FS_QUADPOINTSF quad;
+  {
+    ScopedFPDFTextPage text_page(FPDFText_LoadPage(page.get()));
+    ASSERT_TRUE(text_page);
+    quad = QuadForCharRange(text_page.get(), static_cast<int>(hello_world), 5);
+  }
+  ASSERT_TRUE(EPDFText_RedactInQuads(page.get(), &quad, 1,
+                                     /*recurse_forms=*/true,
+                                     /*draw_black_boxes=*/false));
+  ASSERT_TRUE(FPDFPage_GenerateContent(page.get()));
+  ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, 0));
+
+  ASSERT_TRUE(OpenSavedDocument());
+  FPDF_PAGE saved_page = LoadSavedPage(0);
+  ASSERT_TRUE(saved_page);
+  const std::wstring after = ExtractPageText(saved_page);
+  CloseSavedPage(saved_page);
+
+  EXPECT_NE(std::wstring::npos, after.find(L"Hello,")) << after;
+  EXPECT_NE(std::wstring::npos, after.find(L"Goodbye, world!")) << after;
+  const size_t surviving_world = after.find(L"world");
+  ASSERT_NE(std::wstring::npos, surviving_world) << after;
+  EXPECT_EQ(std::wstring::npos, after.find(L"world", surviving_world + 1))
+      << after;
+  // The fixture's original form stream is uncompressed and literal; none of
+  // it may be reachable in the saved bytes.
+  EXPECT_EQ(std::string::npos, GetString().find("(Hello, world!)"));
+}
+
+// A real OCR layer (Tesseract: GlyphLessFont, invisible text, Tz horizontal
+// scaling, one text object per word). Whole-word and partial-word regions
+// must remove exactly the covered glyphs and leave the rest in place.
+TEST_F(FPDFAnnotEmbedderTest, RedactRemovesInvisibleOcrLayerText) {
+  ASSERT_TRUE(OpenDocument("redact_ocr_glyphless.pdf"));
+  ScopedPage page = LoadScopedPage(0);
+  ASSERT_TRUE(page);
+
+  const std::wstring before = ExtractPageText(page.get());
+  const size_t secret = before.find(L"SECRET");
+  const size_t data = before.find(L"DATA");
+  ASSERT_NE(std::wstring::npos, secret) << before;
+  ASSERT_NE(std::wstring::npos, data) << before;
+  ASSERT_NE(std::wstring::npos, before.find(L"keep")) << before;
+
+  // "SECRET" is a whole text object; "DAT" removes the leading glyphs of the
+  // "DATA " object so its surviving "A " must be re-anchored (with Tz).
+  FS_QUADPOINTSF quads[2];
+  double a_left_before = 0;
+  {
+    ScopedFPDFTextPage text_page(FPDFText_LoadPage(page.get()));
+    ASSERT_TRUE(text_page);
+    quads[0] = QuadForCharRange(text_page.get(), static_cast<int>(secret), 6);
+    quads[1] = QuadForCharRange(text_page.get(), static_cast<int>(data), 3);
+    double r = 0;
+    double b = 0;
+    double t = 0;
+    ASSERT_TRUE(FPDFText_GetCharBox(text_page.get(),
+                                    static_cast<int>(data) + 3, &a_left_before,
+                                    &r, &b, &t));
+  }
+  ASSERT_TRUE(EPDFText_RedactInQuads(page.get(), quads, 2,
+                                     /*recurse_forms=*/true,
+                                     /*draw_black_boxes=*/false));
+  ASSERT_TRUE(FPDFPage_GenerateContent(page.get()));
+  ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, 0));
+
+  ASSERT_TRUE(OpenSavedDocument());
+  FPDF_PAGE saved_page = LoadSavedPage(0);
+  ASSERT_TRUE(saved_page);
+  const std::wstring after = ExtractPageText(saved_page);
+  EXPECT_EQ(std::wstring::npos, after.find(L"SECRET")) << after;
+  EXPECT_EQ(std::wstring::npos, after.find(L"ECRET")) << after;
+  EXPECT_EQ(std::wstring::npos, after.find(L"DAT")) << after;
+  EXPECT_NE(std::wstring::npos, after.find(L"keep")) << after;
+  const size_t surviving_a = after.find(L"A");
+  ASSERT_NE(std::wstring::npos, surviving_a) << after;
+  {
+    ScopedFPDFTextPage text_page(FPDFText_LoadPage(saved_page));
+    ASSERT_TRUE(text_page);
+    double l = 0;
+    double r = 0;
+    double b = 0;
+    double t = 0;
+    ASSERT_TRUE(FPDFText_GetCharBox(
+        text_page.get(), static_cast<int>(surviving_a), &l, &r, &b, &t));
+    EXPECT_NEAR(a_left_before, l, 0.05);
+  }
+  CloseSavedPage(saved_page);
+}
+
+// Vertical writing: removing the leading glyph must re-anchor the run along
+// the vertical axis (the writing axis), and removing glyphs in the middle
+// must keep the glyphs after the gap exactly in place.
+TEST_F(FPDFAnnotEmbedderTest, RedactVerticalTextLeadingGlyphKeepsRestInPlace) {
+  ASSERT_TRUE(OpenDocument("vertical_text.pdf"));
+  ScopedPage page = LoadScopedPage(0);
+  ASSERT_TRUE(page);
+
+  const std::wstring before = ExtractPageText(page.get());
+  ASSERT_EQ(0u, before.find(L"Hello"));
+  FS_QUADPOINTSF quad;
+  double e_left = 0;
+  double e_right = 0;
+  double e_bottom = 0;
+  double e_top = 0;
+  {
+    ScopedFPDFTextPage text_page(FPDFText_LoadPage(page.get()));
+    ASSERT_TRUE(text_page);
+    quad = QuadForCharRange(text_page.get(), 0, 1);  // "H"
+    ASSERT_TRUE(FPDFText_GetCharBox(text_page.get(), 1, &e_left, &e_right,
+                                    &e_bottom, &e_top));
+  }
+  ASSERT_TRUE(EPDFText_RedactInQuads(page.get(), &quad, 1,
+                                     /*recurse_forms=*/true,
+                                     /*draw_black_boxes=*/false));
+  ASSERT_TRUE(FPDFPage_GenerateContent(page.get()));
+  ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, 0));
+
+  ASSERT_TRUE(OpenSavedDocument());
+  FPDF_PAGE saved_page = LoadSavedPage(0);
+  ASSERT_TRUE(saved_page);
+  const std::wstring after = ExtractPageText(saved_page);
+  EXPECT_EQ(std::wstring::npos, after.find(L"H")) << after;
+  ASSERT_EQ(0u, after.find(L"ello")) << after;
+  {
+    ScopedFPDFTextPage text_page(FPDFText_LoadPage(saved_page));
+    ASSERT_TRUE(text_page);
+    double l = 0;
+    double r = 0;
+    double b = 0;
+    double t = 0;
+    ASSERT_TRUE(FPDFText_GetCharBox(text_page.get(), 0, &l, &r, &b, &t));
+    EXPECT_NEAR(e_left, l, 0.05);
+    EXPECT_NEAR(e_right, r, 0.05);
+    EXPECT_NEAR(e_bottom, b, 0.05);
+    EXPECT_NEAR(e_top, t, 0.05);
+  }
+  CloseSavedPage(saved_page);
+}
+
+TEST_F(FPDFAnnotEmbedderTest, RedactVerticalTextMiddleGlyphsKeepsTailInPlace) {
+  ASSERT_TRUE(OpenDocument("vertical_text.pdf"));
+  ScopedPage page = LoadScopedPage(0);
+  ASSERT_TRUE(page);
+
+  const std::wstring before = ExtractPageText(page.get());
+  ASSERT_EQ(0u, before.find(L"Hello"));
+  FS_QUADPOINTSF quad;
+  double o_left = 0;
+  double o_right = 0;
+  double o_bottom = 0;
+  double o_top = 0;
+  {
+    ScopedFPDFTextPage text_page(FPDFText_LoadPage(page.get()));
+    ASSERT_TRUE(text_page);
+    quad = QuadForCharRange(text_page.get(), 2, 2);  // "ll"
+    ASSERT_TRUE(FPDFText_GetCharBox(text_page.get(), 4, &o_left, &o_right,
+                                    &o_bottom, &o_top));
+  }
+  ASSERT_TRUE(EPDFText_RedactInQuads(page.get(), &quad, 1,
+                                     /*recurse_forms=*/true,
+                                     /*draw_black_boxes=*/false));
+  ASSERT_TRUE(FPDFPage_GenerateContent(page.get()));
+  ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, 0));
+
+  ASSERT_TRUE(OpenSavedDocument());
+  FPDF_PAGE saved_page = LoadSavedPage(0);
+  ASSERT_TRUE(saved_page);
+  const std::wstring after = ExtractPageText(saved_page);
+  EXPECT_EQ(std::wstring::npos, after.find(L"ll")) << after;
+  ASSERT_EQ(0u, after.find(L"He")) << after;
+  const size_t o_index = after.find(L"o");
+  ASSERT_NE(std::wstring::npos, o_index) << after;
+  EXPECT_LT(o_index, after.find(L"World")) << after;
+  {
+    ScopedFPDFTextPage text_page(FPDFText_LoadPage(saved_page));
+    ASSERT_TRUE(text_page);
+    double l = 0;
+    double r = 0;
+    double b = 0;
+    double t = 0;
+    ASSERT_TRUE(FPDFText_GetCharBox(text_page.get(), static_cast<int>(o_index),
+                                    &l, &r, &b, &t));
+    EXPECT_NEAR(o_left, l, 0.05);
+    EXPECT_NEAR(o_right, r, 0.05);
+    EXPECT_NEAR(o_bottom, b, 0.05);
+    EXPECT_NEAR(o_top, t, 0.05);
+  }
+  CloseSavedPage(saved_page);
+}
+
+// Text in a font whose glyphs have NO outlines at all (empty glyph boxes,
+// non-zero advances): the text page ignores such objects, so this cannot be
+// targeted through search, but a region drawn over the area must still
+// remove the text object instead of silently keeping it under the overlay.
+TEST_F(FPDFAnnotEmbedderTest, RedactRemovesTextWithEmptyGlyphBoxes) {
+  ASSERT_TRUE(OpenDocument("redact_type3_invisible.pdf"));
+  ScopedPage page = LoadScopedPage(0);
+  ASSERT_TRUE(page);
+  ASSERT_EQ(1, FPDFPage_CountObjects(page.get()));
+  ASSERT_EQ(FPDF_PAGEOBJ_TEXT,
+            FPDFPageObj_GetType(FPDFPage_GetObject(page.get(), 0)));
+
+  // Generously cover the whole line.
+  const FS_RECTF line = {10.0f, 80.0f, 190.0f, 20.0f};
+  EXPECT_TRUE(EPDFText_RedactInRect(page.get(), &line,
+                                    /*recurse_forms=*/true,
+                                    /*draw_black_boxes=*/false));
+  ASSERT_TRUE(FPDFPage_GenerateContent(page.get()));
+  ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, 0));
+
+  ASSERT_TRUE(OpenSavedDocument());
+  FPDF_PAGE saved_page = LoadSavedPage(0);
+  ASSERT_TRUE(saved_page);
+  int text_objects = 0;
+  const int count = FPDFPage_CountObjects(saved_page);
+  for (int i = 0; i < count; ++i) {
+    if (FPDFPageObj_GetType(FPDFPage_GetObject(saved_page, i)) ==
+        FPDF_PAGEOBJ_TEXT) {
+      ++text_objects;
+    }
+  }
+  CloseSavedPage(saved_page);
+  EXPECT_EQ(0, text_objects);
+  EXPECT_EQ(std::string::npos, GetString().find("(SECRET)"));
+}
+
 TEST_F(FPDFAnnotEmbedderTest, ApplyRedactionCountsIntersectingAnnotation) {
   ASSERT_TRUE(OpenDocument("redact_remove_annots.pdf"));
   ScopedPage page = LoadScopedPage(0);
@@ -6191,3 +9919,1006 @@ TEST_F(FPDFAnnotEmbedderTest, GenerateFileAttachmentAppearancePerIcon) {
   const std::wstring default_icon = make_appearance(nullptr);
   EXPECT_EQ(pushpin, default_icon);
 }
+
+// ---------------------------------------------------------------------------
+// EmbedPDF: the delta is what changed, not what was touched.
+//
+// L1 - reads never promote: removing one annotation promotes exactly the page.
+// L2 - a save writes what changed from the base and reports whether anything
+//      reachable changed since the layer was loaded; an annotation added and
+//      removed again (its generated appearance stream left as an orphan)
+//      writes nothing.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using embedpdf_test::LayerFixture;
+
+uint32_t AnnotObjNumAt(FPDF_PAGE page, int index) {
+  ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(page, index));
+  return annot ? EPDFAnnot_GetObjectNumber(annot.get()) : 0;
+}
+
+struct DeltaProbe {
+  std::vector<uint8_t> bytes;
+  EPDFLayerSaveStatus status = EPDFLayerSaveStatus_kSaveFailed;
+  bool changed_since_load = true;
+};
+
+// EPDFLayer_SaveDeltaToOwnedBufferEx: the cumulative delta, or nothing when
+// nothing changed since load.
+DeltaProbe SaveDeltaEx(FPDF_DOCUMENT layer) {
+  DeltaProbe out;
+  unsigned long size = 0;
+  FPDF_BOOL changed = true;
+  void* buffer =
+      EPDFLayer_SaveDeltaToOwnedBufferEx(layer, &size, &out.status, &changed);
+  out.changed_since_load = !!changed;
+  if (buffer) {
+    const uint8_t* data = static_cast<const uint8_t*>(buffer);
+    out.bytes.assign(data, data + size);
+    EPDF_FreeBuffer(buffer);
+  }
+  return out;
+}
+
+// EPDFLayer_SaveDeltaToOwnedBuffer: the cumulative delta a persisted artifact
+// carries, always written.
+std::vector<uint8_t> SaveDeltaCumulative(FPDF_DOCUMENT layer) {
+  unsigned long size = 0;
+  EPDFLayerSaveStatus status = EPDFLayerSaveStatus_kSaveFailed;
+  void* buffer = EPDFLayer_SaveDeltaToOwnedBuffer(layer, &size, &status);
+  EXPECT_EQ(EPDFLayerSaveStatus_kSuccess, status);
+  std::vector<uint8_t> out;
+  if (buffer) {
+    const uint8_t* data = static_cast<const uint8_t*>(buffer);
+    out.assign(data, data + size);
+    EPDF_FreeBuffer(buffer);
+  }
+  return out;
+}
+
+struct StandaloneProbe {
+  std::vector<uint8_t> bytes;
+  EPDFSaveStatus status = EPDFSaveStatus_kFailed;
+};
+
+// By default, the base bytes plus one revision, or nothing when unchanged.
+StandaloneProbe SaveStandaloneEx(FPDF_DOCUMENT doc,
+                                 FPDF_DWORD flags = FPDF_INCREMENTAL) {
+  StandaloneProbe out;
+  unsigned long size = 0;
+  void* buffer =
+      EPDF_SaveDocumentToOwnedBufferEx(doc, flags, 0, &size, &out.status);
+  if (buffer) {
+    const uint8_t* data = static_cast<const uint8_t*>(buffer);
+    out.bytes.assign(data, data + size);
+    EPDF_FreeBuffer(buffer);
+  }
+  return out;
+}
+
+// How many times |objnum| is written as an indirect object in |bytes|.
+int CountObjectWrites(const std::vector<uint8_t>& bytes, uint32_t objnum) {
+  const std::string text(bytes.begin(), bytes.end());
+  const std::string needle = std::to_string(objnum) + " 0 obj";
+  int count = 0;
+  size_t pos = 0;
+  while ((pos = text.find(needle, pos)) != std::string::npos) {
+    const bool digit_before = pos > 0 && isdigit(static_cast<unsigned char>(text[pos - 1]));
+    if (!digit_before) {
+      ++count;
+    }
+    pos += needle.size();
+  }
+  return count;
+}
+
+void SetAnnotString(FPDF_ANNOTATION annot, const char* key, const wchar_t* value) {
+  ScopedFPDFWideString text = GetFPDFWideString(value);
+  ASSERT_TRUE(FPDFAnnot_SetStringValue(annot, key, text.get()));
+}
+
+// What one mutation of a page's /Annots promotes: the page, plus the array
+// itself when the fixture stores it as an indirect object (this one does).
+unsigned long PromotedByAnnotsMutation(FPDF_PAGE page) {
+  RetainPtr<const CPDF_Object> annots =
+      CPDFPageFromFPDFPage(page)->GetDict()->GetObjectFor("Annots");
+  return annots && annots->IsReference() ? 2ul : 1ul;
+}
+
+constexpr char kTwoAnnots[] = "annotation_highlight_square_with_ap.pdf";
+constexpr char kProbeKey[] = "EPDFTwinProbe";
+
+}  // namespace
+
+TEST_F(FPDFAnnotEmbedderTest, LayerRemoveAnnotByObjectNumberPromotesOnlyThePage) {
+  LayerFixture doc;
+  ASSERT_TRUE(doc.OpenFresh(kTwoAnnots));
+  ScopedFPDFPage page(FPDF_LoadPage(doc.layer, 0));
+  ASSERT_TRUE(page);
+  const int initial = FPDFPage_GetAnnotCount(page.get());
+  ASSERT_GE(initial, 2);
+  const uint32_t page_num = EPDFPage_GetObjectNumber(page.get());
+  const uint32_t first = AnnotObjNumAt(page.get(), 0);
+  const uint32_t second = AnnotObjNumAt(page.get(), 1);
+  ASSERT_NE(0u, first);
+  ASSERT_NE(0u, second);
+  // Loading the page and listing its annotations are reads.
+  EXPECT_EQ(0ul, EPDFLayer_GetPromotedObjectCount(doc.layer));
+  const unsigned long expected = PromotedByAnnotsMutation(page.get());
+
+  ASSERT_TRUE(EPDFPage_RemoveAnnotByObjectNumber(page.get(), second));
+
+  EXPECT_EQ(initial - 1, FPDFPage_GetAnnotCount(page.get()));
+  EXPECT_EQ(first, AnnotObjNumAt(page.get(), 0));
+  // Exactly the page (and its /Annots array): it shrank. The siblings were
+  // read, not touched; the removed object was deleted, not edited.
+  EXPECT_EQ(expected, EPDFLayer_GetPromotedObjectCount(doc.layer));
+  EXPECT_TRUE(EPDFLayer_IsObjectPromoted(doc.layer, page_num));
+  EXPECT_FALSE(EPDFLayer_IsObjectPromoted(doc.layer, first));
+  EXPECT_FALSE(EPDFLayer_IsObjectPromoted(doc.layer, second));
+
+  // What really changed is written, and only that. When the fixture keeps
+  // /Annots as an indirect array, the array is what shrank: the page was
+  // touched (promoted) but still equals its base twin and is elided.
+  RetainPtr<const CPDF_Object> annots_entry =
+      CPDFPageFromFPDFPage(page.get())->GetDict()->GetObjectFor("Annots");
+  ASSERT_TRUE(annots_entry);
+  DeltaProbe delta = SaveDeltaEx(doc.layer);
+  EXPECT_EQ(EPDFLayerSaveStatus_kSuccess, delta.status);
+  EXPECT_TRUE(delta.changed_since_load);
+  if (annots_entry->IsReference()) {
+    EXPECT_EQ(1, CountObjectWrites(delta.bytes,
+                                   annots_entry->AsReference()->GetRefObjNum()));
+    EXPECT_EQ(0, CountObjectWrites(delta.bytes, page_num));
+  } else {
+    EXPECT_EQ(1, CountObjectWrites(delta.bytes, page_num));
+  }
+  EXPECT_EQ(0, CountObjectWrites(delta.bytes, first));
+  EXPECT_EQ(0, CountObjectWrites(delta.bytes, second));
+}
+
+TEST_F(FPDFAnnotEmbedderTest, LayerRemoveAnnotByNamePromotesOnlyThePage) {
+  LayerFixture doc;
+  ASSERT_TRUE(doc.OpenFresh(kTwoAnnots));
+  ScopedFPDFPage page(FPDF_LoadPage(doc.layer, 0));
+  ASSERT_TRUE(page);
+  const uint32_t page_num = EPDFPage_GetObjectNumber(page.get());
+
+  // The fixture carries one /NM; find it with reads.
+  int named_index = -1;
+  std::wstring name;
+  for (int i = 0; i < FPDFPage_GetAnnotCount(page.get()); ++i) {
+    ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(page.get(), i));
+    ASSERT_TRUE(annot);
+    if (!FPDFAnnot_HasKey(annot.get(), "NM")) {
+      continue;
+    }
+    const unsigned long length =
+        FPDFAnnot_GetStringValue(annot.get(), "NM", nullptr, 0);
+    std::vector<FPDF_WCHAR> buffer(length / sizeof(FPDF_WCHAR));
+    FPDFAnnot_GetStringValue(annot.get(), "NM", buffer.data(), length);
+    name = GetPlatformWString(buffer.data());
+    named_index = i;
+    break;
+  }
+  ASSERT_GE(named_index, 0);
+  ASSERT_FALSE(name.empty());
+  const uint32_t named = AnnotObjNumAt(page.get(), named_index);
+  const uint32_t other = AnnotObjNumAt(page.get(), named_index == 0 ? 1 : 0);
+  const int initial = FPDFPage_GetAnnotCount(page.get());
+  EXPECT_EQ(0ul, EPDFLayer_GetPromotedObjectCount(doc.layer));
+  const unsigned long expected = PromotedByAnnotsMutation(page.get());
+
+  ScopedFPDFWideString nm = GetFPDFWideString(name.c_str());
+  ASSERT_TRUE(EPDFPage_RemoveAnnotByName(page.get(), nm.get()));
+
+  EXPECT_EQ(initial - 1, FPDFPage_GetAnnotCount(page.get()));
+  EXPECT_EQ(expected, EPDFLayer_GetPromotedObjectCount(doc.layer));
+  EXPECT_TRUE(EPDFLayer_IsObjectPromoted(doc.layer, page_num));
+  EXPECT_FALSE(EPDFLayer_IsObjectPromoted(doc.layer, named));
+  EXPECT_FALSE(EPDFLayer_IsObjectPromoted(doc.layer, other));
+}
+
+TEST_F(FPDFAnnotEmbedderTest, LayerRemoveAnnotByIndexPromotesOnlyThePage) {
+  LayerFixture doc;
+  ASSERT_TRUE(doc.OpenFresh(kTwoAnnots));
+  ScopedFPDFPage page(FPDF_LoadPage(doc.layer, 0));
+  ASSERT_TRUE(page);
+  const uint32_t page_num = EPDFPage_GetObjectNumber(page.get());
+  const uint32_t first = AnnotObjNumAt(page.get(), 0);
+  const uint32_t second = AnnotObjNumAt(page.get(), 1);
+  const int initial = FPDFPage_GetAnnotCount(page.get());
+  const unsigned long expected = PromotedByAnnotsMutation(page.get());
+
+  ASSERT_TRUE(EPDFPage_RemoveAnnot(page.get(), 1));
+
+  EXPECT_EQ(initial - 1, FPDFPage_GetAnnotCount(page.get()));
+  EXPECT_EQ(expected, EPDFLayer_GetPromotedObjectCount(doc.layer));
+  EXPECT_TRUE(EPDFLayer_IsObjectPromoted(doc.layer, page_num));
+  EXPECT_FALSE(EPDFLayer_IsObjectPromoted(doc.layer, first));
+  EXPECT_FALSE(EPDFLayer_IsObjectPromoted(doc.layer, second));
+}
+
+TEST_F(FPDFAnnotEmbedderTest, LayerRemoveAnnotRawPromotesOnlyThePage) {
+  LayerFixture doc;
+  ASSERT_TRUE(doc.OpenFresh(kTwoAnnots));
+  uint32_t page_num = 0;
+  uint32_t first = 0;
+  uint32_t second = 0;
+  int initial = 0;
+  unsigned long expected = 0;
+  {
+    ScopedFPDFPage page(FPDF_LoadPage(doc.layer, 0));
+    ASSERT_TRUE(page);
+    page_num = EPDFPage_GetObjectNumber(page.get());
+    first = AnnotObjNumAt(page.get(), 0);
+    second = AnnotObjNumAt(page.get(), 1);
+    initial = FPDFPage_GetAnnotCount(page.get());
+    expected = PromotedByAnnotsMutation(page.get());
+  }
+  EXPECT_EQ(0ul, EPDFLayer_GetPromotedObjectCount(doc.layer));
+
+  ASSERT_TRUE(EPDFPage_RemoveAnnotRaw(doc.layer, 0, 1));
+
+  EXPECT_EQ(initial - 1, EPDFPage_GetAnnotCountRaw(doc.layer, 0));
+  EXPECT_EQ(expected, EPDFLayer_GetPromotedObjectCount(doc.layer));
+  EXPECT_TRUE(EPDFLayer_IsObjectPromoted(doc.layer, page_num));
+  EXPECT_FALSE(EPDFLayer_IsObjectPromoted(doc.layer, first));
+  EXPECT_FALSE(EPDFLayer_IsObjectPromoted(doc.layer, second));
+}
+
+TEST_F(FPDFAnnotEmbedderTest, LayerMoveAnnotsPromotesOnlyThePageAndMoveBackIsUnchanged) {
+  LayerFixture doc;
+  ASSERT_TRUE(doc.OpenFresh(kTwoAnnots));
+  ScopedFPDFPage page(FPDF_LoadPage(doc.layer, 0));
+  ASSERT_TRUE(page);
+  const uint32_t page_num = EPDFPage_GetObjectNumber(page.get());
+  const uint32_t first = AnnotObjNumAt(page.get(), 0);
+  const uint32_t second = AnnotObjNumAt(page.get(), 1);
+
+  const unsigned long expected = PromotedByAnnotsMutation(page.get());
+
+  const int from[1] = {1};
+  ASSERT_TRUE(EPDFPage_MoveAnnots(page.get(), from, 1, 0));
+  EXPECT_EQ(second, AnnotObjNumAt(page.get(), 0));
+  EXPECT_EQ(expected, EPDFLayer_GetPromotedObjectCount(doc.layer));
+  EXPECT_TRUE(EPDFLayer_IsObjectPromoted(doc.layer, page_num));
+  EXPECT_FALSE(EPDFLayer_IsObjectPromoted(doc.layer, first));
+  EXPECT_FALSE(EPDFLayer_IsObjectPromoted(doc.layer, second));
+  EXPECT_TRUE(SaveDeltaEx(doc.layer).changed_since_load);
+
+  // Move it back: the page is still promoted (touched) but equals its twin.
+  ASSERT_TRUE(EPDFPage_MoveAnnots(page.get(), from, 1, 0));
+  EXPECT_EQ(first, AnnotObjNumAt(page.get(), 0));
+  EXPECT_EQ(expected, EPDFLayer_GetPromotedObjectCount(doc.layer));
+  DeltaProbe delta = SaveDeltaEx(doc.layer);
+  EXPECT_EQ(EPDFLayerSaveStatus_kSuccess, delta.status);
+  EXPECT_FALSE(delta.changed_since_load);
+  EXPECT_TRUE(delta.bytes.empty());
+}
+
+// The report's flow. The annotation is created the way the engine creates
+// it, with a generated appearance: an indirect /AP stream that removal leaves
+// behind as an orphan. Promoted counts it; the save pass reaches neither
+// difference and writes nothing.
+TEST_F(FPDFAnnotEmbedderTest, LayerAddThenRemoveIsUnchangedSinceLoad) {
+  LayerFixture doc;
+  ASSERT_TRUE(doc.OpenFresh(kTwoAnnots));
+  ScopedFPDFPage page(FPDF_LoadPage(doc.layer, 0));
+  ASSERT_TRUE(page);
+  const uint32_t page_num = EPDFPage_GetObjectNumber(page.get());
+  const int initial = FPDFPage_GetAnnotCount(page.get());
+
+  uint32_t added = 0;
+  {
+    ScopedFPDFAnnotation annot(EPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_SQUARE));
+    ASSERT_TRUE(annot);
+    const FS_RECTF rect{50.0f, 50.0f, 150.0f, 150.0f};
+    ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+    ASSERT_TRUE(FPDFAnnot_SetColor(annot.get(), FPDFANNOT_COLORTYPE_Color, 255, 0, 0, 255));
+    ASSERT_TRUE(EPDFAnnot_GenerateAppearance(annot.get()));
+    ASSERT_TRUE(FPDFAnnot_HasKey(annot.get(), "AP"));
+    added = EPDFAnnot_GetObjectNumber(annot.get());
+  }
+  ASSERT_NE(0u, added);
+  EXPECT_EQ(initial + 1, FPDFPage_GetAnnotCount(page.get()));
+  // The page (and its /Annots array), the annotation, its appearance stream.
+  const unsigned long touched = PromotedByAnnotsMutation(page.get()) + 2;
+  EXPECT_EQ(touched, EPDFLayer_GetPromotedObjectCount(doc.layer));
+  EXPECT_TRUE(SaveDeltaEx(doc.layer).changed_since_load);
+
+  ASSERT_TRUE(EPDFPage_RemoveAnnotByObjectNumber(page.get(), added));
+
+  EXPECT_EQ(initial, FPDFPage_GetAnnotCount(page.get()));
+  // The page (touched) and the orphaned appearance stream remain promoted;
+  // the annotation dictionary is gone.
+  EXPECT_EQ(touched - 1, EPDFLayer_GetPromotedObjectCount(doc.layer));
+  EXPECT_TRUE(EPDFLayer_IsObjectPromoted(doc.layer, page_num));
+  EXPECT_FALSE(EPDFLayer_IsObjectPromoted(doc.layer, added));
+
+  DeltaProbe delta = SaveDeltaEx(doc.layer);
+  EXPECT_EQ(EPDFLayerSaveStatus_kSuccess, delta.status);
+  EXPECT_FALSE(delta.changed_since_load);
+  EXPECT_TRUE(delta.bytes.empty());
+
+  StandaloneProbe standalone = SaveStandaloneEx(doc.layer);
+  EXPECT_EQ(EPDFSaveStatus_kUnchangedSinceLoad, standalone.status);
+  EXPECT_TRUE(standalone.bytes.empty());
+
+  // The cumulative delta an artifact persists is the same nothing: the
+  // orphan is unreachable and the page equals its base twin.
+  EXPECT_TRUE(SaveDeltaCumulative(doc.layer).empty());
+}
+
+// A page that had no /Annots gets none back: the reverse of the add that
+// created the array is not an empty array.
+TEST_F(FPDFAnnotEmbedderTest, LayerAddThenRemoveOnPageWithoutAnnotsRestoresShape) {
+  LayerFixture doc;
+  ASSERT_TRUE(doc.OpenFresh("hello_world.pdf"));
+  ScopedFPDFPage page(FPDF_LoadPage(doc.layer, 0));
+  ASSERT_TRUE(page);
+  ASSERT_EQ(0, FPDFPage_GetAnnotCount(page.get()));
+  ASSERT_FALSE(CPDFPageFromFPDFPage(page.get())->GetDict()->KeyExist("Annots"));
+
+  uint32_t added = 0;
+  {
+    ScopedFPDFAnnotation annot(EPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_SQUARE));
+    ASSERT_TRUE(annot);
+    const FS_RECTF rect{50.0f, 50.0f, 150.0f, 150.0f};
+    ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+    ASSERT_TRUE(EPDFAnnot_GenerateAppearance(annot.get()));
+    added = EPDFAnnot_GetObjectNumber(annot.get());
+  }
+  ASSERT_TRUE(EPDFPage_RemoveAnnotByObjectNumber(page.get(), added));
+
+  EXPECT_EQ(0, FPDFPage_GetAnnotCount(page.get()));
+  EXPECT_FALSE(CPDFPageFromFPDFPage(page.get())->GetDict()->KeyExist("Annots"));
+  DeltaProbe delta = SaveDeltaEx(doc.layer);
+  EXPECT_EQ(EPDFLayerSaveStatus_kSuccess, delta.status);
+  EXPECT_FALSE(delta.changed_since_load);
+  EXPECT_TRUE(delta.bytes.empty());
+}
+
+// A base annotation edited and restored: touched, not changed. A real edit
+// writes the object, and only it.
+TEST_F(FPDFAnnotEmbedderTest, LayerEditAndRestoreIsUnchangedSinceLoad) {
+  LayerFixture doc;
+  ASSERT_TRUE(doc.OpenFresh(kTwoAnnots));
+  ScopedFPDFPage page(FPDF_LoadPage(doc.layer, 0));
+  ASSERT_TRUE(page);
+  const uint32_t page_num = EPDFPage_GetObjectNumber(page.get());
+  const uint32_t first = AnnotObjNumAt(page.get(), 0);
+  ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(page.get(), 0));
+  ASSERT_TRUE(annot);
+  ASSERT_FALSE(FPDFAnnot_HasKey(annot.get(), kProbeKey));
+
+  SetAnnotString(annot.get(), kProbeKey, L"changed");
+  EXPECT_EQ(1ul, EPDFLayer_GetPromotedObjectCount(doc.layer));
+  EXPECT_TRUE(EPDFLayer_IsObjectPromoted(doc.layer, first));
+  EXPECT_FALSE(EPDFLayer_IsObjectPromoted(doc.layer, page_num));
+  DeltaProbe edited = SaveDeltaEx(doc.layer);
+  EXPECT_TRUE(edited.changed_since_load);
+  EXPECT_EQ(1, CountObjectWrites(edited.bytes, first));
+  EXPECT_EQ(0, CountObjectWrites(edited.bytes, page_num));
+
+  ASSERT_TRUE(EPDFAnnot_RemoveKey(annot.get(), kProbeKey));
+  EXPECT_EQ(1ul, EPDFLayer_GetPromotedObjectCount(doc.layer));  // still touched
+  DeltaProbe restored = SaveDeltaEx(doc.layer);
+  EXPECT_EQ(EPDFLayerSaveStatus_kSuccess, restored.status);
+  EXPECT_FALSE(restored.changed_since_load);
+  EXPECT_TRUE(restored.bytes.empty());
+}
+
+// A reopened layer: its saved edits live in the overlay and differ from the
+// base, but not from the loaded document. The two twins disagree exactly
+// where a session must not confuse them.
+TEST_F(FPDFAnnotEmbedderTest, LayerReopenedTwinsDisagree) {
+  LayerFixture doc;
+  ASSERT_TRUE(doc.OpenFresh(kTwoAnnots));
+  uint32_t first = 0;
+  uint32_t second = 0;
+  std::vector<uint8_t> saved;
+  {
+    ScopedFPDFPage page(FPDF_LoadPage(doc.layer, 0));
+    ASSERT_TRUE(page);
+    first = AnnotObjNumAt(page.get(), 0);
+    second = AnnotObjNumAt(page.get(), 1);
+    ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(page.get(), 0));
+    ASSERT_TRUE(annot);
+    SetAnnotString(annot.get(), kProbeKey, L"twenty");
+    saved = SaveDeltaCumulative(doc.layer);
+    ASSERT_EQ(1, CountObjectWrites(saved, first));
+  }
+
+  ASSERT_TRUE(doc.Reopen(saved));
+  EXPECT_EQ(1ul, EPDFLayer_GetPromotedObjectCount(doc.layer));  // ingested
+  EXPECT_TRUE(EPDFLayer_IsObjectPromoted(doc.layer, first));
+  {
+    // Untouched: nothing changed since load, even though the overlay object
+    // differs from the base.
+    DeltaProbe untouched = SaveDeltaEx(doc.layer);
+    EXPECT_EQ(EPDFLayerSaveStatus_kSuccess, untouched.status);
+    EXPECT_FALSE(untouched.changed_since_load);
+    EXPECT_TRUE(untouched.bytes.empty());
+    // The persisted, cumulative delta still carries the saved edit.
+    EXPECT_EQ(1, CountObjectWrites(SaveDeltaCumulative(doc.layer), first));
+    EXPECT_EQ(EPDFSaveStatus_kUnchangedSinceLoad, SaveStandaloneEx(doc.layer).status);
+  }
+
+  ScopedFPDFPage page(FPDF_LoadPage(doc.layer, 0));
+  ASSERT_TRUE(page);
+  ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(page.get(), 0));
+  ASSERT_TRUE(annot);
+
+  // Set to the loaded value, and set away then back: unchanged since load.
+  SetAnnotString(annot.get(), kProbeKey, L"twenty");
+  EXPECT_FALSE(SaveDeltaEx(doc.layer).changed_since_load);
+  SetAnnotString(annot.get(), kProbeKey, L"thirty");
+  EXPECT_TRUE(SaveDeltaEx(doc.layer).changed_since_load);
+  SetAnnotString(annot.get(), kProbeKey, L"twenty");
+  EXPECT_FALSE(SaveDeltaEx(doc.layer).changed_since_load);
+
+  // Revert to the BASE value: changed since load (the loaded bytes say
+  // twenty), yet nothing to write (the layer equals its base).
+  ASSERT_TRUE(EPDFAnnot_RemoveKey(annot.get(), kProbeKey));
+  DeltaProbe reverted = SaveDeltaEx(doc.layer);
+  EXPECT_EQ(EPDFLayerSaveStatus_kSuccess, reverted.status);
+  EXPECT_TRUE(reverted.changed_since_load);
+  EXPECT_TRUE(reverted.bytes.empty());
+  EXPECT_TRUE(SaveDeltaCumulative(doc.layer).empty());
+  StandaloneProbe standalone = SaveStandaloneEx(doc.layer);
+  EXPECT_EQ(EPDFSaveStatus_kWritten, standalone.status);
+  EXPECT_EQ(doc.bytes, standalone.bytes);  // the base, and no revision after it
+
+  // An edit elsewhere still writes the ingested object: the cumulative delta
+  // is judged against the base, never against the loaded document.
+  SetAnnotString(annot.get(), kProbeKey, L"twenty");
+  ScopedFPDFAnnotation other(FPDFPage_GetAnnot(page.get(), 1));
+  ASSERT_TRUE(other);
+  SetAnnotString(other.get(), kProbeKey, L"also");
+  DeltaProbe both = SaveDeltaEx(doc.layer);
+  EXPECT_TRUE(both.changed_since_load);
+  EXPECT_EQ(1, CountObjectWrites(both.bytes, first));
+  EXPECT_EQ(1, CountObjectWrites(both.bytes, second));
+}
+
+// ---------------------------------------------------------------------------
+// EmbedPDF: a reopened layer, and the file-backed server paths.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::string WriteTempFile(const std::string& stem, const std::vector<uint8_t>& bytes) {
+  const std::filesystem::path path =
+      std::filesystem::temp_directory_path() /
+      (stem + "-" + std::to_string(::getpid()) + "-" +
+       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+  std::ofstream out(path, std::ios::binary);
+  out.write(reinterpret_cast<const char*>(bytes.data()),
+            static_cast<std::streamsize>(bytes.size()));
+  out.close();
+  return path.string();
+}
+
+}  // namespace
+
+// The reviewer's sequence: sign, add, persist, reopen (eviction, restart,
+// another replica), remove. The base page had no /Annots; the persisted page
+// had one. Removing it restores the BASE shape, so the page is elided and the
+// layer equals its base again - changed since load, nothing to write.
+TEST_F(FPDFAnnotEmbedderTest, LayerReopenedRemoveOfPersistedAnnotationRestoresBaseShape) {
+  LayerFixture doc;
+  ASSERT_TRUE(doc.OpenFresh("hello_world.pdf"));
+  std::vector<uint8_t> saved;
+  uint32_t added = 0;
+  {
+    ScopedFPDFPage page(FPDF_LoadPage(doc.layer, 0));
+    ASSERT_TRUE(page);
+    ASSERT_FALSE(CPDFPageFromFPDFPage(page.get())->GetDict()->KeyExist("Annots"));
+    ScopedFPDFAnnotation annot(EPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_SQUARE));
+    ASSERT_TRUE(annot);
+    const FS_RECTF rect{50.0f, 50.0f, 150.0f, 150.0f};
+    ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+    ASSERT_TRUE(EPDFAnnot_GenerateAppearance(annot.get()));
+    added = EPDFAnnot_GetObjectNumber(annot.get());
+    saved = SaveDeltaCumulative(doc.layer);
+    ASSERT_FALSE(saved.empty());
+  }
+  ASSERT_TRUE(doc.Reopen(saved));
+  ScopedFPDFPage page(FPDF_LoadPage(doc.layer, 0));
+  ASSERT_TRUE(page);
+  ASSERT_EQ(1, FPDFPage_GetAnnotCount(page.get()));
+
+  ASSERT_TRUE(EPDFPage_RemoveAnnotByObjectNumber(page.get(), added));
+
+  EXPECT_EQ(0, FPDFPage_GetAnnotCount(page.get()));
+  EXPECT_FALSE(CPDFPageFromFPDFPage(page.get())->GetDict()->KeyExist("Annots"));
+  DeltaProbe delta = SaveDeltaEx(doc.layer);
+  EXPECT_EQ(EPDFLayerSaveStatus_kSuccess, delta.status);
+  EXPECT_TRUE(delta.changed_since_load);
+  EXPECT_TRUE(delta.bytes.empty());
+  StandaloneProbe standalone = SaveStandaloneEx(doc.layer);
+  EXPECT_EQ(EPDFSaveStatus_kWritten, standalone.status);
+  EXPECT_EQ(doc.bytes, standalone.bytes);
+}
+
+// The FPDF_FILEWRITE variants report the same decision as the buffer ones,
+// and write nothing when nothing changed since load.
+TEST_F(FPDFAnnotEmbedderTest, LayerFileWriteVariantsReportChange) {
+  LayerFixture doc;
+  ASSERT_TRUE(doc.OpenFresh(kTwoAnnots));
+  ScopedFPDFPage page(FPDF_LoadPage(doc.layer, 0));
+  ASSERT_TRUE(page);
+  ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(page.get(), 0));
+  ASSERT_TRUE(annot);
+
+  SetAnnotString(annot.get(), kProbeKey, L"edited");
+  ASSERT_TRUE(EPDFAnnot_RemoveKey(annot.get(), kProbeKey));  // touched, not changed
+
+  EPDFLayerSaveStatus status = EPDFLayerSaveStatus_kSaveFailed;
+  FPDF_BOOL changed = true;
+  ClearString();
+  ASSERT_TRUE(EPDFLayer_SaveDeltaEx(doc.layer, this, &status, &changed));
+  EXPECT_EQ(EPDFLayerSaveStatus_kSuccess, status);
+  EXPECT_FALSE(changed);
+  EXPECT_TRUE(GetString().empty());
+  ClearString();
+  ASSERT_TRUE(EPDFLayer_SaveLayerArtifactEx(doc.layer, this, &status, &changed));
+  EXPECT_EQ(EPDFLayerSaveStatus_kSuccess, status);
+  EXPECT_FALSE(changed);
+  EXPECT_TRUE(GetString().empty());
+
+  SetAnnotString(annot.get(), kProbeKey, L"edited");  // a real change
+  ClearString();
+  ASSERT_TRUE(EPDFLayer_SaveLayerArtifactEx(doc.layer, this, &status, &changed));
+  EXPECT_EQ(EPDFLayerSaveStatus_kSuccess, status);
+  EXPECT_TRUE(changed);
+  EXPECT_FALSE(GetString().empty());
+  // The artifact written by the file variant has the shape the buffer
+  // variant writes: same size, same header up to the base identity (each
+  // save mints a fresh trailer /ID, so the delta hash and bytes differ).
+  const std::string from_file = GetString();
+  unsigned long size = 0;
+  EPDFLayerSaveStatus buffer_status = EPDFLayerSaveStatus_kSaveFailed;
+  void* buffer = EPDFLayer_SaveLayerArtifactToOwnedBuffer(doc.layer, &size, &buffer_status);
+  ASSERT_TRUE(buffer);
+  const std::string from_buffer(static_cast<const char*>(buffer), size);
+  EPDF_FreeBuffer(buffer);
+  EXPECT_EQ(from_buffer.size(), from_file.size());
+  constexpr size_t kUpToBaseSha = 8 + 4 + 4 + 8 + 8 + 8 + 32;
+  EXPECT_EQ(from_buffer.substr(0, kUpToBaseSha), from_file.substr(0, kUpToBaseSha));
+  EXPECT_NE(std::string::npos, from_file.find("EPDFTwinProbe(edited)"));
+}
+
+// An artifact opened from a path is read in place: the streams the delta
+// carries are views into the file, not copies, in the overlay and in the twin.
+TEST_F(FPDFAnnotEmbedderTest, LayerArtifactOpensFromPathWithoutCopyingStreams) {
+  LayerFixture doc;
+  ASSERT_TRUE(doc.OpenFresh("hello_world.pdf"));
+  uint32_t added = 0;
+  std::string artifact;
+  {
+    ScopedFPDFPage page(FPDF_LoadPage(doc.layer, 0));
+    ScopedFPDFAnnotation annot(EPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_SQUARE));
+    const FS_RECTF rect{50.0f, 50.0f, 150.0f, 150.0f};
+    ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+    ASSERT_TRUE(EPDFAnnot_GenerateAppearance(annot.get()));
+    added = EPDFAnnot_GetObjectNumber(annot.get());
+    EPDFLayerSaveStatus status = EPDFLayerSaveStatus_kSaveFailed;
+    ClearString();
+    ASSERT_TRUE(EPDFLayer_SaveLayerArtifact(doc.layer, this, &status));
+    artifact = GetString();
+    ASSERT_FALSE(artifact.empty());
+  }
+  const std::string path =
+      WriteTempFile("epdf-artifact", std::vector<uint8_t>(artifact.begin(), artifact.end()));
+  FPDF_CloseDocument(doc.layer);
+  EPDFLayerOpenStatus status = EPDFLayerOpenStatus_kOpenFailed;
+  doc.layer = EPDFLayer_OpenLayerArtifactFromPath(doc.base, path.c_str(), nullptr, &status);
+  ASSERT_TRUE(doc.layer);
+  EXPECT_EQ(EPDFLayerOpenStatus_kSuccess, status);
+
+  ScopedFPDFPage page(FPDF_LoadPage(doc.layer, 0));
+  ASSERT_TRUE(page);
+  EXPECT_EQ(1, FPDFPage_GetAnnotCount(page.get()));
+  EXPECT_EQ(added, AnnotObjNumAt(page.get(), 0));
+  EXPECT_TRUE(EPDFLayer_IsObjectPromoted(doc.layer, added));
+
+  // The appearance stream the delta carried: a view into the artifact file.
+  CPDF_Document* layer_doc = CPDFDocumentFromFPDFDocument(doc.layer);
+  RetainPtr<const CPDF_Dictionary> annot_dict =
+      ToDictionary(layer_doc->GetIndirectObject(added));
+  ASSERT_TRUE(annot_dict);
+  RetainPtr<const CPDF_Stream> ap =
+      annot_dict->GetDictFor("AP")->GetStreamFor("N");
+  ASSERT_TRUE(ap);
+  EXPECT_TRUE(ap->IsFileBased());
+  EXPECT_TRUE(ap->BackingView());
+
+  // Nothing changed since load: the reporting saves write nothing.
+  DeltaProbe delta = SaveDeltaEx(doc.layer);
+  EXPECT_EQ(EPDFLayerSaveStatus_kSuccess, delta.status);
+  EXPECT_FALSE(delta.changed_since_load);
+  EXPECT_TRUE(delta.bytes.empty());
+  std::filesystem::remove(path);
+}
+
+// base ⊕ delta composed from a file on disk: what a working-copy analysis
+// opens on the server without buffering the delta.
+TEST_F(FPDFAnnotEmbedderTest, BaseOverlayOpensFromPath) {
+  LayerFixture doc;
+  ASSERT_TRUE(doc.OpenFresh("hello_world.pdf"));
+  {
+    ScopedFPDFPage page(FPDF_LoadPage(doc.layer, 0));
+    ScopedFPDFAnnotation annot(EPDFPage_CreateAnnot(page.get(), FPDF_ANNOT_SQUARE));
+    const FS_RECTF rect{50.0f, 50.0f, 150.0f, 150.0f};
+    ASSERT_TRUE(FPDFAnnot_SetRect(annot.get(), &rect));
+  }
+  const std::vector<uint8_t> delta = SaveDeltaCumulative(doc.layer);
+  ASSERT_FALSE(delta.empty());
+  const std::string path = WriteTempFile("epdf-delta", delta);
+  FPDF_DOCUMENT overlay = EPDFDoc_OpenBaseOverlayFromPath(doc.layer, path.c_str());
+  ASSERT_TRUE(overlay);
+  EXPECT_EQ(1, FPDF_GetPageCount(overlay));
+  ScopedFPDFPage page(FPDF_LoadPage(overlay, 0));
+  ASSERT_TRUE(page);
+  EXPECT_EQ(1, FPDFPage_GetAnnotCount(page.get()));
+  FPDF_CloseDocument(overlay);
+  EXPECT_FALSE(EPDFDoc_OpenBaseOverlayFromPath(doc.layer, "/nonexistent/epdf-delta"));
+  std::filesystem::remove(path);
+}
+
+class EPDFStampResizeEmbedderTest : public EmbedderTest {
+ protected:
+  void SetUp() override {
+    EmbedderTest::SetUp();
+    doc_.reset(FPDF_CreateNewDocument());
+    ASSERT_TRUE(doc_);
+    page_.reset(FPDFPage_New(doc_.get(), 0, 600, 600));
+    ASSERT_TRUE(page_);
+    annot_.reset(FPDFPage_CreateAnnot(page_.get(), FPDF_ANNOT_STAMP));
+    ASSERT_TRUE(annot_);
+    const FS_RECTF rect{10, 110, 110, 10};
+    ASSERT_TRUE(EPDFAnnot_SetRect(annot_.get(), &rect));
+  }
+
+  void TearDown() override {
+    annot_.reset();
+    page_.reset();
+    doc_.reset();
+    EmbedderTest::TearDown();
+  }
+
+  CPDF_Document* pdf() { return CPDFDocumentFromFPDFDocument(doc_.get()); }
+  RetainPtr<CPDF_Dictionary> annot_dict() {
+    return CPDFAnnotContextFromFPDFAnnotation(annot_.get())
+        ->GetMutableAnnotDict();
+  }
+  RetainPtr<CPDF_Stream> appearance() {
+    return GetAnnotAP(annot_dict().Get(), CPDF_Annot::AppearanceMode::kNormal);
+  }
+  RetainPtr<CPDF_Stream> InstallArtwork(
+      CFX_FloatRect bbox = CFX_FloatRect(0, 0, 200, 100)) {
+    const ByteStringView kArtwork = "1 0 0 rg 0 0 200 100 re f";
+    auto stream = pdf()->NewIndirect<CPDF_Stream>(kArtwork.unsigned_span());
+    auto dict = stream->GetMutableDict();
+    dict->SetNewFor<CPDF_Name>("Type", "XObject");
+    dict->SetNewFor<CPDF_Name>("Subtype", "Form");
+    dict->SetRectFor("BBox", bbox);
+    dict->SetNewFor<CPDF_Dictionary>("Resources");
+    annot_dict()->SetNewFor<CPDF_Dictionary>("AP")->SetNewFor<CPDF_Reference>(
+        "N", pdf(), stream->GetObjNum());
+    return stream;
+  }
+
+  ScopedFPDFDocument doc_;
+  ScopedFPDFPage page_;
+  ScopedFPDFAnnotation annot_;
+};
+
+TEST_F(EPDFStampResizeEmbedderTest, CoverCentersBothAxes) {
+  InstallArtwork();
+  ASSERT_TRUE(
+      EPDFAnnot_UpdateAppearanceToRect(annot_.get(), EPDF_STAMP_FIT_COVER));
+  EXPECT_EQ("q 1 0 0 1 -50 0 cm /EPDFWRAP Do Q",
+            GetNormalAppearanceStreamBytes(annot_.get()));
+
+  InstallArtwork(CFX_FloatRect(0, 0, 100, 200));
+  ASSERT_TRUE(
+      EPDFAnnot_UpdateAppearanceToRect(annot_.get(), EPDF_STAMP_FIT_COVER));
+  EXPECT_EQ("q 1 0 0 1 0 -50 cm /EPDFWRAP Do Q",
+            GetNormalAppearanceStreamBytes(annot_.get()));
+}
+
+TEST_F(EPDFStampResizeEmbedderTest,
+       DetachesSharedDictionariesAndSelectedState) {
+  auto original = InstallArtwork();
+  auto states = pdf()->NewIndirect<CPDF_Dictionary>();
+  states->SetNewFor<CPDF_Reference>("On", pdf(), original->GetObjNum());
+  states->SetNewFor<CPDF_Reference>("Off", pdf(), original->GetObjNum());
+  auto shared_ap = pdf()->NewIndirect<CPDF_Dictionary>();
+  shared_ap->SetNewFor<CPDF_Reference>("N", pdf(), states->GetObjNum());
+  shared_ap->SetNewFor<CPDF_Reference>("R", pdf(), original->GetObjNum());
+  annot_dict()->SetNewFor<CPDF_Reference>("AP", pdf(), shared_ap->GetObjNum());
+  annot_dict()->SetNewFor<CPDF_Name>("AS", "On");
+
+  ScopedFPDFAnnotation sibling(
+      FPDFPage_CreateAnnot(page_.get(), FPDF_ANNOT_STAMP));
+  auto sibling_dict =
+      CPDFAnnotContextFromFPDFAnnotation(sibling.get())->GetMutableAnnotDict();
+  sibling_dict->SetNewFor<CPDF_Reference>("AP", pdf(), shared_ap->GetObjNum());
+  sibling_dict->SetNewFor<CPDF_Name>("AS", "On");
+
+  ASSERT_TRUE(
+      EPDFAnnot_UpdateAppearanceToRect(annot_.get(), EPDF_STAMP_FIT_CONTAIN));
+  auto updated_ap = annot_dict()->GetDictFor("AP");
+  EXPECT_NE(shared_ap.Get(), updated_ap.Get());
+  EXPECT_NE(states.Get(), updated_ap->GetDictFor("N").Get());
+  EXPECT_NE(original.Get(), appearance().Get());
+  EXPECT_EQ(original.Get(),
+            updated_ap->GetDictFor("N")->GetStreamFor("Off").Get());
+  EXPECT_EQ(original.Get(), updated_ap->GetStreamFor("R").Get());
+  EXPECT_EQ(shared_ap.Get(), sibling_dict->GetDictFor("AP").Get());
+  EXPECT_EQ(original.Get(), states->GetStreamFor("On").Get());
+  EXPECT_EQ(CFX_FloatRect(0, 0, 200, 100),
+            original->GetDict()->GetRectFor("BBox"));
+  EXPECT_FALSE(original->GetDict()->KeyExist("EPDFOrigContentRect"));
+}
+
+TEST_F(EPDFStampResizeEmbedderTest, StateSelectionWithoutASMatchesRendering) {
+  for (int selection = 0; selection < 3; ++selection) {
+    auto original = InstallArtwork();
+    auto states = pdf()->NewIndirect<CPDF_Dictionary>();
+    states->SetNewFor<CPDF_Reference>("On", pdf(), original->GetObjNum());
+    states->SetNewFor<CPDF_Reference>("Off", pdf(), original->GetObjNum());
+    annot_dict()->GetMutableDictFor("AP")->SetNewFor<CPDF_Reference>(
+        "N", pdf(), states->GetObjNum());
+    annot_dict()->RemoveFor("V");
+    annot_dict()->RemoveFor("Parent");
+    if (selection == 0) {
+      annot_dict()->SetNewFor<CPDF_Name>("V", "On");
+    } else if (selection == 1) {
+      annot_dict()->SetNewFor<CPDF_Dictionary>("Parent")->SetNewFor<CPDF_Name>(
+          "V", "On");
+    }
+    ASSERT_TRUE(
+        EPDFAnnot_UpdateAppearanceToRect(annot_.get(), EPDF_STAMP_FIT_CONTAIN));
+    auto updated = annot_dict()->GetDictFor("AP")->GetDictFor("N");
+    EXPECT_NE(original.Get(),
+              updated->GetStreamFor(selection == 2 ? "Off" : "On").Get());
+    EXPECT_EQ(original.Get(),
+              updated->GetStreamFor(selection == 2 ? "On" : "Off").Get());
+  }
+}
+
+TEST_F(EPDFStampResizeEmbedderTest,
+       StaleMarkerDoesNotReplaceArtworkWithMissingDo) {
+  auto original = InstallArtwork();
+  original->GetMutableDict()->SetRectFor("EPDFOrigContentRect",
+                                         CFX_FloatRect(0, 0, 1, 1));
+  ASSERT_TRUE(
+      EPDFAnnot_UpdateAppearanceToRect(annot_.get(), EPDF_STAMP_FIT_CONTAIN));
+  auto ap = appearance();
+  auto child = ap->GetDict()
+                   ->GetDictFor("Resources")
+                   ->GetDictFor("XObject")
+                   ->GetStreamFor("EPDFWRAP");
+  ASSERT_TRUE(child);
+  EXPECT_EQ(CFX_FloatRect(0, 0, 200, 100),
+            child->GetDict()->GetRectFor("BBox"));
+  EXPECT_EQ(CFX_FloatRect(0, 0, 200, 100),
+            ap->GetDict()->GetRectFor("EPDFOrigContentRect"));
+  EXPECT_EQ("q .5 0 0 .5 0 25 cm /EPDFWRAP Do Q",
+            GetNormalAppearanceStreamBytes(annot_.get()));
+}
+
+TEST_F(EPDFStampResizeEmbedderTest,
+       RepeatedResizesReuseChildDespiteMissingOrStaleMarker) {
+  auto original = InstallArtwork(CFX_FloatRect(20, 30, 220, 130));
+  original->GetMutableDict()->SetMatrixFor("Matrix",
+                                           CFX_Matrix(0, 1, -1, 0, 130, -20));
+  ASSERT_TRUE(
+      EPDFAnnot_UpdateAppearanceToRect(annot_.get(), EPDF_STAMP_FIT_CONTAIN));
+  auto child = appearance()
+                   ->GetDict()
+                   ->GetDictFor("Resources")
+                   ->GetDictFor("XObject")
+                   ->GetStreamFor("EPDFWRAP");
+  ASSERT_TRUE(child);
+  EXPECT_EQ("q .5 0 0 .5 25 0 cm /EPDFWRAP Do Q",
+            GetNormalAppearanceStreamBytes(annot_.get()));
+  for (int i = 0; i < 20; ++i) {
+    auto dict = appearance()->GetMutableDict();
+    if (i % 2) {
+      dict->SetRectFor("EPDFOrigContentRect", CFX_FloatRect(0, 0, 1, 1));
+    } else {
+      dict->RemoveFor("EPDFOrigContentRect");
+    }
+    const FS_RECTF rect{10, 110, i % 2 ? 210.0f : 110.0f, 10};
+    ASSERT_TRUE(EPDFAnnot_SetRect(annot_.get(), &rect));
+    ASSERT_TRUE(
+        EPDFAnnot_UpdateAppearanceToRect(annot_.get(), EPDF_STAMP_FIT_CONTAIN));
+    auto next_child = appearance()
+                          ->GetDict()
+                          ->GetDictFor("Resources")
+                          ->GetDictFor("XObject")
+                          ->GetStreamFor("EPDFWRAP");
+    EXPECT_EQ(child.Get(), next_child.Get());
+  }
+  EXPECT_EQ(CFX_FloatRect(20, 30, 220, 130),
+            child->GetDict()->GetRectFor("BBox"));
+  EXPECT_EQ(CFX_Matrix(0, 1, -1, 0, 130, -20),
+            child->GetDict()->GetMatrixFor("Matrix"));
+}
+
+TEST_F(EPDFStampResizeEmbedderTest, RefreshesAlreadyParsedAnnotationObjects) {
+  InstallArtwork();
+  ASSERT_EQ(1, FPDFAnnot_GetObjectCount(annot_.get()));
+  EXPECT_EQ(FPDF_PAGEOBJ_PATH,
+            FPDFPageObj_GetType(FPDFAnnot_GetObject(annot_.get(), 0)));
+  ASSERT_TRUE(
+      EPDFAnnot_UpdateAppearanceToRect(annot_.get(), EPDF_STAMP_FIT_CONTAIN));
+  ASSERT_EQ(1, FPDFAnnot_GetObjectCount(annot_.get()));
+  EXPECT_EQ(FPDF_PAGEOBJ_FORM,
+            FPDFPageObj_GetType(FPDFAnnot_GetObject(annot_.get(), 0)));
+}
+
+TEST_F(EPDFStampResizeEmbedderTest,
+       FailedWrappingLeavesOriginalAppearanceUnchanged) {
+  auto original = InstallArtwork(CFX_FloatRect());
+  EXPECT_FALSE(
+      EPDFAnnot_UpdateAppearanceToRect(annot_.get(), EPDF_STAMP_FIT_CONTAIN));
+  EXPECT_EQ(original.Get(), appearance().Get());
+  EXPECT_FALSE(original->GetDict()->KeyExist("EPDFOrigContentRect"));
+  EXPECT_EQ("1 0 0 rg 0 0 200 100 re f",
+            GetNormalAppearanceStreamBytes(annot_.get()));
+}
+
+class EPDFStampSaveEmbedderTest : public EPDFStampResizeEmbedderTest,
+                                  public testing::WithParamInterface<int> {};
+
+TEST_P(EPDFStampSaveEmbedderTest,
+       LayerRotationSurvivesIncrementalSaveAndRewrite) {
+  // Model an imported stamp: existing indirect AP, no Matrix or metadata.
+  auto artwork = InstallArtwork();
+  const ByteStringView kBands =
+      "1 0 0 rg 0 0 50 100 re f 0 1 0 rg 50 0 100 100 re f "
+      "0 0 1 rg 150 0 50 100 re f";
+  artwork->SetData(kBands.unsigned_span());
+  const FS_RECTF initial_rect{10, 110, 210, 10};
+  ASSERT_TRUE(EPDFAnnot_SetRect(annot_.get(), &initial_rect));
+  if (GetParam() >= 2) {
+    auto ap = pdf()->NewIndirect<CPDF_Dictionary>();
+    if (GetParam() == 3) {
+      auto states = pdf()->NewIndirect<CPDF_Dictionary>();
+      states->SetNewFor<CPDF_Reference>("On", pdf(), artwork->GetObjNum());
+      states->SetNewFor<CPDF_Reference>("Off", pdf(), artwork->GetObjNum());
+      ap->SetNewFor<CPDF_Reference>("N", pdf(), states->GetObjNum());
+    } else {
+      ap->SetNewFor<CPDF_Reference>("N", pdf(), artwork->GetObjNum());
+    }
+    annot_dict()->SetNewFor<CPDF_Reference>("AP", pdf(), ap->GetObjNum());
+    annot_dict()->SetNewFor<CPDF_Name>("AS", "On");
+  }
+  if (GetParam() != 0) {
+    ScopedFPDFAnnotation sibling(
+        FPDFPage_CreateAnnot(page_.get(), FPDF_ANNOT_STAMP));
+    ASSERT_TRUE(sibling);
+    const FS_RECTF sibling_rect{300, 110, 500, 10};
+    ASSERT_TRUE(EPDFAnnot_SetRect(sibling.get(), &sibling_rect));
+    auto sibling_dict = CPDFAnnotContextFromFPDFAnnotation(sibling.get())
+                            ->GetMutableAnnotDict();
+    sibling_dict->SetFor("AP", annot_dict()->GetObjectFor("AP")->Clone());
+    sibling_dict->SetNewFor<CPDF_Name>("AS", "On");
+  }
+
+  ClearString();
+  ASSERT_TRUE(FPDF_SaveAsCopy(doc_.get(), this, FPDF_NO_INCREMENTAL));
+  const std::string input = GetString();
+  LayerFixture layer;
+  ASSERT_TRUE(
+      layer.OpenBytes(std::vector<uint8_t>(input.begin(), input.end())));
+  ScopedFPDFPage page(FPDF_LoadPage(layer.layer, 0));
+  ASSERT_TRUE(page);
+  ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(page.get(), 0));
+  ASSERT_TRUE(annot);
+  auto normal_ap = [](FPDF_ANNOTATION handle) {
+    return GetAnnotAP(
+        CPDFAnnotContextFromFPDFAnnotation(handle)->GetAnnotDict(),
+        CPDF_Annot::AppearanceMode::kNormal);
+  };
+  ASSERT_FALSE(normal_ap(annot.get())->GetDict()->KeyExist("Matrix"));
+  ASSERT_FALSE(EPDFAnnot_HasEmbedMetadata(annot.get()));
+  EXPECT_EQ(EPDFSaveStatus_kUnchangedSinceLoad,
+            SaveStandaloneEx(layer.layer).status);
+
+  // A separate layer over the same base must not inherit the edit.
+  ScopedFPDFDocument untouched(
+      EPDFLayer_OpenLayer(layer.base, nullptr, nullptr, nullptr));
+  ASSERT_TRUE(untouched);
+  ScopedFPDFPage untouched_page(FPDF_LoadPage(untouched.get(), 0));
+  ASSERT_TRUE(untouched_page);
+  const std::string original_pixels = HashBitmap(
+      RenderPageWithFlags(untouched_page.get(), nullptr, FPDF_ANNOT).get());
+
+  const FS_RECTF rect{95, 90, 125, 30};
+  const FS_RECTF unrotated{80, 75, 140, 45};
+  ASSERT_TRUE(EPDFAnnot_SetRect(annot.get(), &rect));
+  ASSERT_TRUE(EPDFAnnot_SetEmbedMetadataNumber(annot.get(), "Rotation", 270));
+  ASSERT_TRUE(
+      EPDFAnnot_SetEmbedMetadataRect(annot.get(), "UnrotatedRect", &unrotated));
+  ASSERT_TRUE(
+      EPDFAnnot_UpdateAppearanceToRect(annot.get(), EPDF_STAMP_FIT_CONTAIN));
+  const ByteString live_content = GetNormalAppearanceStreamBytes(annot.get());
+  const std::string live_pixels =
+      HashBitmap(RenderPageWithFlags(page.get(), nullptr, FPDF_ANNOT).get());
+  EXPECT_NE(original_pixels, live_pixels);
+
+  // Repeated saves use the original baseline, even after a full rewrite.
+  for (FPDF_DWORD flags :
+       {FPDF_INCREMENTAL, FPDF_NO_INCREMENTAL, FPDF_INCREMENTAL}) {
+    SCOPED_TRACE(flags);
+    const StandaloneProbe saved = SaveStandaloneEx(layer.layer, flags);
+    ASSERT_EQ(EPDFSaveStatus_kWritten, saved.status);
+    ASSERT_FALSE(saved.bytes.empty());
+    if (flags == FPDF_INCREMENTAL) {
+      ASSERT_GT(saved.bytes.size(), layer.bytes.size());
+      EXPECT_TRUE(std::equal(layer.bytes.begin(), layer.bytes.end(),
+                             saved.bytes.begin()));
+    }
+    ScopedFPDFDocument reopened(FPDF_LoadMemDocument64(
+        saved.bytes.data(), saved.bytes.size(), nullptr));
+    ASSERT_TRUE(reopened);
+    ScopedFPDFPage reopened_page(FPDF_LoadPage(reopened.get(), 0));
+    ASSERT_TRUE(reopened_page);
+    ScopedFPDFAnnotation reopened_annot(
+        FPDFPage_GetAnnot(reopened_page.get(), 0));
+    ASSERT_TRUE(reopened_annot);
+    float rotation = 0;
+    ASSERT_TRUE(EPDFAnnot_GetEmbedMetadataNumber(reopened_annot.get(),
+                                                 "Rotation", &rotation));
+    EXPECT_FLOAT_EQ(270, rotation);
+    const auto ap = normal_ap(reopened_annot.get());
+    ASSERT_TRUE(ap);
+    const auto dict = ap->GetDict();
+    ASSERT_TRUE(dict->KeyExist("Matrix"));
+    const CFX_Matrix matrix = dict->GetMatrixFor("Matrix");
+    EXPECT_NEAR(0, matrix.a, 1e-5);
+    EXPECT_NEAR(-1, matrix.b, 1e-5);
+    EXPECT_NEAR(1, matrix.c, 1e-5);
+    EXPECT_NEAR(0, matrix.d, 1e-5);
+    EXPECT_NEAR(50, matrix.e, 1e-5);
+    EXPECT_NEAR(170, matrix.f, 1e-5);
+    EXPECT_EQ(CFX_FloatRect(0, 0, 60, 30), dict->GetRectFor("BBox"));
+    EXPECT_EQ(CFX_FloatRect(0, 0, 200, 100),
+              dict->GetRectFor("EPDFOrigContentRect"));
+    const auto resources = dict->GetDictFor("Resources");
+    ASSERT_TRUE(resources);
+    const auto xobjects = resources->GetDictFor("XObject");
+    ASSERT_TRUE(xobjects);
+    EXPECT_TRUE(xobjects->GetStreamFor("EPDFWRAP"));
+    EXPECT_EQ(live_content,
+              GetNormalAppearanceStreamBytes(reopened_annot.get()));
+    EXPECT_EQ(live_pixels, HashBitmap(RenderPageWithFlags(reopened_page.get(),
+                                                          nullptr, FPDF_ANNOT)
+                                          .get()));
+    EXPECT_EQ(original_pixels,
+              HashBitmap(
+                  RenderPageWithFlags(untouched_page.get(), nullptr, FPDF_ANNOT)
+                      .get()));
+    EXPECT_EQ(EPDFSaveStatus_kUnchangedSinceLoad,
+              SaveStandaloneEx(untouched.get()).status);
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(AppearanceSharing,
+                         EPDFStampSaveEmbedderTest,
+                         testing::Values(0, 1, 2, 3),
+                         ([](const testing::TestParamInfo<int>& info) {
+                           constexpr const char* kNames[] = {
+                               "Unshared", "SharedStream", "SharedDictionary",
+                               "SharedStates"};
+                           return kNames[info.param];
+                         }));

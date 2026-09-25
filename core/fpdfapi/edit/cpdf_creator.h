@@ -11,9 +11,9 @@
 
 #include <map>
 #include <memory>
-#include <set>
 #include <vector>
 
+#include "core/fpdfapi/parser/cpdf_write_context.h"
 #include "core/fxcrt/fx_stream.h"
 #include "core/fxcrt/fx_string.h"
 #include "core/fxcrt/mask.h"
@@ -27,8 +27,9 @@ class CPDF_Dictionary;
 class CPDF_Document;
 class CPDF_Object;
 class CPDF_Parser;
+class CPDF_SaveTrailer;
 
-class CPDF_Creator {
+class CPDF_Creator final : public CPDF_WriteContext {
  public:
   enum CreateFlags : uint32_t {
     kNone = 0,
@@ -39,6 +40,11 @@ class CPDF_Creator {
     // TODO(crbug.com/42270430): Implement font subsetting.
     kSubsetNewFonts = (1 << 3),
     kIncrementalAppendOnly = (1 << 4),
+    // EmbedPDF: an incremental save of a layer document writes nothing at
+    // all when no reachable object differs from the document the layer was
+    // opened with; IsUnchangedSinceLoad() then reports it and the caller
+    // returns the loaded bytes verbatim.
+    kSkipIfUnchangedSinceLoad = (1 << 5),
   };
 
   enum class FailureReason {
@@ -50,12 +56,31 @@ class CPDF_Creator {
 
   CPDF_Creator(CPDF_Document* doc,
                RetainPtr<IFX_RetainableWriteStream> archive);
-  ~CPDF_Creator();
+  ~CPDF_Creator() override;
 
   bool Create(Mask<CreateFlags> flags, int32_t file_version);
   FailureReason GetFailureReason() const { return failure_reason_; }
 
+  // Experimental EmbedPDF Extension: where the last Create() wrote each
+  // object it emitted, and where its cross-reference section starts. Valid
+  // after a successful Create(); used to locate a signature dictionary's
+  // placeholders in the saved bytes without searching.
+  const std::map<uint32_t, FX_FILESIZE>& object_offsets() const {
+    return object_offsets_;
+  }
+  FX_FILESIZE xref_start() const { return xref_start_; }
+
   static ByteString FormatXrefOffset10ForTesting(FX_FILESIZE offset);
+
+  // EmbedPDF: what the last incremental save of a layer found. A save
+  // writes what changed from the BASE (overlay objects equal to their base
+  // twin are elided); whether anything reachable changed since the layer
+  // was LOADED is a separate answer, used by callers to keep what they
+  // have. Valid after Create() on a layer document.
+  bool changed_since_load() const { return changed_since_load_; }
+  // True when Create() wrote nothing because kSkipIfUnchangedSinceLoad was
+  // set and nothing changed since load.
+  bool IsUnchangedSinceLoad() const { return decided_unchanged_; }
 
   // Experimental EmbedPDF Extension: Set encryption for documents that weren't
   // originally encrypted. This sets both encrypt_dict_ (for trailer writing)
@@ -71,7 +96,6 @@ class CPDF_Creator {
     kWriteHeader10 = 10,
     kWriteIncremental15 = 15,
     kInitWriteObjs20 = 20,
-    kWriteOldObjs21 = 21,
     kInitWriteNewObjs25 = 25,
     kWriteNewObjs26 = 26,
     kWriteEncryptDict27 = 27,
@@ -85,19 +109,21 @@ class CPDF_Creator {
   bool Continue();
   void Clear();
 
-  void InitNewObjNumOffsets();
+  void PrepareIncrementalObjects();
   void InitID();
+  bool BuildTrailer();
 
   CPDF_Creator::Stage WriteDoc_Stage1();
   CPDF_Creator::Stage WriteDoc_Stage2();
   CPDF_Creator::Stage WriteDoc_Stage3();
   CPDF_Creator::Stage WriteDoc_Stage4();
 
-  bool WriteOldIndirectObject(uint32_t objnum);
-  bool WriteOldObjs();
+  bool WriteFullDocument();
   bool WriteNewObjs();
   bool WriteIndirectObj(uint32_t objnum, const CPDF_Object* pObj);
   bool CheckEmittedOffset(FX_FILESIZE offset);
+  uint32_t GetObjectGeneration(uint32_t object_number) const override;
+  bool WriteReference(uint32_t object_number);
 
   void RemoveSecurity();
 
@@ -116,8 +142,12 @@ class CPDF_Creator {
   FX_FILESIZE xref_start_ = 0;
   std::map<uint32_t, FX_FILESIZE> object_offsets_;
   std::vector<uint32_t> new_obj_num_array_;  // Sorted, ascending.
-  std::set<uint32_t> objects_with_refs_;
+  bool changed_since_load_ = false;
+  bool decided_unchanged_ = false;
+  // A layer save with nothing to write appends no revision at all.
+  bool skip_empty_revision_ = false;
   RetainPtr<CPDF_Array> id_array_;
+  std::unique_ptr<CPDF_SaveTrailer> trailer_;
   int32_t file_version_ = 0;
   bool security_changed_ = false;
   bool is_incremental_ = false;

@@ -33,8 +33,10 @@ class CPDF_Stream final : public CPDF_Object {
       CPDF_IndirectObjectHolder* holder) const override;
   WideString GetUnicodeText() const override;
   CPDF_Stream* AsMutableStream() override;
+  using CPDF_Object::WriteTo;
   bool WriteTo(IFX_ArchiveStream* archive,
-               const CPDF_Encryptor* encryptor) const override;
+               const CPDF_Encryptor* encryptor,
+               const CPDF_WriteContext* context) const override;
 
   size_t GetRawSize() const;
   // Can only be called when stream is memory-based.
@@ -61,6 +63,13 @@ class CPDF_Stream final : public CPDF_Object {
   bool IsFileBased() const {
     return std::holds_alternative<RetainPtr<IFX_SeekableReadStream>>(data_);
   }
+  // EmbedPDF: the read-only view a file-based stream's bytes live in (null
+  // for memory-based data). Two streams with the same view hold the same
+  // bytes; SetData() replaces the view with owned memory.
+  RetainPtr<IFX_SeekableReadStream> BackingView() const;
+  // EmbedPDF: raw (still-encoded) bytes [offset, offset + buffer.size()),
+  // from memory or from the view, without loading the whole stream.
+  bool ReadRawBlock(pdfium::span<uint8_t> buffer, FX_FILESIZE offset) const;
   bool IsMemoryBased() const {
     return std::holds_alternative<DataVector<uint8_t>>(data_);
   }

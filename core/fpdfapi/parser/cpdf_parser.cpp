@@ -20,6 +20,7 @@
 #include "core/fpdfapi/parser/cpdf_linearized_header.h"
 #include "core/fpdfapi/parser/cpdf_number.h"
 #include "core/fpdfapi/parser/cpdf_object_stream.h"
+#include "core/fpdfapi/parser/cpdf_object_stream_cache.h"
 #include "core/fpdfapi/parser/cpdf_read_validator.h"
 #include "core/fpdfapi/parser/cpdf_reference.h"
 #include "core/fpdfapi/parser/cpdf_security_handler.h"
@@ -196,6 +197,7 @@ bool CPDF_Parser::IsObjectFree(uint32_t objnum) const {
 }
 
 bool CPDF_Parser::InitSyntaxParser(RetainPtr<CPDF_ReadValidator> validator) {
+  save_reference_index_.Clear();
   const std::optional<FX_FILESIZE> header_offset = GetHeaderOffset(validator);
   if (!header_offset.has_value()) {
     return false;
@@ -433,6 +435,23 @@ bool CPDF_Parser::LoadAllCrossRefTablesAndStreams(FX_FILESIZE xref_offset) {
   if (!FindAllCrossReferenceTablesAndStream(xref_offset, xref_list,
                                             xref_stream_list)) {
     return false;
+  }
+
+  // EmbedPDF: remember the chain, oldest first. Consecutive entries are
+  // linked by /Prev because FindAllCrossReferenceTablesAndStream() prepends
+  // each older section as it follows the chain.
+  cross_ref_sections_.clear();
+  for (size_t i = 0; i < xref_list.size(); ++i) {
+    CrossRefSection section;
+    if (xref_list[i] > 0) {
+      section.offset = xref_list[i];
+      section.hybrid_stream_offset =
+          xref_stream_list[i] > 0 ? xref_stream_list[i] : 0;
+    } else {
+      section.offset = xref_stream_list[i];
+    }
+    section.prev_offset = i > 0 ? cross_ref_sections_[i - 1].offset : 0;
+    cross_ref_sections_.push_back(section);
   }
 
   if (xref_list.front() > 0) {
@@ -753,6 +772,9 @@ bool CPDF_Parser::FindAllCrossReferenceTablesAndStream(
 }
 
 bool CPDF_Parser::RebuildCrossRef() {
+  save_reference_index_.Clear();
+  // EmbedPDF: a scanned table has no chain.
+  cross_ref_sections_.clear();
   auto cross_ref_table = std::make_unique<CPDF_CrossRefTable>();
 
   const uint32_t kBufferSize = 4096;
@@ -1066,6 +1088,22 @@ uint32_t CPDF_Parser::GetRootObjNum() const {
 }
 
 RetainPtr<CPDF_Object> CPDF_Parser::ParseIndirectObject(uint32_t objnum) {
+  return ParseIndirectObjectInternal(objnum, objects_holder_, nullptr);
+}
+
+RetainPtr<CPDF_Object> CPDF_Parser::ParseIndirectObjectForSave(
+    uint32_t objnum,
+    CPDF_IndirectObjectHolder* holder,
+    CPDF_ObjectStreamCache* stream_cache) {
+  CHECK(holder);
+  CHECK(stream_cache);
+  return ParseIndirectObjectInternal(objnum, holder, stream_cache);
+}
+
+RetainPtr<CPDF_Object> CPDF_Parser::ParseIndirectObjectInternal(
+    uint32_t objnum,
+    CPDF_IndirectObjectHolder* holder,
+    CPDF_ObjectStreamCache* stream_cache) {
   if (!IsValidObjectNumber(objnum)) {
     return nullptr;
   }
@@ -1089,17 +1127,50 @@ RetainPtr<CPDF_Object> CPDF_Parser::ParseIndirectObject(uint32_t objnum) {
       if (info->pos <= 0) {
         return nullptr;
       }
-      return ParseIndirectObjectAt(info->pos, objnum);
+      return ParseIndirectObjectAtWithHolder(info->pos, objnum, holder);
     }
     case ObjectType::kCompressed: {
+      if (stream_cache) {
+        auto stream =
+            GetObjectStreamForSave(info->archive.obj_num, holder, stream_cache);
+        return stream ? stream->ParseObject(holder, objnum,
+                                            info->archive.obj_index)
+                      : nullptr;
+      }
       const auto* obj_stream = GetObjectStream(info->archive.obj_num);
       if (!obj_stream) {
         return nullptr;
       }
-      return obj_stream->ParseObject(objects_holder_, objnum,
-                                     info->archive.obj_index);
+      return obj_stream->ParseObject(holder, objnum, info->archive.obj_index);
     }
   }
+}
+
+std::shared_ptr<const CPDF_ObjectStream> CPDF_Parser::GetObjectStreamForSave(
+    uint32_t object_number,
+    CPDF_IndirectObjectHolder* holder,
+    CPDF_ObjectStreamCache* stream_cache) {
+  if (pdfium::Contains(parsing_obj_nums_, object_number)) {
+    return nullptr;
+  }
+  if (auto cached = stream_cache->Get(object_number)) {
+    return cached;
+  }
+
+  const auto* info = cross_ref_table_->GetObjectInfo(object_number);
+  if (!info || !info->is_object_stream_flag || info->pos <= 0) {
+    return nullptr;
+  }
+
+  ScopedSetInsertion parsing(&parsing_obj_nums_, object_number);
+  auto object =
+      ParseIndirectObjectAtWithHolder(info->pos, object_number, holder);
+  std::shared_ptr<const CPDF_ObjectStream> stream =
+      CPDF_ObjectStream::Create(ToStream(object));
+  if (stream) {
+    stream_cache->Put(object_number, stream);
+  }
+  return stream;
 }
 
 const CPDF_ObjectStream* CPDF_Parser::GetObjectStream(uint32_t object_number) {
@@ -1142,11 +1213,18 @@ const CPDF_ObjectStream* CPDF_Parser::GetObjectStream(uint32_t object_number) {
 
 RetainPtr<CPDF_Object> CPDF_Parser::ParseIndirectObjectAt(FX_FILESIZE pos,
                                                           uint32_t objnum) {
+  return ParseIndirectObjectAtWithHolder(pos, objnum, objects_holder_);
+}
+
+RetainPtr<CPDF_Object> CPDF_Parser::ParseIndirectObjectAtWithHolder(
+    FX_FILESIZE pos,
+    uint32_t objnum,
+    CPDF_IndirectObjectHolder* holder) {
   const FX_FILESIZE saved_pos = syntax_->GetPos();
   syntax_->SetPos(pos);
 
-  auto result = syntax_->GetIndirectObject(
-      objects_holder_, CPDF_SyntaxParser::ParseType::kLoose);
+  auto result =
+      syntax_->GetIndirectObject(holder, CPDF_SyntaxParser::ParseType::kLoose);
   syntax_->SetPos(saved_pos);
   if (result && objnum && result->GetObjNum() != objnum) {
     return nullptr;
@@ -1164,6 +1242,23 @@ RetainPtr<CPDF_Object> CPDF_Parser::ParseIndirectObjectAt(FX_FILESIZE pos,
 
 FX_FILESIZE CPDF_Parser::GetDocumentSize() const {
   return syntax_->GetDocumentSize();
+}
+
+const std::vector<unsigned int>& CPDF_Parser::GetCachedTrailerEnds() {
+  if (!cached_trailer_ends_.has_value()) {
+    cached_trailer_ends_ = GetTrailerEnds();
+  }
+  return cached_trailer_ends_.value();
+}
+
+FX_FILESIZE CPDF_Parser::GetFileHeaderOffset() const {
+  RetainPtr<IFX_SeekableReadStream> file = GetFileAccess();
+  if (!file || !syntax_) {
+    return 0;
+  }
+  const FX_FILESIZE file_size = file->GetSize();
+  const FX_FILESIZE document_size = syntax_->GetDocumentSize();
+  return file_size > document_size ? file_size - document_size : 0;
 }
 
 RetainPtr<IFX_SeekableReadStream> CPDF_Parser::GetFileAccess() const {
