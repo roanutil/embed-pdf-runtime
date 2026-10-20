@@ -6,7 +6,6 @@
 #include <vector>
 
 #include "public/fpdf_attachment.h"
-#include "public/fpdf_save.h"
 #include "public/fpdfview.h"
 #include "testing/embedder_test.h"
 #include "testing/fx_string_testhelpers.h"
@@ -340,6 +339,37 @@ TEST_F(FPDFAttachmentEmbedderTest, AddAttachmentsToFileWithNoAttachments) {
   EXPECT_EQ(std::string(kContents2), std::string(content_buf.data(), 6));
 }
 
+TEST_F(FPDFAttachmentEmbedderTest, AddAttachmentWithNonAsciiStringValue) {
+  ASSERT_TRUE(OpenDocument("hello_world.pdf"));
+  ScopedPage page = LoadScopedPage(0);
+  ASSERT_TRUE(page);
+
+  // Add a new attachment to the document.
+  ScopedFPDFWideString file_name = GetFPDFWideString(L"attachment.txt");
+  FPDF_ATTACHMENT attachment =
+      FPDFDoc_AddAttachment(document(), file_name.get());
+  ASSERT_TRUE(attachment);
+
+  static constexpr char kContents[] = "Test Contents";
+  EXPECT_TRUE(FPDFAttachment_SetFile(attachment, document(), kContents,
+                                     strlen(kContents)));
+
+  // Then add a non-ASCII string.
+  static constexpr wchar_t kData[] = L"\xf6\xe4";
+  static constexpr char kTestKey[] = "test";
+  ScopedFPDFWideString text = GetFPDFWideString(kData);
+  EXPECT_TRUE(FPDFAttachment_SetStringValue(attachment, kTestKey, text.get()));
+
+  // Read back the string value. It should be `kData`.
+  static constexpr size_t kBufSize = 6;
+  std::vector<FPDF_WCHAR> buf = GetFPDFWideStringBuffer(kBufSize);
+  unsigned long length_bytes =
+      FPDFAttachment_GetStringValue(attachment, kTestKey, buf.data(), kBufSize);
+
+  EXPECT_EQ(kBufSize, length_bytes);
+  EXPECT_EQ(kData, GetPlatformWString(buf.data()));
+}
+
 TEST_F(FPDFAttachmentEmbedderTest, DeleteAttachment) {
   // Open a file with two attachments.
   ASSERT_TRUE(OpenDocument("embedded_attachments.pdf"));
@@ -441,367 +471,117 @@ TEST_F(FPDFAttachmentEmbedderTest, GetSubtypeInvalid) {
             FPDFAttachment_GetSubtype(attachment, nullptr, 10));
 }
 
-namespace {
+TEST_F(FPDFAttachmentEmbedderTest, GetAFRelationship) {
+  ASSERT_TRUE(OpenDocument("embedded_attachments_with_af.pdf"));
+  ASSERT_EQ(3, FPDFDoc_GetAttachmentCount(document()));
 
-class CollectingFileWriter final : public FPDF_FILEWRITE {
- public:
-  CollectingFileWriter() {
-    version = 1;
-    WriteBlock = WriteBlockImpl;
-  }
-
-  const std::string& data() const { return data_; }
-  int write_calls() const { return write_calls_; }
-
- private:
-  static int WriteBlockImpl(FPDF_FILEWRITE* self,
-                            const void* data,
-                            unsigned long size) {
-    auto* writer = static_cast<CollectingFileWriter*>(self);
-    ++writer->write_calls_;
-    writer->data_.append(static_cast<const char*>(data), size);
-    return 1;
-  }
-
-  std::string data_;
-  int write_calls_ = 0;
-};
-
-class FailingFileWriter final : public FPDF_FILEWRITE {
- public:
-  FailingFileWriter() {
-    version = 1;
-    WriteBlock = WriteBlockImpl;
-  }
-
- private:
-  static int WriteBlockImpl(FPDF_FILEWRITE*, const void*, unsigned long) {
-    return 0;
-  }
-};
-
-std::string GetFileViaStockApi(FPDF_ATTACHMENT attachment) {
-  unsigned long length = 0;
-  if (!FPDFAttachment_GetFile(attachment, nullptr, 0, &length)) {
-    ADD_FAILURE() << "stock FPDFAttachment_GetFile failed";
-    return std::string();
-  }
-  std::vector<char> buf(length);
-  unsigned long actual = 0;
-  EXPECT_TRUE(FPDFAttachment_GetFile(attachment, buf.data(), length, &actual));
-  return std::string(buf.data(), actual);
-}
-
-}  // namespace
-
-TEST_F(FPDFAttachmentEmbedderTest, ExtractFileMatchesGetFile) {
-  ASSERT_TRUE(OpenDocument("embedded_attachments.pdf"));
-  ASSERT_EQ(2, FPDFDoc_GetAttachmentCount(document()));
-
-  for (int i = 0; i < 2; ++i) {
-    FPDF_ATTACHMENT attachment = FPDFDoc_GetAttachment(document(), i);
-    ASSERT_TRUE(attachment);
-    const std::string expected = GetFileViaStockApi(attachment);
-    ASSERT_FALSE(expected.empty());
-
-    // FPDF_FILEWRITE variant produces byte-identical output.
-    CollectingFileWriter writer;
-    uint32_t size = 0;
-    EPDFAttachmentExtractStatus status =
-        EPDFAttachmentExtractStatus_kWriteFailed;
-    ASSERT_TRUE(EPDFAttachment_ExtractFile(attachment, &writer,
-                                           /*max_decoded_bytes=*/0, &size,
-                                           &status))
-        << " for attachment " << i;
-    EXPECT_EQ(EPDFAttachmentExtractStatus_kSuccess, status);
-    EXPECT_EQ(expected.size(), static_cast<size_t>(size));
-    EXPECT_EQ(expected, writer.data());
-
-    // Owned-buffer variant too.
-    void* buffer = nullptr;
-    uint32_t buffer_size = 0;
-    ASSERT_TRUE(EPDFAttachment_ExtractFileToOwnedBuffer(
-        attachment, /*max_decoded_bytes=*/0, &buffer, &buffer_size, &status));
-    EXPECT_EQ(EPDFAttachmentExtractStatus_kSuccess, status);
-    ASSERT_EQ(expected.size(), static_cast<size_t>(buffer_size));
-    ASSERT_TRUE(buffer);
-    EXPECT_EQ(expected, std::string(static_cast<const char*>(buffer),
-                                    buffer_size));
-    EPDF_FreeBuffer(buffer);
-  }
-}
-
-TEST_F(FPDFAttachmentEmbedderTest, ExtractFileSizeLimit) {
-  ASSERT_TRUE(OpenDocument("embedded_attachments.pdf"));
-
-  // The second attachment is 5869 bytes.
-  FPDF_ATTACHMENT attachment = FPDFDoc_GetAttachment(document(), 1);
-  ASSERT_TRUE(attachment);
-
-  CollectingFileWriter writer;
-  uint32_t size = 0;
-  EPDFAttachmentExtractStatus status = EPDFAttachmentExtractStatus_kSuccess;
-  EXPECT_FALSE(EPDFAttachment_ExtractFile(attachment, &writer,
-                                          /*max_decoded_bytes=*/100, &size,
-                                          &status));
-  EXPECT_EQ(EPDFAttachmentExtractStatus_kSizeLimitExceeded, status);
-  EXPECT_EQ(0u, size);
-
-  void* buffer = nullptr;
-  uint32_t buffer_size = 0;
-  EXPECT_FALSE(EPDFAttachment_ExtractFileToOwnedBuffer(
-      attachment, /*max_decoded_bytes=*/100, &buffer, &buffer_size, &status));
-  EXPECT_EQ(EPDFAttachmentExtractStatus_kSizeLimitExceeded, status);
-  EXPECT_FALSE(buffer);
-  EXPECT_EQ(0u, buffer_size);
-
-  // A limit exactly equal to the file size succeeds.
-  CollectingFileWriter exact_writer;
-  EXPECT_TRUE(EPDFAttachment_ExtractFile(attachment, &exact_writer,
-                                         /*max_decoded_bytes=*/5869, &size,
-                                         &status));
-  EXPECT_EQ(EPDFAttachmentExtractStatus_kSuccess, status);
-  EXPECT_EQ(5869u, size);
-}
-
-TEST_F(FPDFAttachmentEmbedderTest, ExtractFileNoFileStream) {
-  // This fixture's attachment is missing the embedded file (/EF).
-  ASSERT_TRUE(OpenDocument("embedded_attachments_invalid_data.pdf"));
+  // Attachment 0 (1.txt) has /AFRelationship /Alternative.
   FPDF_ATTACHMENT attachment = FPDFDoc_GetAttachment(document(), 0);
   ASSERT_TRUE(attachment);
 
-  CollectingFileWriter writer;
-  uint32_t size = 0;
-  EPDFAttachmentExtractStatus status = EPDFAttachmentExtractStatus_kSuccess;
-  EXPECT_FALSE(EPDFAttachment_ExtractFile(attachment, &writer,
-                                          /*max_decoded_bytes=*/0, &size,
-                                          &status));
-  EXPECT_EQ(EPDFAttachmentExtractStatus_kNoFileStream, status);
-  EXPECT_EQ(0, writer.write_calls());
+  constexpr char kExpectedRelationship[] = "Alternative";
+  unsigned long length =
+      FPDFAttachment_GetAFRelationship(attachment, nullptr, 0);
+  ASSERT_EQ(2u * (strlen(kExpectedRelationship) + 1), length);
 
-  void* buffer = nullptr;
-  uint32_t buffer_size = 0;
-  EXPECT_FALSE(EPDFAttachment_ExtractFileToOwnedBuffer(
-      attachment, /*max_decoded_bytes=*/0, &buffer, &buffer_size, &status));
-  EXPECT_EQ(EPDFAttachmentExtractStatus_kNoFileStream, status);
-  EXPECT_FALSE(buffer);
+  std::vector<FPDF_WCHAR> buf = GetFPDFWideStringBuffer(length);
+  EXPECT_EQ(length,
+            FPDFAttachment_GetAFRelationship(attachment, buf.data(), length));
+  EXPECT_EQ(kExpectedRelationship, GetPlatformString(buf.data()));
 
-  // A null attachment behaves the same.
-  EXPECT_FALSE(EPDFAttachment_ExtractFile(nullptr, &writer,
-                                          /*max_decoded_bytes=*/0, &size,
-                                          &status));
-  EXPECT_EQ(EPDFAttachmentExtractStatus_kNoFileStream, status);
+  // Attachment 1 (2.txt) has no /AFRelationship -> empty string (length 2).
+  FPDF_ATTACHMENT no_relationship = FPDFDoc_GetAttachment(document(), 1);
+  ASSERT_TRUE(no_relationship);
+  EXPECT_EQ(2u, FPDFAttachment_GetAFRelationship(no_relationship, buf.data(),
+                                                 length));
+  EXPECT_EQ("", GetPlatformString(buf.data()));
+
+  // Attachment 2 (3.txt) has a numeric /AFRelationship, which is not a name
+  // object -> empty string (length 2).
+  FPDF_ATTACHMENT numeric_relationship = FPDFDoc_GetAttachment(document(), 2);
+  ASSERT_TRUE(numeric_relationship);
+  EXPECT_EQ(2u, FPDFAttachment_GetAFRelationship(numeric_relationship,
+                                                 buf.data(), length));
+  EXPECT_EQ("", GetPlatformString(buf.data()));
 }
 
-TEST_F(FPDFAttachmentEmbedderTest, ExtractFileInvalidWriter) {
-  ASSERT_TRUE(OpenDocument("embedded_attachments.pdf"));
+TEST_F(FPDFAttachmentEmbedderTest, GetAFRelationshipInvalid) {
+  ASSERT_TRUE(OpenDocument("embedded_attachments_with_af.pdf"));
   FPDF_ATTACHMENT attachment = FPDFDoc_GetAttachment(document(), 0);
   ASSERT_TRUE(attachment);
 
-  uint32_t size = 1;
-  EPDFAttachmentExtractStatus status = EPDFAttachmentExtractStatus_kSuccess;
-  EXPECT_FALSE(EPDFAttachment_ExtractFile(attachment, nullptr,
-                                          /*max_decoded_bytes=*/0, &size,
-                                          &status));
-  EXPECT_EQ(EPDFAttachmentExtractStatus_kWriteFailed, status);
-  EXPECT_EQ(0u, size);
+  // Null attachment -> 0.
+  std::vector<FPDF_WCHAR> buf(1);
+  EXPECT_EQ(0u, FPDFAttachment_GetAFRelationship(nullptr, buf.data(), 1));
 
-  CollectingFileWriter bad_version;
-  bad_version.version = 2;
-  EXPECT_FALSE(EPDFAttachment_ExtractFile(attachment, &bad_version,
-                                          /*max_decoded_bytes=*/0, &size,
-                                          &status));
-  EXPECT_EQ(EPDFAttachmentExtractStatus_kWriteFailed, status);
+  // Buffer too small: unmodified, but the full length is still returned.
+  constexpr char kExpectedRelationship[] = "Alternative";
+  unsigned long length =
+      FPDFAttachment_GetAFRelationship(attachment, nullptr, 0);
+  ASSERT_EQ(2u * (strlen(kExpectedRelationship) + 1), length);
 
-  CollectingFileWriter no_callback;
-  no_callback.WriteBlock = nullptr;
-  EXPECT_FALSE(EPDFAttachment_ExtractFile(attachment, &no_callback,
-                                          /*max_decoded_bytes=*/0, &size,
-                                          &status));
-  EXPECT_EQ(EPDFAttachmentExtractStatus_kWriteFailed, status);
+  std::vector<FPDF_WCHAR> small_buf(length - 1);
+  constexpr FPDF_WCHAR kPattern = 0xDEAD;
+  std::ranges::fill(small_buf, kPattern);
+  EXPECT_EQ(length, FPDFAttachment_GetAFRelationship(
+                        attachment, small_buf.data(), small_buf.size()));
+  // The buffer was too small to hold the result, so it must be left
+  // unmodified: every element still holds the pre-filled pattern.
+  EXPECT_THAT(small_buf, testing::Each(kPattern));
 }
 
-TEST_F(FPDFAttachmentEmbedderTest, ExtractFileWriterFailure) {
-  ASSERT_TRUE(OpenDocument("embedded_attachments.pdf"));
+TEST_F(FPDFAttachmentEmbedderTest, ReadAttachmentDescription) {
+  ASSERT_TRUE(OpenDocument("embedded_attachments_with_desc.pdf"));
+
+  FPDF_ATTACHMENT valid_attachment = FPDFDoc_GetAttachment(document(), 0);
+  FPDF_ATTACHMENT desc_absent = FPDFDoc_GetAttachment(document(), 1);
+  FPDF_ATTACHMENT numeric_desc = FPDFDoc_GetAttachment(document(), 2);
+  FPDF_ATTACHMENT empty_desc = FPDFDoc_GetAttachment(document(), 3);
+  ASSERT_TRUE(valid_attachment);
+  ASSERT_TRUE(desc_absent);
+  ASSERT_TRUE(empty_desc);
+  ASSERT_TRUE(numeric_desc);
+
+  std::vector<FPDF_WCHAR> buf(128);
+  constexpr char kExpectedValue[] = "Hello, World!";
+
+  // Buf is not filled if it is too small, but the needed buf size is returned.
+  EXPECT_EQ(2u * std::size(kExpectedValue),
+            FPDFAttachment_GetDescription(valid_attachment, buf.data(), 3));
+  EXPECT_EQ("", GetPlatformString(buf.data()));
+
+  EXPECT_EQ(
+      2u * std::size(kExpectedValue),
+      FPDFAttachment_GetDescription(valid_attachment, buf.data(), buf.size()));
+  EXPECT_EQ(kExpectedValue, GetPlatformString(buf.data()));
+
+  EXPECT_EQ(2u,
+            FPDFAttachment_GetDescription(desc_absent, buf.data(), buf.size()));
+  EXPECT_EQ("", GetPlatformString(buf.data()));
+
+  EXPECT_EQ(
+      2u, FPDFAttachment_GetDescription(numeric_desc, buf.data(), buf.size()));
+  EXPECT_EQ("", GetPlatformString(buf.data()));
+
+  EXPECT_EQ(2u,
+            FPDFAttachment_GetDescription(empty_desc, buf.data(), buf.size()));
+  EXPECT_EQ("", GetPlatformString(buf.data()));
+}
+
+TEST_F(FPDFAttachmentEmbedderTest, WriteAttachmentDescription) {
+  ASSERT_TRUE(OpenDocument("embedded_attachments_with_desc.pdf"));
+
   FPDF_ATTACHMENT attachment = FPDFDoc_GetAttachment(document(), 0);
   ASSERT_TRUE(attachment);
 
-  FailingFileWriter writer;
-  uint32_t size = 1;
-  EPDFAttachmentExtractStatus status = EPDFAttachmentExtractStatus_kSuccess;
-  EXPECT_FALSE(EPDFAttachment_ExtractFile(attachment, &writer,
-                                          /*max_decoded_bytes=*/0, &size,
-                                          &status));
-  EXPECT_EQ(EPDFAttachmentExtractStatus_kWriteFailed, status);
-  EXPECT_EQ(0u, size);
-}
+  std::vector<FPDF_WCHAR> buf(128);
+  static constexpr wchar_t kTestValue[] = L"\xFCber";
+  static constexpr size_t kTestLength = 6u;
+  ScopedFPDFWideString test_value = GetFPDFWideString(kTestValue);
 
-TEST_F(FPDFAttachmentEmbedderTest, ExtractFileEmptyAttachment) {
-  ASSERT_TRUE(OpenDocument("hello_world.pdf"));
-  ScopedFPDFWideString file_name = GetFPDFWideString(L"empty.bin");
-  FPDF_ATTACHMENT attachment =
-      FPDFDoc_AddAttachment(document(), file_name.get());
-  ASSERT_TRUE(attachment);
-  ASSERT_TRUE(FPDFAttachment_SetFile(attachment, document(), nullptr, 0));
+  EXPECT_TRUE(FPDFAttachment_SetDescription(attachment, test_value.get()));
 
-  // A zero-byte embedded file extracts successfully without any writes.
-  CollectingFileWriter writer;
-  uint32_t size = 1;
-  EPDFAttachmentExtractStatus status = EPDFAttachmentExtractStatus_kWriteFailed;
-  EXPECT_TRUE(EPDFAttachment_ExtractFile(attachment, &writer,
-                                         /*max_decoded_bytes=*/0, &size,
-                                         &status));
-  EXPECT_EQ(EPDFAttachmentExtractStatus_kSuccess, status);
-  EXPECT_EQ(0u, size);
-  EXPECT_EQ(0, writer.write_calls());
-
-  // The owned-buffer variant reports success with a null buffer.
-  void* buffer = reinterpret_cast<void*>(1);
-  uint32_t buffer_size = 1;
-  EXPECT_TRUE(EPDFAttachment_ExtractFileToOwnedBuffer(
-      attachment, /*max_decoded_bytes=*/0, &buffer, &buffer_size, &status));
-  EXPECT_EQ(EPDFAttachmentExtractStatus_kSuccess, status);
-  EXPECT_FALSE(buffer);
-  EXPECT_EQ(0u, buffer_size);
-}
-
-TEST_F(FPDFAttachmentEmbedderTest, ExtractFileLargeAttachment) {
-  ASSERT_TRUE(OpenDocument("hello_world.pdf"));
-  ScopedFPDFWideString file_name = GetFPDFWideString(L"big.bin");
-  FPDF_ATTACHMENT attachment =
-      FPDFDoc_AddAttachment(document(), file_name.get());
-  ASSERT_TRUE(attachment);
-
-  std::string contents(2 * 1024 * 1024 + 17, '\0');
-  for (size_t i = 0; i < contents.size(); ++i) {
-    contents[i] = static_cast<char>((i * 31 + i / 997) & 0xff);
-  }
-  ASSERT_TRUE(FPDFAttachment_SetFile(attachment, document(), contents.data(),
-                                     contents.size()));
-
-  CollectingFileWriter writer;
-  uint32_t size = 0;
-  EPDFAttachmentExtractStatus status = EPDFAttachmentExtractStatus_kWriteFailed;
-  ASSERT_TRUE(EPDFAttachment_ExtractFile(attachment, &writer,
-                                         /*max_decoded_bytes=*/0, &size,
-                                         &status));
-  EXPECT_EQ(EPDFAttachmentExtractStatus_kSuccess, status);
-  ASSERT_EQ(contents.size(), static_cast<size_t>(size));
-  EXPECT_EQ(contents, writer.data());
-}
-
-TEST_F(FPDFAttachmentEmbedderTest, ExtractFileToOwnedBufferBadArgs) {
-  ASSERT_TRUE(OpenDocument("embedded_attachments.pdf"));
-  FPDF_ATTACHMENT attachment = FPDFDoc_GetAttachment(document(), 0);
-  ASSERT_TRUE(attachment);
-
-  void* buffer = nullptr;
-  uint32_t size = 0;
-  EPDFAttachmentExtractStatus status = EPDFAttachmentExtractStatus_kSuccess;
-  EXPECT_FALSE(EPDFAttachment_ExtractFileToOwnedBuffer(
-      attachment, /*max_decoded_bytes=*/0, nullptr, &size, &status));
-  EXPECT_EQ(EPDFAttachmentExtractStatus_kWriteFailed, status);
-  EXPECT_FALSE(EPDFAttachment_ExtractFileToOwnedBuffer(
-      attachment, /*max_decoded_bytes=*/0, &buffer, nullptr, &status));
-  EXPECT_EQ(EPDFAttachmentExtractStatus_kWriteFailed, status);
-  EXPECT_FALSE(buffer);
-}
-
-TEST_F(FPDFAttachmentEmbedderTest, GetAttachmentKey) {
-  ASSERT_TRUE(OpenDocument("embedded_attachments.pdf"));
-  ASSERT_EQ(2, FPDFDoc_GetAttachmentCount(document()));
-
-  // This fixture's tree keys equal the /UF names (as do all
-  // FPDFDoc_AddAttachment-created entries).
-  unsigned long length_bytes =
-      EPDFDoc_GetAttachmentKey(document(), 0, nullptr, 0);
-  ASSERT_EQ(12u, length_bytes);
-  std::vector<FPDF_WCHAR> buf = GetFPDFWideStringBuffer(length_bytes);
-  EXPECT_EQ(12u,
-            EPDFDoc_GetAttachmentKey(document(), 0, buf.data(), length_bytes));
-  EXPECT_EQ(L"1.txt", GetPlatformWString(buf.data()));
-
-  length_bytes = EPDFDoc_GetAttachmentKey(document(), 1, nullptr, 0);
-  ASSERT_EQ(26u, length_bytes);
-  buf = GetFPDFWideStringBuffer(length_bytes);
-  EXPECT_EQ(26u,
-            EPDFDoc_GetAttachmentKey(document(), 1, buf.data(), length_bytes));
-  EXPECT_EQ(L"attached.pdf", GetPlatformWString(buf.data()));
-
-  // Bad indices / bad document.
-  EXPECT_EQ(0u, EPDFDoc_GetAttachmentKey(document(), -1, nullptr, 0));
-  EXPECT_EQ(0u, EPDFDoc_GetAttachmentKey(document(), 2, nullptr, 0));
-  EXPECT_EQ(0u, EPDFDoc_GetAttachmentKey(nullptr, 0, nullptr, 0));
-}
-
-TEST_F(FPDFAttachmentEmbedderTest, GetAttachmentIndexByKey) {
-  ASSERT_TRUE(OpenDocument("embedded_attachments.pdf"));
-
-  ScopedFPDFWideString key1 = GetFPDFWideString(L"1.txt");
-  ScopedFPDFWideString key2 = GetFPDFWideString(L"attached.pdf");
-  ScopedFPDFWideString missing = GetFPDFWideString(L"nope.bin");
-  EXPECT_EQ(0, EPDFDoc_GetAttachmentIndexByKey(document(), key1.get()));
-  EXPECT_EQ(1, EPDFDoc_GetAttachmentIndexByKey(document(), key2.get()));
-  EXPECT_EQ(-1, EPDFDoc_GetAttachmentIndexByKey(document(), missing.get()));
-  EXPECT_EQ(-1, EPDFDoc_GetAttachmentIndexByKey(nullptr, key1.get()));
-  EXPECT_EQ(-1, EPDFDoc_GetAttachmentIndexByKey(document(), nullptr));
-
-  // The name tree is sorted, so adding "0.txt" shifts every index. Keys
-  // keep resolving to the CURRENT position.
-  ScopedFPDFWideString key0 = GetFPDFWideString(L"0.txt");
-  FPDF_ATTACHMENT attachment =
-      FPDFDoc_AddAttachment(document(), key0.get());
-  ASSERT_TRUE(attachment);
-  EXPECT_EQ(0, EPDFDoc_GetAttachmentIndexByKey(document(), key0.get()));
-  EXPECT_EQ(1, EPDFDoc_GetAttachmentIndexByKey(document(), key1.get()));
-  EXPECT_EQ(2, EPDFDoc_GetAttachmentIndexByKey(document(), key2.get()));
-
-  // Deleting shifts them back; the deleted key stops resolving.
-  EXPECT_TRUE(FPDFDoc_DeleteAttachment(document(), 0));
-  EXPECT_EQ(-1, EPDFDoc_GetAttachmentIndexByKey(document(), key0.get()));
-  EXPECT_EQ(0, EPDFDoc_GetAttachmentIndexByKey(document(), key1.get()));
-  EXPECT_EQ(1, EPDFDoc_GetAttachmentIndexByKey(document(), key2.get()));
-}
-
-TEST_F(FPDFAttachmentEmbedderTest, SetNameKeepsTheRestOfTheFileSpec) {
-  ASSERT_TRUE(OpenDocument("embedded_attachments.pdf"));
-  FPDF_ATTACHMENT attachment = FPDFDoc_GetAttachment(document(), 0);
-  ASSERT_TRUE(attachment);
-
-  ScopedFPDFWideString desc = GetFPDFWideString(L"Kept description");
-  ASSERT_TRUE(EPDFAttachment_SetDescription(attachment, desc.get()));
-
-  ScopedFPDFWideString empty = GetFPDFWideString(L"");
-  EXPECT_FALSE(EPDFAttachment_SetName(attachment, empty.get()));
-  EXPECT_FALSE(EPDFAttachment_SetName(nullptr, empty.get()));
-
-  ScopedFPDFWideString name = GetFPDFWideString(L"r\u00e9sum\u00e9.txt");
-  ASSERT_TRUE(EPDFAttachment_SetName(attachment, name.get()));
-
-  unsigned long length_bytes = FPDFAttachment_GetName(attachment, nullptr, 0);
-  std::vector<FPDF_WCHAR> buf = GetFPDFWideStringBuffer(length_bytes);
-  ASSERT_EQ(length_bytes,
-            FPDFAttachment_GetName(attachment, buf.data(), length_bytes));
-  EXPECT_EQ(L"r\u00e9sum\u00e9.txt", GetPlatformWString(buf.data()));
-
-  // The file's bytes and description are untouched.
-  unsigned long out_len = 0;
-  ASSERT_TRUE(FPDFAttachment_GetFile(attachment, nullptr, 0, &out_len));
-  EXPECT_EQ(4u, out_len);
-  length_bytes = EPDFAttachment_GetDescription(attachment, nullptr, 0);
-  buf = GetFPDFWideStringBuffer(length_bytes);
-  ASSERT_EQ(length_bytes,
-            EPDFAttachment_GetDescription(attachment, buf.data(), length_bytes));
-  EXPECT_EQ(L"Kept description", GetPlatformWString(buf.data()));
-
-  // The name survives a save and reload.
-  ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, 0));
-  ASSERT_TRUE(OpenSavedDocument());
-  FPDF_ATTACHMENT saved = FPDFDoc_GetAttachment(saved_document(), 0);
-  ASSERT_TRUE(saved);
-  length_bytes = FPDFAttachment_GetName(saved, nullptr, 0);
-  buf = GetFPDFWideStringBuffer(length_bytes);
-  ASSERT_EQ(length_bytes, FPDFAttachment_GetName(saved, buf.data(), length_bytes));
-  EXPECT_EQ(L"r\u00e9sum\u00e9.txt", GetPlatformWString(buf.data()));
-  CloseSavedDocument();
+  EXPECT_EQ(kTestLength,
+            FPDFAttachment_GetDescription(attachment, buf.data(), buf.size()));
+  EXPECT_EQ(kTestValue, GetPlatformWString(buf.data()));
 }

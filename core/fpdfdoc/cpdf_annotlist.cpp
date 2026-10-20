@@ -12,6 +12,7 @@
 
 #include "constants/annotation_common.h"
 #include "constants/annotation_flags.h"
+#include "constants/catalog.h"
 #include "constants/form_fields.h"
 #include "core/fpdfapi/page/cpdf_occontext.h"
 #include "core/fpdfapi/page/cpdf_page.h"
@@ -122,17 +123,24 @@ std::unique_ptr<CPDF_Annot> CreatePopupAnnot(CPDF_Document* document,
   return pPopupAnnot;
 }
 
+// EmbedPDF(reads-dont-write): GenerateAP() was removed: listing a page's
+// annotations no longer writes widget appearances or /AS for
+// /NeedAppearances.
 }  // namespace
 
 CPDF_AnnotList::CPDF_AnnotList(CPDF_Page* pPage)
     : page_(pPage), document_(page_->GetDocument()) {
+  // EmbedPDF(view-scope): listing a page's annotations is a read entry point.
   CPDF_DocumentViewScope document_view(document_);
 
+  // EmbedPDF(reads-dont-write): read without the mutable getter.
   RetainPtr<const CPDF_Array> pAnnots = page_->GetAnnotsArray();
   if (!pAnnots) {
     return;
   }
 
+  // EmbedPDF(reads-dont-write): read without the mutable getter. Upstream read
+  // /NeedAppearances here to regenerate widget appearances while listing.
   for (size_t i = 0; i < pAnnots->size(); ++i) {
     RetainPtr<const CPDF_Dictionary> const_dict = pAnnots->GetDictAt(i);
     if (!const_dict) {
@@ -145,6 +153,9 @@ CPDF_AnnotList::CPDF_AnnotList(CPDF_Page* pPage)
       // provides its own Popup annotations.
       continue;
     }
+    // EmbedPDF(reads-dont-write, annot-identity): listing writes nothing. A
+    // direct annotation stays direct (upstream made it indirect here), and a
+    // widget without an appearance gets none generated (/NeedAppearances).
     // CPDF_Annot still owns a mutable dictionary handle because explicit edit
     // APIs mutate annotation dictionaries. Listing/rendering must not promote
     // direct annotations to indirect objects.
@@ -185,6 +196,7 @@ void CPDF_AnnotList::DisplayPass(CPDF_RenderContext* context,
                                  bool bPrinting,
                                  const CFX_Matrix& mtMatrix,
                                  bool bWidgetPass) {
+  // EmbedPDF(view-scope): drawing a page's annotations is a read entry point.
   CPDF_DocumentViewScope document_view(document_);
 
   CHECK(context);
@@ -196,6 +208,12 @@ void CPDF_AnnotList::DisplayPass(CPDF_RenderContext* context,
 
     uint32_t annot_flags = pAnnot->GetFlags();
     if (annot_flags & pdfium::annotation_flags::kHidden) {
+      continue;
+    }
+
+    // EmbedPDF(bug-fix): an unknown type with the Invisible flag isn't drawn;
+    // upstream drew it.
+    if (CPDF_Annot::IsHiddenByInvisibleFlag(pAnnot->GetAnnotDict())) {
       continue;
     }
 
@@ -212,12 +230,16 @@ void CPDF_AnnotList::DisplayPass(CPDF_RenderContext* context,
   }
 }
 
+// EmbedPDF(annot-appearance): annotations and widgets draw independently.
 void CPDF_AnnotList::DisplayAnnots(CPDF_RenderContext* context,
                                    bool bPrinting,
                                    const CFX_Matrix& mtUser2Device,
+                                   bool bShowAnnots,
                                    bool bShowWidget) {
   CHECK(context);
-  DisplayPass(context, bPrinting, mtUser2Device, false);
+  if (bShowAnnots) {
+    DisplayPass(context, bPrinting, mtUser2Device, false);
+  }
   if (bShowWidget) {
     DisplayPass(context, bPrinting, mtUser2Device, true);
   }

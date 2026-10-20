@@ -107,6 +107,9 @@ std::unique_ptr<CPDFSDK_Annot> CPDFSDK_PageView::NewAnnot(CPDF_Annot* annot) {
 
     auto ret = std::make_unique<CPDFSDK_Widget>(annot, this, form);
     form->AddMap(form_control, ret.get());
+    // EmbedPDF(reads-dont-write): opening a page view no longer writes missing
+    // widget appearances (upstream's NeedConstructAP reset); they are drawn
+    // from memory.
     return ret;
   }
 
@@ -567,8 +570,7 @@ bool CPDFSDK_PageView::OnKeyDown(FWL_VKEYCODE key_code,
 }
 
 void CPDFSDK_PageView::LoadFXAnnots() {
-  AutoRestorer<bool> lock(&locked_);
-  locked_ = true;
+  AutoRestorer<bool> lock(&locked_, true);
 
 #ifdef PDF_ENABLE_XFA
   RetainPtr<CPDFXFA_Page> protector(ToXFAPage(page_));

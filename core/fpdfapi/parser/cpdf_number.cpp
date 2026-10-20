@@ -8,10 +8,11 @@
 
 #include <sstream>
 
-#include "core/fpdfapi/edit/cpdf_contentstream_write_utils.h"
+#include "core/fpdfapi/parser/cpdf_write_generation.h"
 #include "core/fxcrt/check.h"
 #include "core/fxcrt/fx_stream.h"
 #include "core/fxcrt/fx_string_wrappers.h"
+#include "core/fxcrt/stream_write_utils.h"
 
 namespace {
 
@@ -56,7 +57,8 @@ CPDF_Number* CPDF_Number::AsMutableNumber() {
 }
 
 void CPDF_Number::SetString(const ByteString& str) {
-  DCHECK(!IsFrozen());
+  // EmbedPDF(write-generation): a write past the layer's door is a bug.
+  DCHECK_PDF_WRITABLE(this);
   number_ = FX_Number(str.AsStringView());
 }
 
@@ -65,6 +67,7 @@ ByteString CPDF_Number::GetString() const {
                              : FloatToString(GetNumber());
 }
 
+// EmbedPDF(save-generations): writers carry the write context.
 bool CPDF_Number::WriteTo(IFX_ArchiveStream* archive,
                           const CPDF_Encryptor* encryptor,
                           const CPDF_WriteContext* context) const {

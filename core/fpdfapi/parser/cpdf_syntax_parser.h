@@ -14,12 +14,12 @@
 #include <vector>
 
 #include "core/fpdfapi/parser/cpdf_stream.h"
+#include "core/fxcrt/bytestring_pool.h"
 #include "core/fxcrt/data_vector.h"
 #include "core/fxcrt/epdf_tls.h"
 #include "core/fxcrt/fx_types.h"
 #include "core/fxcrt/retain_ptr.h"
 #include "core/fxcrt/span.h"
-#include "core/fxcrt/string_pool_template.h"
 #include "core/fxcrt/unowned_ptr.h"
 #include "core/fxcrt/weak_ptr.h"
 
@@ -39,13 +39,11 @@ class CPDF_SyntaxParser {
     bool is_number;
   };
 
-  static std::unique_ptr<CPDF_SyntaxParser> CreateForTesting(
-      RetainPtr<IFX_SeekableReadStream> pFileAccess,
-      FX_FILESIZE HeaderOffset);
+  static constexpr uint32_t kParserMaxRecursionDepth = 64;
 
-  explicit CPDF_SyntaxParser(RetainPtr<IFX_SeekableReadStream> pFileAccess);
-  CPDF_SyntaxParser(RetainPtr<CPDF_ReadValidator> pValidator,
-                    FX_FILESIZE HeaderOffset);
+  explicit CPDF_SyntaxParser(RetainPtr<IFX_SeekableReadStream> file_access);
+  CPDF_SyntaxParser(RetainPtr<CPDF_ReadValidator> validator,
+                    FX_FILESIZE header_offset);
   ~CPDF_SyntaxParser();
 
   void SetReadBufferSize(uint32_t read_buffer_size) {
@@ -71,6 +69,8 @@ class CPDF_SyntaxParser {
   ByteString PeekNextWord();
 
   RetainPtr<CPDF_ReadValidator> GetValidator() const;
+  // EmbedPDF(layer-open): a layer reads the base file's bytes before its
+  // delta.
   RetainPtr<IFX_SeekableReadStream> GetFileAccess() const;
   uint32_t GetDirectNum();
   bool GetNextChar(uint8_t& ch);
@@ -96,8 +96,8 @@ class CPDF_SyntaxParser {
   friend class CPDF_DataAvail;
   friend class cpdf_syntax_parser_ReadHexString_Test;
 
-  static constexpr int kParserMaxRecursionDepth = 64;
-  static EPDF_TLS int s_CurrentRecursionDepth;
+  // EmbedPDF(thread-confined-globals): each thread parses with its own depth.
+  static EPDF_TLS uint32_t s_CurrentRecursionDepth;
 
   bool ReadBlockAt(FX_FILESIZE read_pos);
   bool GetCharAtBackward(FX_FILESIZE pos, uint8_t* ch);

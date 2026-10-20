@@ -26,6 +26,8 @@
 #include "core/fpdfapi/parser/cpdf_string.h"
 #include "core/fxcrt/check.h"
 #include "core/fxcrt/check_op.h"
+#include "core/fxcrt/fx_random.h"
+#include "core/fxcrt/span_util.h"
 #include "core/fxcrt/stl_util.h"
 
 namespace {
@@ -56,7 +58,8 @@ bool CPDF_CryptoHandler::IsSignatureDictionary(
   if (!type_obj) {
     return false;
   }
-  // EmbedPDF: a document timestamp's /Contents is a signature too.
+  // EmbedPDF(signatures): a document timestamp's /Contents is a signature
+  // too.
   const ByteString type = type_obj->GetString();
   return type == pdfium::form_fields::kSig || type == "DocTimeStamp";
 }
@@ -66,7 +69,7 @@ DataVector<uint8_t> CPDF_CryptoHandler::EncryptContent(
     uint32_t gennum,
     pdfium::span<const uint8_t> source) const {
   if (cipher_ == Cipher::kNone) {
-    return DataVector<uint8_t>(source.begin(), source.end());
+    return ToDataVector(source);
   }
   std::array<uint8_t, 16> realkey;
   size_t realkeylen = realkey.size();
@@ -78,7 +81,7 @@ DataVector<uint8_t> CPDF_CryptoHandler::EncryptContent(
                   pdfium::span(key1).subspan(key_len_ + 5));
     }
     size_t len = cipher_ == Cipher::kAES ? key_len_ + 9 : key_len_ + 5;
-    CRYPT_MD5Generate(pdfium::span(key1).first(len), realkey);
+    CryptMd5Generate(pdfium::span(key1).first(len), realkey);
     realkeylen = std::min(key_len_ + 5, realkeylen);
   }
   if (cipher_ == Cipher::kAES) {
@@ -100,9 +103,7 @@ DataVector<uint8_t> CPDF_CryptoHandler::EncryptContent(
     auto dest_data_span = dest_span.subspan(kIVSize, source_data_size);
     auto dest_padding_span = dest_span.subspan(kIVSize + source_data_size);
 
-    for (auto& v : dest_iv_span) {
-      v = static_cast<uint8_t>(rand());
-    }
+    FX_Random::Fill(fxcrt::reinterpret_span<uint32_t>(dest_iv_span));
     CRYPT_AESSetIV(aes_context_.get(), dest_iv_span);
     CRYPT_AESEncrypt(aes_context_.get(), dest_data_span,
                      source.first(source_data_size));
@@ -115,7 +116,7 @@ DataVector<uint8_t> CPDF_CryptoHandler::EncryptContent(
     return dest;
   }
   DataVector<uint8_t> dest(source.begin(), source.end());
-  CRYPT_ArcFourCryptBlock(dest, pdfium::span(realkey).first(realkeylen));
+  CryptArcFourCryptBlock(dest, pdfium::span(realkey).first(realkeylen));
   return dest;
 }
 
@@ -138,7 +139,7 @@ void* CPDF_CryptoHandler::DecryptStart(uint32_t objnum, uint32_t gennum) {
                 pdfium::span(key1).subspan(key_len_ + 5));
 
     std::array<uint8_t, 16> realkey;
-    CRYPT_MD5Generate(pdfium::span(key1).first(key_len_ + 9), realkey);
+    CryptMd5Generate(pdfium::span(key1).first(key_len_ + 9), realkey);
     CRYPT_AESSetKey(&context->context_, realkey);
     return context;
   }
@@ -147,11 +148,11 @@ void* CPDF_CryptoHandler::DecryptStart(uint32_t objnum, uint32_t gennum) {
   PopulateKey(objnum, gennum, key1);
 
   std::array<uint8_t, 16> realkey;
-  CRYPT_MD5Generate(pdfium::span(key1).first(key_len_ + 5), realkey);
+  CryptMd5Generate(pdfium::span(key1).first(key_len_ + 5), realkey);
   size_t realkeylen = std::min(key_len_ + 5, realkey.size());
 
-  CRYPT_rc4_context* context = FX_Alloc(CRYPT_rc4_context, 1);
-  CRYPT_ArcFourSetup(context, pdfium::span(realkey).first(realkeylen));
+  CryptRc4Context* context = FX_Alloc(CryptRc4Context, 1);
+  CryptArcFourSetup(context, pdfium::span(realkey).first(realkeylen));
   return context;
 }
 
@@ -169,8 +170,8 @@ bool CPDF_CryptoHandler::DecryptStream(void* context,
   if (cipher_ == Cipher::kRC4) {
     size_t old_size = dest_buf.GetSize();
     dest_buf.AppendSpan(source);
-    CRYPT_ArcFourCrypt(
-        static_cast<CRYPT_rc4_context*>(context),
+    CryptArcFourCrypt(
+        static_cast<CryptRc4Context*>(context),
         dest_buf.GetMutableSpan().subspan(old_size, source.size()));
     return true;
   }

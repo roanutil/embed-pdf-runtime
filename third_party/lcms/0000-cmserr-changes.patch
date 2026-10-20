@@ -1,7 +1,16 @@
 diff --git a/third_party/lcms/src/cmserr.c b/third_party/lcms/src/cmserr.c
-index 700152ee3..3c3848b2a 100644
+index ac89811a9..902b7762a 100644
 --- a/third_party/lcms/src/cmserr.c
 +++ b/third_party/lcms/src/cmserr.c
+@@ -1,7 +1,7 @@
+ //---------------------------------------------------------------------------------
+ //
+ //  Little Color Management System
+-//  Copyright (c) 1998-2026 Marti Maria Saguer
++//  Copyright (c) 1998-2023 Marti Maria Saguer
+ //
+ // Permission is hereby granted, free of charge, to any person obtaining
+ // a copy of this software and associated documentation files (the "Software"),
 @@ -25,6 +25,8 @@
  
  #include "lcms2_internal.h"
@@ -11,19 +20,87 @@ index 700152ee3..3c3848b2a 100644
  
  // This function is here to help applications to prevent mixing lcms versions on header and shared objects.
  int CMSEXPORT cmsGetEncodedCMMversion(void)
-@@ -67,140 +67,75 @@ long int CMSEXPORT cmsfilelength(FILE* f)
+@@ -48,203 +50,94 @@ int CMSEXPORT cmsstrcasecmp(const char* s1, const char* s2)
+     return (toupper(*us1) - toupper(*--us2));
+ }
+ 
+-#ifdef CMS_LARGE_FILE_SUPPORT
+-
+-long long int CMSEXPORT cmsfilelength(FILE* f)
+-{
+-    long long int p, n;
+-
+-#ifdef CMS_IS_WINDOWS_
+-    p = _ftelli64(f);
+-    if (p == -1LL)
+-        return -1LL;
+-
+-    if (_fseeki64(f, 0, SEEK_END) != 0)
+-        return -1LL;
+-
+-    n = _ftelli64(f);
+-
+-    if (_fseeki64(f, p, SEEK_SET) != 0)
+-        return -1LL;
+-#else
+-    p = (long long int) ftello(f);
+-    if (p < 0)
+-        return -1LL;
+-
+-    if (fseeko(f, 0, SEEK_END) != 0)
+-        return -1LL;
+-
+-    n = (long long int) ftello(f);
+-
+-    if (fseeko(f, (off_t) p, SEEK_SET) != 0)
+-        return -1LL;
+-#endif
+-
+-    return n;
+-}
+-
+-#else
+-
+ // long int because C99 specifies ftell in such way (7.19.9.2)
+ long int CMSEXPORT cmsfilelength(FILE* f)
+ {
+-    long int p, n;
++    long int p , n;
+ 
+-    p = ftell(f);
+-    if (p == -1L)
++    p = ftell(f); // register current file position
++    if (p == -1L) 
+         return -1L;
+ 
+-    if (fseek(f, 0, SEEK_END) != 0)
++    if (fseek(f, 0, SEEK_END) != 0) {
+         return -1L;
++    }
+ 
+     n = ftell(f);
+-
+-    if (fseek(f, p, SEEK_SET) != 0)
+-        return -1L;
++    fseek(f, p, SEEK_SET); // file position restored
+ 
      return n;
  }
  
+-#endif
 -
 -// Memory handling ------------------------------------------------------------------
 -//
 -// This is the interface to low-level memory management routines. By default a simple
 -// wrapping to malloc/free/realloc is provided, although there is a limit on the max
--// amount of memoy that can be reclaimed. This is mostly as a safety feature to prevent 
+-// amount of memory that can be reclaimed. This is mostly as a safety feature to prevent 
 -// bogus or evil code to allocate huge blocks that otherwise lcms would never need.
 -
--#define MAX_MEMORY_FOR_ALLOC  ((cmsUInt32Number)(1024U*1024U*512U))
+-#ifdef CMS_LARGE_FILE_SUPPORT
+-#   define MAX_MEMORY_FOR_ALLOC  ((cmsUInt32Number)(1024U*1024U*2048U))
+-#else
+-#   define MAX_MEMORY_FOR_ALLOC  ((cmsUInt32Number)(1024U*1024U*512U))
+-#endif
 -
 -// User may override this behaviour by using a memory plug-in, which basically replaces
 -// the default memory management functions. In this case, no check is performed and it
@@ -41,7 +118,8 @@ index 700152ee3..3c3848b2a 100644
 -void* _cmsMallocDefaultFn(cmsContext ContextID, cmsUInt32Number size)
 +cmsBool  _cmsRegisterMemHandlerPlugin(cmsContext ContextID, cmsPluginBase* Plugin)
  {
--    if (size > MAX_MEMORY_FOR_ALLOC) return NULL;  // Never allow over maximum
+-    // Never allow 0 or over maximum
+-    if (size == 0 || size > MAX_MEMORY_FOR_ALLOC) return NULL;
 -
 -    return (void*) malloc(size);
 +    return TRUE;
@@ -184,7 +262,7 @@ index 700152ee3..3c3848b2a 100644
  void _cmsInstallAllocFunctions(cmsPluginMemHandler* Plugin, _cmsMemPluginChunkType* ptr)
  {
      if (Plugin == NULL) {
-@@ -214,94 +149,15 @@ void _cmsInstallAllocFunctions(cmsPluginMemHandler* Plugin, _cmsMemPluginChunkTy
+@@ -258,96 +151,17 @@ void _cmsInstallAllocFunctions(cmsPluginMemHandler* Plugin, _cmsMemPluginChunkTy
          ptr ->ReallocPtr = Plugin -> ReallocPtr;
  
          // Make sure we revert to defaults
@@ -203,7 +281,7 @@ index 700152ee3..3c3848b2a 100644
 -    }
 -}
 -
- 
+-
 -// Plug-in replacement entry
 -cmsBool  _cmsRegisterMemHandlerPlugin(cmsContext ContextID, cmsPluginBase *Data)
 -{
@@ -212,7 +290,7 @@ index 700152ee3..3c3848b2a 100644
 -
 -    // NULL forces to reset to defaults. In this special case, the defaults are stored in the context structure. 
 -    // Remaining plug-ins does NOT have any copy in the context structure, but this is somehow special as the
--    // context internal data should be malloce'd by using those functions. 
+-    // context internal data should be malloc'ed by using those functions. 
 -    if (Data == NULL) {
 -
 -       struct _cmsContext_struct* ctx = ( struct _cmsContext_struct*) ContextID;
@@ -222,7 +300,7 @@ index 700152ee3..3c3848b2a 100644
 -            ctx->chunks[MemPlugin] = (void*) &ctx->DefaultMemoryManager;
 -        }
 -        return TRUE;
-     }
+-    }
 -
 -    // Check for required callbacks
 -    if (Plugin -> MallocPtr == NULL ||
@@ -237,7 +315,7 @@ index 700152ee3..3c3848b2a 100644
 -    _cmsInstallAllocFunctions(Plugin, ptr);
 -    return TRUE;
 -}
--
+ 
 -// Generic allocate
 -void* CMSEXPORT _cmsMalloc(cmsContext ContextID, cmsUInt32Number size)
 -{
@@ -272,14 +350,16 @@ index 700152ee3..3c3848b2a 100644
 -    if (Ptr != NULL) {
 -        _cmsMemPluginChunkType* ptr = (_cmsMemPluginChunkType*) _cmsContextGetClientChunk(ContextID, MemPlugin);
 -        ptr ->FreePtr(ContextID, Ptr);
--    }
--}
--
+     }
+ }
+ 
 -// Generic block duplication
 -void* CMSEXPORT _cmsDupMem(cmsContext ContextID, const void* Org, cmsUInt32Number size)
 -{
 -    _cmsMemPluginChunkType* ptr = (_cmsMemPluginChunkType*) _cmsContextGetClientChunk(ContextID, MemPlugin);
 -    return ptr ->DupPtr(ContextID, Org, size);
- }
- 
+-}
+-
  // ********************************************************************************************
+ 
+ // Sub allocation takes care of many pointers of small size. The memory allocated in

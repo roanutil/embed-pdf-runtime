@@ -17,6 +17,7 @@
 #include "core/fpdfapi/parser/cpdf_reference.h"
 #include "core/fpdfapi/parser/cpdf_stream.h"
 #include "core/fpdfapi/parser/cpdf_string.h"
+#include "core/fpdfapi/parser/cpdf_write_generation.h"
 #include "core/fxcrt/check.h"
 #include "core/fxcrt/containers/contains.h"
 #include "core/fxcrt/fx_stream.h"
@@ -47,6 +48,7 @@ RetainPtr<CPDF_Object> CPDF_Array::Clone() const {
   return CloneObjectNonCyclic(false);
 }
 
+// EmbedPDF(layer-door): the copy a layer makes when it promotes a base object.
 RetainPtr<CPDF_Object> CPDF_Array::CloneForHolder(
     CPDF_IndirectObjectHolder* holder) const {
   std::set<const CPDF_Object*> visited;
@@ -69,6 +71,7 @@ RetainPtr<CPDF_Object> CPDF_Array::CloneNonCyclic(
   return pCopy;
 }
 
+// EmbedPDF(layer-door): references in the copy resolve through `holder`.
 RetainPtr<CPDF_Object> CPDF_Array::CloneForHolderNonCyclic(
     CPDF_IndirectObjectHolder* holder,
     std::set<const CPDF_Object*>* pVisited) const {
@@ -85,9 +88,17 @@ RetainPtr<CPDF_Object> CPDF_Array::CloneForHolderNonCyclic(
   return pCopy;
 }
 
+// EmbedPDF(write-generation): freezing or stamping an array reaches its
+// children.
 void CPDF_Array::FreezeChildren(std::set<const CPDF_Object*>* visited) {
   for (const auto& object : objects_) {
     object->FreezeForHolder(visited);
+  }
+}
+
+void CPDF_Array::StampWriteGenerationOfChildren(uint32_t generation) {
+  for (const auto& object : objects_) {
+    object->StampWriteGeneration(generation);
   }
 }
 
@@ -131,6 +142,9 @@ CPDF_Object* CPDF_Array::GetMutableObjectAtInternal(size_t index) {
 }
 
 const CPDF_Object* CPDF_Array::GetObjectAtInternal(size_t index) const {
+  // EmbedPDF(reads-dont-write): const reads never call a mutable getter: on a
+  // layer, those resolve references through the copy-up door. Upstream
+  // casts these reads to the mutable getters.
   return index < objects_.size() ? objects_[index].Get() : nullptr;
 }
 
@@ -143,6 +157,7 @@ RetainPtr<const CPDF_Object> CPDF_Array::GetObjectAt(size_t index) const {
 }
 
 RetainPtr<const CPDF_Object> CPDF_Array::GetDirectObjectAt(size_t index) const {
+  // EmbedPDF(reads-dont-write): read without the mutable getter.
   RetainPtr<const CPDF_Object> pObj = GetObjectAt(index);
   return pObj ? pObj->GetDirect() : nullptr;
 }
@@ -205,6 +220,7 @@ RetainPtr<CPDF_Dictionary> CPDF_Array::GetMutableDictAt(size_t index) {
 }
 
 RetainPtr<const CPDF_Dictionary> CPDF_Array::GetDictAt(size_t index) const {
+  // EmbedPDF(reads-dont-write): read without the mutable getter.
   RetainPtr<const CPDF_Object> p = GetDirectObjectAt(index);
   if (!p) {
     return nullptr;
@@ -221,6 +237,7 @@ RetainPtr<CPDF_Stream> CPDF_Array::GetMutableStreamAt(size_t index) {
 }
 
 RetainPtr<const CPDF_Stream> CPDF_Array::GetStreamAt(size_t index) const {
+  // EmbedPDF(reads-dont-write): read without the mutable getter.
   return ToStream(GetDirectObjectAt(index));
 }
 
@@ -229,6 +246,7 @@ RetainPtr<CPDF_Array> CPDF_Array::GetMutableArrayAt(size_t index) {
 }
 
 RetainPtr<const CPDF_Array> CPDF_Array::GetArrayAt(size_t index) const {
+  // EmbedPDF(reads-dont-write): read without the mutable getter.
   return ToArray(GetDirectObjectAt(index));
 }
 
@@ -242,7 +260,9 @@ RetainPtr<const CPDF_String> CPDF_Array::GetStringAt(size_t index) const {
 
 void CPDF_Array::Clear() {
   CHECK(!IsLocked());
-  DCHECK(!IsFrozen());
+  // EmbedPDF(write-generation, reads-dont-write): a write past the layer's
+  // door, or one during a read-only walk, is a bug.
+  DCHECK_PDF_WRITABLE(this);
   DCHECK_PDF_GRAPH_MUTABLE_FOR(this);
   objects_.clear();
 }
@@ -250,7 +270,9 @@ void CPDF_Array::Clear() {
 void CPDF_Array::RemoveAt(size_t index) {
   CHECK(!IsLocked());
   if (index < objects_.size()) {
-    DCHECK(!IsFrozen());
+    // EmbedPDF(write-generation, reads-dont-write): a write past the layer's
+    // door, or one during a read-only walk, is a bug.
+    DCHECK_PDF_WRITABLE(this);
     DCHECK_PDF_GRAPH_MUTABLE_FOR(this);
     objects_.erase(objects_.begin() + index);
   }
@@ -267,8 +289,10 @@ void CPDF_Array::ConvertToIndirectObjectAt(size_t index,
     return;
   }
 
+  // EmbedPDF(write-generation, reads-dont-write): a write past the layer's
+  // door, or one during a read-only walk, is a bug.
   DCHECK_PDF_GRAPH_MUTABLE_FOR(this);
-  DCHECK(!IsFrozen());
+  DCHECK_PDF_WRITABLE(this);
   pHolder->AddIndirectObject(objects_[index]);
   objects_[index] = objects_[index]->MakeReference(pHolder);
 }
@@ -295,8 +319,12 @@ CPDF_Object* CPDF_Array::SetAtInternal(size_t index,
     return nullptr;
   }
 
+  // EmbedPDF(write-generation, reads-dont-write): a write past the layer's
+  // door, or one during a read-only walk, is a bug. A detached child joins
+  // this array's write generation.
   DCHECK_PDF_GRAPH_MUTABLE_FOR(this);
-  DCHECK(!IsFrozen());
+  DCHECK_PDF_WRITABLE(this);
+  pObj->StampWriteGeneration(write_generation());
   CPDF_Object* pRet = pObj.Get();
   objects_[index] = std::move(pObj);
   return pRet;
@@ -312,8 +340,12 @@ CPDF_Object* CPDF_Array::InsertAtInternal(size_t index,
     return nullptr;
   }
 
+  // EmbedPDF(write-generation, reads-dont-write): a write past the layer's
+  // door, or one during a read-only walk, is a bug. A detached child joins
+  // this array's write generation.
   DCHECK_PDF_GRAPH_MUTABLE_FOR(this);
-  DCHECK(!IsFrozen());
+  DCHECK_PDF_WRITABLE(this);
+  pObj->StampWriteGeneration(write_generation());
   CPDF_Object* pRet = pObj.Get();
   objects_.insert(objects_.begin() + index, std::move(pObj));
   return pRet;
@@ -324,13 +356,18 @@ CPDF_Object* CPDF_Array::AppendInternal(RetainPtr<CPDF_Object> pObj) {
   CHECK(pObj);
   CHECK(pObj->IsInline());
   CHECK(!pObj->IsStream());
+  // EmbedPDF(write-generation, reads-dont-write): a write past the layer's
+  // door, or one during a read-only walk, is a bug. A detached child joins
+  // this array's write generation.
   DCHECK_PDF_GRAPH_MUTABLE_FOR(this);
-  DCHECK(!IsFrozen());
+  DCHECK_PDF_WRITABLE(this);
+  pObj->StampWriteGeneration(write_generation());
   CPDF_Object* pRet = pObj.Get();
   objects_.push_back(std::move(pObj));
   return pRet;
 }
 
+// EmbedPDF(save-generations): writers carry the write context.
 bool CPDF_Array::WriteTo(IFX_ArchiveStream* archive,
                          const CPDF_Encryptor* encryptor,
                          const CPDF_WriteContext* context) const {

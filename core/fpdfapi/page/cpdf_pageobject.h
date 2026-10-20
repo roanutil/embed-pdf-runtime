@@ -44,21 +44,35 @@ class CPDF_PageObject {
 
   virtual Type GetType() const = 0;
   virtual void Transform(const CFX_Matrix& matrix) = 0;
-  virtual bool IsText() const;
-  virtual bool IsPath() const;
-  virtual bool IsImage() const;
-  virtual bool IsShading() const;
-  virtual bool IsForm() const;
   virtual CPDF_TextObject* AsText();
-  virtual const CPDF_TextObject* AsText() const;
   virtual CPDF_PathObject* AsPath();
-  virtual const CPDF_PathObject* AsPath() const;
   virtual CPDF_ImageObject* AsImage();
-  virtual const CPDF_ImageObject* AsImage() const;
   virtual CPDF_ShadingObject* AsShading();
-  virtual const CPDF_ShadingObject* AsShading() const;
   virtual CPDF_FormObject* AsForm();
-  virtual const CPDF_FormObject* AsForm() const;
+
+  // Const methods wrap non-const virtual As*() methods.
+  const CPDF_TextObject* AsText() const {
+    return const_cast<CPDF_PageObject*>(this)->AsText();
+  }
+  const CPDF_PathObject* AsPath() const {
+    return const_cast<CPDF_PageObject*>(this)->AsPath();
+  }
+  const CPDF_ImageObject* AsImage() const {
+    return const_cast<CPDF_PageObject*>(this)->AsImage();
+  }
+  const CPDF_ShadingObject* AsShading() const {
+    return const_cast<CPDF_PageObject*>(this)->AsShading();
+  }
+  const CPDF_FormObject* AsForm() const {
+    return const_cast<CPDF_PageObject*>(this)->AsForm();
+  }
+
+  // Type-testing methods merely wrap As*() methods.
+  bool IsText() const { return !!AsText(); }
+  bool IsPath() const { return !!AsPath(); }
+  bool IsImage() const { return !!AsImage(); }
+  bool IsShading() const { return !!AsShading(); }
+  bool IsForm() const { return !!AsForm(); }
 
   void SetDirty(bool value) { dirty_ = value; }
   bool IsDirty() const { return dirty_ || matrix_dirty_; }
@@ -67,10 +81,23 @@ class CPDF_PageObject {
   bool IsActive() const { return is_active_; }
   void TransformClipPath(const CFX_Matrix& matrix);
 
-  void SetOriginalRect(const CFX_FloatRect& rect) { original_rect_ = rect; }
-  const CFX_FloatRect& GetOriginalRect() const { return original_rect_; }
-  void SetRect(const CFX_FloatRect& rect) { rect_ = rect; }
+  // EmbedPDF(lean-page-objects): SetOriginalRect() and GetOriginalRect()
+  // moved to the text and image objects.
+  // EmbedPDF(render-speedup): a held object's new rect makes its holder's
+  // object groups stale.
+  void SetRect(const CFX_FloatRect& rect) {
+    rect_ = rect;
+    if (held_) {
+      NoteHeldBoundsChanged();
+    }
+  }
   const CFX_FloatRect& GetRect() const { return rect_; }
+
+  // EmbedPDF(render-speedup): counts, process-wide, the changes to GetRect()
+  // of objects that a holder lists. A holder's object groups are current
+  // while it is unchanged.
+  static uint64_t HeldBoundsGeneration();
+
   FX_RECT GetBBox() const;
   FX_RECT GetTransformedBBox(const CFX_Matrix& matrix) const;
 
@@ -136,29 +163,33 @@ class CPDF_PageObject {
 
   void SetDefaultStates();
 
-  const CFX_Matrix& original_matrix() const { return original_matrix_; }
-
+  // EmbedPDF(lean-page-objects): original_matrix() and
+  // InitializeOriginalMatrix() moved to CPDF_ImageObject.
  protected:
   void CopyData(const CPDF_PageObject* pSrcObject);
-  void InitializeOriginalMatrix(const CFX_Matrix& matrix);
 
  private:
+  // EmbedPDF(render-speedup): only a holder lists and unlists objects.
+  friend class CPDF_PageObjectHolder;
+
+  static void NoteHeldBoundsChanged();
+
   CPDF_GraphicStates graphic_states_;
   CFX_FloatRect rect_;
-  CFX_FloatRect original_rect_;
-  // Only used with `CPDF_ImageObject` for now.
-  // TODO(thestig): Use with `CPDF_FormObject` and `CPDF_PageObject` as well.
-  CFX_Matrix original_matrix_;
+  // EmbedPDF(lean-page-objects): original_rect_ and original_matrix_ moved to
+  // CPDF_TextObject and CPDF_ImageObject, the only objects that use them.
   CPDF_ContentMarks content_marks_;
   // Modifying `is_active_` automatically set `dirty_` to be true, but
   // otherwise `dirty_` and `is_active_` are independent.  A
   // `CPDF_PageObject` can remain dirty until page object processing completes
   // and marks it no longer dirty.
   bool dirty_ = false;
-  // Separately track if the current matrix is different from
-  // `original_matrix_`.
+  // Separately track if the current matrix is different from the one the
+  // object was created with (`CPDF_ImageObject::original_matrix()`).
   bool matrix_dirty_ = false;
   bool is_active_ = true;
+  // EmbedPDF(render-speedup): whether a holder lists this object.
+  bool held_ = false;
   int32_t content_stream_;
   // The resource name for this object.
   ByteString resource_name_;

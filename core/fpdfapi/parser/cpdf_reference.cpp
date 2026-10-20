@@ -9,6 +9,7 @@
 #include "core/fpdfapi/parser/cpdf_dictionary.h"
 #include "core/fpdfapi/parser/cpdf_indirect_object_holder.h"
 #include "core/fpdfapi/parser/cpdf_write_context.h"
+#include "core/fpdfapi/parser/cpdf_write_generation.h"
 #include "core/fxcrt/check_op.h"
 #include "core/fxcrt/containers/contains.h"
 #include "core/fxcrt/fx_stream.h"
@@ -50,6 +51,8 @@ RetainPtr<CPDF_Object> CPDF_Reference::Clone() const {
   return CloneObjectNonCyclic(false);
 }
 
+// EmbedPDF(layer-door): a copy-up's references point at the layer, and a
+// mutable read of a reference goes through the layer's door.
 RetainPtr<CPDF_Object> CPDF_Reference::CloneForHolder(
     CPDF_IndirectObjectHolder* holder) const {
   return pdfium::MakeRetain<CPDF_Reference>(holder, ref_obj_num_);
@@ -73,6 +76,7 @@ RetainPtr<CPDF_Object> CPDF_Reference::CloneNonCyclic(
              : nullptr;
 }
 
+// EmbedPDF(layer-door): references in the copy resolve through `holder`.
 RetainPtr<CPDF_Object> CPDF_Reference::CloneForHolderNonCyclic(
     CPDF_IndirectObjectHolder* holder,
     std::set<const CPDF_Object*>* pVisited) const {
@@ -90,6 +94,8 @@ const CPDF_Object* CPDF_Reference::FastGetDirect() const {
 }
 
 void CPDF_Reference::SetRef(CPDF_IndirectObjectHolder* doc, uint32_t objnum) {
+  // EmbedPDF(write-generation): a write past the layer's door is a bug.
+  DCHECK_PDF_WRITABLE(this);
   obj_list_ = doc;
   ref_obj_num_ = objnum;
 }
@@ -99,6 +105,8 @@ const CPDF_Object* CPDF_Reference::GetDirectInternal() const {
                    : nullptr;
 }
 
+// EmbedPDF(save-generations): writers carry the write context, and a
+// reference writes its target's generation instead of 0.
 bool CPDF_Reference::WriteTo(IFX_ArchiveStream* archive,
                              const CPDF_Encryptor* encryptor,
                              const CPDF_WriteContext* context) const {

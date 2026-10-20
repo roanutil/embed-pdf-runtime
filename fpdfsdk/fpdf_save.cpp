@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "build/build_config.h"
+#include "constants/catalog.h"
 #include "core/fpdfapi/edit/cpdf_creator.h"
 #include "core/fpdfapi/parser/cpdf_array.h"
 #include "core/fpdfapi/parser/cpdf_dictionary.h"
@@ -31,6 +32,7 @@
 #include "core/fxcrt/stl_util.h"
 #include "fpdfsdk/cpdfsdk_filewriteadapter.h"
 #include "fpdfsdk/cpdfsdk_helpers.h"
+#include "public/epdf_save.h"
 #include "public/fpdf_edit.h"
 
 #ifdef PDF_ENABLE_XFA
@@ -73,7 +75,8 @@ bool SaveXFADocumentData(
     return false;
   }
 
-  RetainPtr<CPDF_Dictionary> acro_form = root->GetMutableDictFor("AcroForm");
+  RetainPtr<CPDF_Dictionary> acro_form =
+      root->GetMutableDictFor(pdfium::catalog::kAcroForm);
   if (!acro_form) {
     return false;
   }
@@ -177,6 +180,8 @@ bool SaveXFADocumentData(
 }
 #endif  // PDF_ENABLE_XFA
 
+// EmbedPDF(layer-save): upstream's DoDocSave() is now DoDocSaveImpl(), which
+// can skip a save that changed nothing and reports what it did.
 void SetSaveStatus(EPDFSaveStatus* out_status, EPDFSaveStatus status) {
   if (out_status) {
     *out_status = status;
@@ -211,9 +216,10 @@ bool DoDocSaveImpl(FPDF_DOCUMENT document,
   CPDF_Creator file_maker(
       doc, pdfium::MakeRetain<CPDFSDK_FileWriteAdapter>(file_write));
 
-  // Apply document-owned pending security state. It stays on the document so
-  // repeated saves use the same requested encryption/removal policy until the
-  // caller changes it or closes the document.
+  // EmbedPDF(save-security): apply document-owned pending security state. It
+  // stays on the document so repeated saves use the same requested
+  // encryption/removal policy until the caller changes it or closes the
+  // document.
   if (const CPDF_Document::PendingSecurity* pending =
           doc->GetPendingSecurity()) {
     if (pending->mode == CPDF_Document::PendingSecurityMode::kRemove) {
@@ -227,6 +233,7 @@ bool DoDocSaveImpl(FPDF_DOCUMENT document,
     }
   }
 
+  // EmbedPDF(layer-save): a layer save can skip writing when nothing changed.
   Mask<CPDF_Creator::CreateFlags> create_flags =
       Mask<CPDF_Creator::CreateFlags>::FromUnderlyingUnchecked(
           static_cast<uint32_t>(flags));
@@ -241,6 +248,7 @@ bool DoDocSaveImpl(FPDF_DOCUMENT document,
   }
 #endif  // PDF_ENABLE_XFA
 
+  // EmbedPDF(layer-save): say whether the save wrote anything.
   if (create_result) {
     SetSaveStatus(out_status, file_maker.IsUnchangedSinceLoad()
                                   ? EPDFSaveStatus_kUnchangedSinceLoad
@@ -249,6 +257,8 @@ bool DoDocSaveImpl(FPDF_DOCUMENT document,
   return create_result;
 }
 
+// EmbedPDF(layer-save): upstream's DoDocSave(), kept for the FPDF_Save*
+// functions: it always writes.
 bool DoDocSave(FPDF_DOCUMENT document,
                FPDF_FILEWRITE* file_write,
                FPDF_DWORD flags,
@@ -257,6 +267,8 @@ bool DoDocSave(FPDF_DOCUMENT document,
                        /*skip_if_unchanged=*/false, /*out_status=*/nullptr);
 }
 
+// EmbedPDF(epdf-api): the in-memory writer behind the
+// EPDF_SaveDocumentToOwnedBuffer* functions.
 struct MemoryFileWriter : public FPDF_FILEWRITE {
   MemoryFileWriter() {
     version = 1;
@@ -351,6 +363,7 @@ void* SaveToOwnedBuffer(FPDF_DOCUMENT document,
 
 }  // namespace
 
+// EmbedPDF(epdf-api): EPDF_FreeBuffer, for what the owned-buffer saves return.
 FPDF_EXPORT void FPDF_CALLCONV EPDF_FreeBuffer(void* buffer) {
   free(buffer);
 }
@@ -369,6 +382,7 @@ FPDF_SaveWithVersion(FPDF_DOCUMENT document,
   return DoDocSave(document, file_write, flags, fileVersion);
 }
 
+// EmbedPDF(epdf-api): EPDF_SaveDocumentToOwnedBuffer* and EPDF_SaveAsCopyEx.
 FPDF_EXPORT void* FPDF_CALLCONV
 EPDF_SaveDocumentToOwnedBuffer(FPDF_DOCUMENT document,
                                FPDF_DWORD flags,

@@ -26,12 +26,6 @@
 #include <windows.h>
 #endif
 
-#ifdef PDF_ENABLE_XFA
-// PDF_USE_XFA is set in confirmation that this version of PDFium can support
-// XFA forms as requested by the PDF_ENABLE_XFA setting.
-#define PDF_USE_XFA
-#endif  // PDF_ENABLE_XFA
-
 // PDF object types
 #define FPDF_OBJECT_UNKNOWN 0
 #define FPDF_OBJECT_BOOLEAN 1
@@ -67,8 +61,6 @@ typedef struct fpdf_bitmap_t__* FPDF_BITMAP;
 typedef struct fpdf_bookmark_t__* FPDF_BOOKMARK;
 typedef struct fpdf_clippath_t__* FPDF_CLIPPATH;
 typedef struct fpdf_dest_t__* FPDF_DEST;
-typedef struct fpdf_base_document_t__* EPDF_BASE_DOCUMENT;
-typedef struct epdf_checkpoint_t__* EPDF_CHECKPOINT;
 typedef struct fpdf_document_t__* FPDF_DOCUMENT;
 typedef struct fpdf_font_t__* FPDF_FONT;
 typedef struct fpdf_form_handle_t__* FPDF_FORMHANDLE;
@@ -205,6 +197,8 @@ typedef int FPDF_ANNOT_APPEARANCEMODE;
 // Dictionary value types.
 typedef int FPDF_OBJECT_TYPE;
 
+// EmbedPDF(runtime-exports): FPDF_EXPORT exports in every build, not only in
+// component builds, so the runtime's PDFium library exports its API.
 // FPDF_EXPORT should be consistent with |export| in the pdfium_fuzzer
 // template in testing/fuzzers/BUILD.gn.
 #if defined(WIN32)
@@ -220,6 +214,7 @@ typedef int FPDF_OBJECT_TYPE;
 #define FPDF_EXPORT
 #endif  // defined(FPDF_IMPLEMENTATION)
 #endif  // defined(WIN32)
+// EmbedPDF(runtime-exports): no empty FPDF_EXPORT outside component builds.
 
 #if defined(WIN32) && defined(FPDFSDK_EXPORTS)
 #define FPDF_CALLCONV __stdcall
@@ -240,6 +235,15 @@ typedef enum {
   // Skia - https://skia.org/
   FPDF_RENDERERTYPE_SKIA = 1,
 } FPDF_RENDERER_TYPE;
+
+// PDF font library types - Experimental.
+// Selection of font backend library to use.
+typedef enum {
+  // FreeType - https://freetype.org/
+  FPDF_FONTBACKENDTYPE_FREETYPE = 0,
+  // Fontations - https://github.com/googlefonts/fontations/
+  FPDF_FONTBACKENDTYPE_FONTATIONS = 1,
+} FPDF_FONT_BACKEND_TYPE;
 
 // Process-wide options for initializing the library.
 typedef struct FPDF_LIBRARY_CONFIG_ {
@@ -271,13 +275,38 @@ typedef struct FPDF_LIBRARY_CONFIG_ {
 
   // Version 4 - Experimental.
 
-  // Explicit specification of core renderer to use. |m_RendererType| must be
-  // a valid value for |FPDF_LIBRARY_CONFIG| versions of this level or higher,
-  // or else the initialization will fail with an immediate crash.
+  // Explicit specification of 2D graphics rendering library to use.
+  // |m_RendererType| must be a valid value for |FPDF_LIBRARY_CONFIG| versions
+  // of this level or higher, or else the initialization will fail with an
+  // immediate crash.
   // Note that use of a specified |FPDF_RENDERER_TYPE| value for which the
-  // corresponding render library is not included in the build will similarly
-  // fail with an immediate crash.
+  // corresponding 2D graphics rendering library is not included in the build
+  // will similarly fail with an immediate crash.
   FPDF_RENDERER_TYPE m_RendererType;
+
+  // Version 5 - Experimental.
+
+  // Explicit specification of font library to use.
+  // |m_FontLibraryType| must be a valid value for |FPDF_LIBRARY_CONFIG|
+  // versions of this level or higher, or else the initialization will fail with
+  // an immediate crash.
+  // Note that use of a specified |FPDF_FONT_BACKEND_TYPE| value for which the
+  // corresponding font library is not included in the build will similarly fail
+  // with an immediate crash.
+  FPDF_FONT_BACKEND_TYPE m_FontLibraryType;
+
+  // Version 6 - Experimental.
+
+  // Boolean to specify whether the experimental PDF 2.0 /BrotliDecode filter
+  // is enabled. For setting the bool to true to have an effect, PDFium must be
+  // built with |PDF_ENABLE_BROTLI|.
+  FPDF_BOOL m_BrotliEnabled;
+
+  // Version 7 - Experimental.
+
+  // Boolean to specify whether PDFium creates a dedicated v8::Isolate for each
+  // document. When true, |m_pIsolate| must be NULL.
+  FPDF_BOOL m_IsolatePerDocument;
 } FPDF_LIBRARY_CONFIG;
 
 // Function: FPDF_InitLibraryWithConfig
@@ -320,24 +349,6 @@ FPDF_EXPORT void FPDF_CALLCONV FPDF_InitLibrary();
 //          objects. It is recommended to close other objects before
 //          closing the library with this function.
 FPDF_EXPORT void FPDF_CALLCONV FPDF_DestroyLibrary();
-
-// Experimental EmbedPDF Extension API.
-// Function: EPDF_InitThread / EPDF_ShutdownThread
-//          Thread-confined runtime lifecycle. Initialize / tear down PDFium for
-//          the CALLING thread.
-// Comments:
-//          When the runtime is built with per-thread globals
-//          (embedpdf_thread_local_globals), each worker thread owns its own
-//          PDFium state, so every thread that uses PDFium MUST call
-//          EPDF_InitThread before creating any handle and EPDF_ShutdownThread
-//          after closing every handle it created. Handles must never cross
-//          threads. When per-thread globals are disabled, these are exact
-//          aliases of FPDF_InitLibrary / FPDF_DestroyLibrary and are safe to
-//          call once on a single thread. EPDF_ShutdownThread is lifecycle-
-//          strict: only legal after all handles on the calling thread are
-//          closed.
-FPDF_EXPORT void FPDF_CALLCONV EPDF_InitThread();
-FPDF_EXPORT void FPDF_CALLCONV EPDF_ShutdownThread();
 
 // Policy for accessing the local machine time.
 #define FPDF_POLICY_MACHINETIME_ACCESS 0
@@ -582,152 +593,6 @@ typedef struct FPDF_FILEHANDLER_ {
 FPDF_EXPORT FPDF_DOCUMENT FPDF_CALLCONV
 FPDF_LoadCustomDocument(FPDF_FILEACCESS* pFileAccess, FPDF_BYTESTRING password);
 
-// Function: EPDF_LoadBaseDocument
-//          Load and freeze a shareable base PDF document from a custom access
-//          descriptor. The returned handle is distinct from FPDF_DOCUMENT and
-//          cannot be used with ordinary document APIs such as FPDF_LoadPage().
-// Parameters:
-//          pFileAccess -   A structure for accessing the file.
-//          password    -   Optional password for decrypting the PDF file.
-// Return value:
-//          A handle to the loaded base document, or NULL on failure.
-FPDF_EXPORT EPDF_BASE_DOCUMENT FPDF_CALLCONV
-EPDF_LoadBaseDocument(FPDF_FILEACCESS* pFileAccess, FPDF_BYTESTRING password);
-
-// Function: EPDF_LoadMemBaseDocument
-//          Load and freeze a shareable base PDF document from memory. The
-//          returned handle is distinct from FPDF_DOCUMENT and cannot be used
-//          with ordinary document APIs such as FPDF_LoadPage().
-// Parameters:
-//          data_buf    -   Pointer to a buffer containing the PDF document.
-//          size        -   Number of bytes in the PDF document.
-//          password    -   Optional password for decrypting the PDF file.
-// Return value:
-//          A handle to the loaded base document, or NULL on failure.
-// Comments:
-//          The memory buffer must remain valid until the returned base document
-//          is released with EPDF_ReleaseBaseDocument().
-//
-//          See the comments for FPDF_LoadDocument() regarding the encoding for
-//          |password|.
-FPDF_EXPORT EPDF_BASE_DOCUMENT FPDF_CALLCONV
-EPDF_LoadMemBaseDocument(const void* data_buf,
-                         int size,
-                         FPDF_BYTESTRING password);
-
-// Function: EPDF_LoadMemBaseDocument64
-//          Load and freeze a shareable base PDF document from memory. The
-//          returned handle is distinct from FPDF_DOCUMENT and cannot be used
-//          with ordinary document APIs such as FPDF_LoadPage().
-// Parameters:
-//          data_buf    -   Pointer to a buffer containing the PDF document.
-//          size        -   Number of bytes in the PDF document.
-//          password    -   Optional password for decrypting the PDF file.
-// Return value:
-//          A handle to the loaded base document, or NULL on failure.
-// Comments:
-//          The memory buffer must remain valid until the returned base document
-//          is released with EPDF_ReleaseBaseDocument().
-//
-//          See the comments for FPDF_LoadDocument() regarding the encoding for
-//          |password|.
-FPDF_EXPORT EPDF_BASE_DOCUMENT FPDF_CALLCONV
-EPDF_LoadMemBaseDocument64(const void* data_buf,
-                           size_t size,
-                           FPDF_BYTESTRING password);
-
-// Function: EPDF_ReleaseBaseDocument
-//          Release a base document returned by EPDF_LoadBaseDocument() or
-//          EPDF_LoadMemBaseDocument()/EPDF_LoadMemBaseDocument64().
-FPDF_EXPORT void FPDF_CALLCONV
-EPDF_ReleaseBaseDocument(EPDF_BASE_DOCUMENT base);
-
-// Function: EPDF_SetBaseDocumentSha256
-//          Supply the SHA-256 of the exact bytes |base| was loaded from, so
-//          the runtime need not hash them again. Without it the runtime
-//          hashes the file on first use (a layer artifact carries the hash;
-//          a completed signature reports it as the version). Call it right
-//          after loading, before any layer is opened on |base|.
-//          |sha256| points at 32 bytes. This is an identity claim, not a
-//          check: a wrong value only makes the caller's own layer artifacts
-//          fail to open on the real bytes.
-FPDF_EXPORT void FPDF_CALLCONV
-EPDF_SetBaseDocumentSha256(EPDF_BASE_DOCUMENT base,
-                           const unsigned char* sha256);
-
-// Function: EPDFLayer_GetBaseSha256
-//          Copy the SHA-256 (32 bytes) of the base a layer document was
-//          opened on into |out_sha256|. Returns FALSE when |layer| is not a
-//          layer document or |out_sha256| is NULL.
-FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
-EPDFLayer_GetBaseSha256(FPDF_DOCUMENT layer, unsigned char* out_sha256);
-
-// Runtime-side status for opening a layer on top of a base document.
-typedef enum {
-  EPDFLayerOpenStatus_kSuccess = 0,
-  EPDFLayerOpenStatus_kPasswordRequired = 1,
-  EPDFLayerOpenStatus_kMalformedDelta = 2,
-  EPDFLayerOpenStatus_kBaseLayerMismatch = 3,
-  EPDFLayerOpenStatus_kOpenFailed = 4,
-} EPDFLayerOpenStatus;
-
-// Function: EPDFLayer_OpenLayer
-//          Open a layer view on top of a previously loaded base document.
-//          The returned handle is an ordinary FPDF_DOCUMENT and must be closed
-//          with FPDF_CloseDocument().
-// Parameters:
-//          base        -   A base document returned by EPDF_LoadBaseDocument().
-//          pFileAccess -   Optional raw layer delta bytes as returned by
-//                          EPDFLayer_SaveDelta(). NULL or zero-length opens a
-//                          fresh empty layer.
-//          password    -   Reserved for future delta-password handling.
-//          out_status  -   Optional detailed open status.
-// Return value:
-//          A layer document handle, or NULL on failure.
-FPDF_EXPORT FPDF_DOCUMENT FPDF_CALLCONV
-EPDFLayer_OpenLayer(EPDF_BASE_DOCUMENT base,
-                    FPDF_FILEACCESS* pFileAccess,
-                    FPDF_BYTESTRING password,
-                    EPDFLayerOpenStatus* out_status);
-
-// Function: EPDFLayer_OpenLayerArtifact
-//          Open a layer view from a layer artifact produced by
-//          EPDFLayer_SaveLayerArtifactToOwnedBuffer(). Validates that the
-//          artifact belongs to |base| before ingesting its raw delta.
-FPDF_EXPORT FPDF_DOCUMENT FPDF_CALLCONV
-EPDFLayer_OpenLayerArtifact(EPDF_BASE_DOCUMENT base,
-                            FPDF_FILEACCESS* pFileAccess,
-                            FPDF_BYTESTRING password,
-                            EPDFLayerOpenStatus* out_status);
-
-// Function: EPDFLayer_OpenLayerArtifactFromPath
-//          EPDFLayer_OpenLayerArtifact over a file the runtime opens itself
-//          and keeps open for the life of the layer: the delta is read in
-//          place, never copied, and every stream the delta carries stays a
-//          view into the file. The file must not change while the layer is
-//          open. |path| is a UTF-8 file system path.
-FPDF_EXPORT FPDF_DOCUMENT FPDF_CALLCONV
-EPDFLayer_OpenLayerArtifactFromPath(EPDF_BASE_DOCUMENT base,
-                                    FPDF_STRING path,
-                                    FPDF_BYTESTRING password,
-                                    EPDFLayerOpenStatus* out_status);
-
-// Function: EPDFLayer_IsObjectPromoted
-//          Return whether the object exists in the layer overlay.
-FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
-EPDFLayer_IsObjectPromoted(FPDF_DOCUMENT layer, unsigned long obj_num);
-
-// Function: EPDFLayer_GetPromotedObjectCount
-//          Return the number of objects currently stored in the layer overlay.
-FPDF_EXPORT unsigned long FPDF_CALLCONV
-EPDFLayer_GetPromotedObjectCount(FPDF_DOCUMENT layer);
-
-// Function: EPDFLayer_GetBaseDocument
-//          Return the layer's borrowed base document handle. The caller MUST
-//          NOT release the returned handle.
-FPDF_EXPORT EPDF_BASE_DOCUMENT FPDF_CALLCONV
-EPDFLayer_GetBaseDocument(FPDF_DOCUMENT layer);
-
 // Function: FPDF_GetFileVersion
 //          Get the file version of the given PDF document.
 // Parameters:
@@ -834,146 +699,6 @@ FPDF_GetDocUserPermissions(FPDF_DOCUMENT document);
 FPDF_EXPORT int FPDF_CALLCONV
 FPDF_GetSecurityHandlerRevision(FPDF_DOCUMENT document);
 
-// Permission flags for EPDF_SetEncryption allowed_flags parameter
-#define EPDF_PERM_PRINT              (1 << 2)   // Bit 3: Print document
-#define EPDF_PERM_MODIFY             (1 << 3)   // Bit 4: Modify contents
-#define EPDF_PERM_COPY               (1 << 4)   // Bit 5: Copy/extract text
-#define EPDF_PERM_ANNOT              (1 << 5)   // Bit 6: Add/modify annotations
-#define EPDF_PERM_FILL_FORMS         (1 << 8)   // Bit 9: Fill form fields
-#define EPDF_PERM_ACCESSIBILITY      (1 << 9)   // Bit 10: Extract for accessibility
-#define EPDF_PERM_ASSEMBLE           (1 << 10)  // Bit 11: Assemble document
-#define EPDF_PERM_PRINT_HIGH         (1 << 11)  // Bit 12: High quality print
-
-// Experimental EmbedPDF Extension API.
-// Sets AES-256 encryption on a document with user/owner passwords and permissions.
-//
-//   document        - handle to a document. Must not already be encrypted.
-//   user_password   - password required to open the document.
-//                     NULL or empty = no open password (document opens freely
-//                     but has owner restrictions enforced by compliant readers).
-//   owner_password  - password required to change permissions. Required, cannot
-//                     be NULL or empty.
-//   allowed_flags   - OR'd combination of EPDF_PERM_* flags indicating which
-//                     actions ARE ALLOWED. Internally converted to proper P value.
-//
-// Returns TRUE on success, FALSE on failure (e.g., already encrypted, NULL
-// owner password).
-// Note: Must be called before FPDF_SaveAsCopy for encryption to take effect.
-//
-// Example allowed_flags: EPDF_PERM_PRINT | EPDF_PERM_COPY
-FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
-EPDF_SetEncryption(FPDF_DOCUMENT document,
-                   FPDF_BYTESTRING user_password,
-                   FPDF_BYTESTRING owner_password,
-                   unsigned long allowed_flags);
-
-// Experimental EmbedPDF Extension API.
-// Clears any pending encryption set by EPDF_SetEncryption.
-// To remove encryption from an already-encrypted document, use
-// FPDF_REMOVE_SECURITY flag with FPDF_SaveAsCopy instead.
-//
-//   document - handle to a document.
-//
-// Returns TRUE on success.
-FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
-EPDF_RemoveEncryption(FPDF_DOCUMENT document);
-
-#define EPDF_PASSWORD_PERMISSION_INVALID 0
-#define EPDF_PASSWORD_PERMISSION_NONE 1
-#define EPDF_PASSWORD_PERMISSION_USER 2
-#define EPDF_PASSWORD_PERMISSION_OWNER 3
-
-// Experimental EmbedPDF Extension API.
-// Checks what permissions the given password proves without changing the
-// document's current owner-unlocked state.
-//
-//   document                      - handle to a document
-//   password                      - raw password to check
-//   out_kind                      - receives EPDF_PASSWORD_PERMISSION_*
-//   out_user_permissions          - receives the document's user permission bits
-//   out_effective_permissions     - receives permissions implied by |password|
-//   out_security_handler_revision - receives the security handler revision
-//
-// Returns TRUE if:
-//   - document is not encrypted (kind NONE, full permissions, revision -1)
-//   - password is valid as user or owner
-//
-// Returns FALSE if:
-//   - document is NULL
-//   - any out pointer is NULL
-//   - document has no parser
-//   - password is invalid for an encrypted document
-//
-// This is a password probe, not a runtime permission override. It must not be
-// used as evidence that the current document handle is owner-unlocked.
-FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
-EPDF_CheckPasswordPermissions(FPDF_DOCUMENT document,
-                              FPDF_BYTESTRING password,
-                              int* out_kind,
-                              unsigned int* out_user_permissions,
-                              unsigned int* out_effective_permissions,
-                              int* out_security_handler_revision);
-
-// Experimental EmbedPDF Extension API.
-// Attempts to unlock owner permissions on an already-opened encrypted document.
-//
-//   document        - handle to a document
-//   owner_password  - the owner password to verify (raw, encoding handled internally)
-//
-// Returns TRUE if the password is valid and owner permissions are now unlocked.
-// Returns FALSE if:
-//   - document is NULL
-//   - document has no parser (not loaded from file)
-//   - document is not encrypted
-//   - password is empty or invalid
-//
-// After successful unlock, FPDF_GetDocPermissions() will return full permissions.
-FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
-EPDF_UnlockOwnerPermissions(FPDF_DOCUMENT document,
-                            FPDF_BYTESTRING owner_password);
-
-// Experimental EmbedPDF Extension API.
-// Runtime policy override for EmbedPDF-managed sessions.
-//
-//   document - handle to a document
-//   enabled  - TRUE to make PDFium internals behave as owner-unlocked, FALSE to
-//              restore the normal user-permission state for this handle
-//
-// This does not prove an owner password and does not authorize the caller.
-// Callers must enforce JWT/PDF permission policy outside PDFium. This exists so
-// high-level PDFium subsystems that consult permissions (notably forms) do not
-// silently block operations after app-level authorization has already happened.
-FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
-EPDF_SetRuntimeOwnerPermissions(FPDF_DOCUMENT document, FPDF_BOOL enabled);
-
-// Experimental EmbedPDF Extension API.
-// Checks if a document is encrypted.
-//
-//   document - handle to a document
-//
-// Returns TRUE if the document has encryption (Standard security handler).
-// Returns FALSE if:
-//   - document is NULL
-//   - document has no parser
-//   - document is not encrypted
-FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
-EPDF_IsEncrypted(FPDF_DOCUMENT document);
-
-// Experimental EmbedPDF Extension API.
-// Checks if owner permissions are currently unlocked on an encrypted document.
-//
-//   document - handle to a document
-//
-// Returns TRUE if:
-//   - Document is encrypted AND owner password was verified (at load or via UnlockOwner)
-// Returns FALSE if:
-//   - document is NULL
-//   - document has no parser
-//   - document is not encrypted
-//   - owner permissions are not unlocked
-FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
-EPDF_IsOwnerUnlocked(FPDF_DOCUMENT document);
-
 // Function: FPDF_GetPageCount
 //          Get total number of pages in the document.
 // Parameters:
@@ -1074,101 +799,6 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
 FPDF_GetPageSizeByIndexF(FPDF_DOCUMENT document,
                          int page_index,
                          FS_SIZEF* size);
-
-// Page box type used by EPDF_GetPageBoxByIndex().
-typedef enum EPDF_PAGE_BOX_TYPE {
-  EPDF_PAGE_BOX_MEDIA = 0,
-  EPDF_PAGE_BOX_CROP = 1,
-  EPDF_PAGE_BOX_BLEED = 2,
-  EPDF_PAGE_BOX_TRIM = 3,
-  EPDF_PAGE_BOX_ART = 4,
-} EPDF_PAGE_BOX_TYPE;
-
-// Experimental EmbedPDF API.
-// Function: EPDF_GetPageRotationByIndex
-//          Get the rotation of the page at the given index without parsing
-//          the page contents.
-// Parameters:
-//          document    -   Handle to document. Returned by FPDF_LoadDocument().
-//          page_index  -   Page index, zero for the first page.
-// Return value:
-//          The rotation as quarter-turns (must be one of 0, 1, 2, 3).
-//          Returns -1 on error (document or page not found).
-FPDF_EXPORT int FPDF_CALLCONV
-EPDF_GetPageRotationByIndex(FPDF_DOCUMENT document, int page_index);
-
-// Experimental EmbedPDF API.
-// Function: EPDF_GetPageSizeByIndexNormalized
-//          Get the ORIGINAL (non-rotated) size of the page at the given index.
-//          Unlike FPDF_GetPageSizeByIndexF, this does NOT swap width/height
-//          for 90/270 degree rotated pages. Does NOT load the page (lightweight).
-// Parameters:
-//          document    -   Handle to document. Returned by FPDF_LoadDocument().
-//          page_index  -   Page index, zero for the first page.
-//          size        -   Pointer to a FS_SIZEF to receive the page size (in points).
-// Return value:
-//          Non-zero for success. 0 for error.
-FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
-EPDF_GetPageSizeByIndexNormalized(FPDF_DOCUMENT document,
-                                   int page_index,
-                                   FS_SIZEF* size);
-
-// Experimental EmbedPDF API.
-// Function: EPDF_GetPageBoxByIndex
-//          Get a page box at the given index without loading or parsing the page.
-// Parameters:
-//          document    -   Handle to document. Returned by FPDF_LoadDocument().
-//          page_index  -   Page index, zero for the first page.
-//          box_type    -   The page box to query.
-//          box         -   Pointer to a FS_RECTF to receive the box (in points).
-// Return value:
-//          Non-zero for success. 0 for error or absent optional box.
-// Comments:
-//          MediaBox is resolved through page-tree inheritance and falls back to
-//          PDFium's default page size when absent. CropBox falls back to
-//          MediaBox. BleedBox, TrimBox, and ArtBox return false when absent.
-FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
-EPDF_GetPageBoxByIndex(FPDF_DOCUMENT document,
-                       int page_index,
-                       EPDF_PAGE_BOX_TYPE box_type,
-                       FS_RECTF* box);
-
-// Experimental EmbedPDF API.
-// Function: EPDF_GetPageUserUnitByIndex
-//          Get /UserUnit at the given page index without loading or parsing the
-//          page.
-// Parameters:
-//          document    -   Handle to document. Returned by FPDF_LoadDocument().
-//          page_index  -   Page index, zero for the first page.
-//          user_unit   -   Pointer to a float to receive the user unit.
-// Return value:
-//          Non-zero for success. 0 for error.
-// Comments:
-//          Missing or invalid /UserUnit values return the PDF default 1.0.
-FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
-EPDF_GetPageUserUnitByIndex(FPDF_DOCUMENT document,
-                            int page_index,
-                            float* user_unit);
-
-// Experimental EmbedPDF API.
-// Function: EPDF_LoadPageNormalized
-//          Load a page with rotation normalized to 0 degrees.
-//          All subsequent operations (GetPageWidth, annotations, text, rendering)
-//          will use normalized coordinates as if the page had no rotation.
-// Parameters:
-//          document            -   Handle to document.
-//          page_index          -   Page index, zero for the first page.
-//          out_original_rotation - Optional. Receives the original rotation (0-3).
-//                                  Can be NULL if not needed.
-// Return value:
-//          Handle to the loaded page, or NULL on failure.
-// Comments:
-//          The returned page must be closed with FPDF_ClosePage().
-//          Use out_original_rotation to know the actual page rotation for display.
-FPDF_EXPORT FPDF_PAGE FPDF_CALLCONV
-EPDF_LoadPageNormalized(FPDF_DOCUMENT document,
-                         int page_index,
-                         int* out_original_rotation);
 
 // Function: FPDF_GetPageSizeByIndex
 //          Get the size of the page at the given index.
@@ -1826,42 +1456,6 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDF_GetXFAPacketContent(
     unsigned long buflen,
     unsigned long* out_buflen);
 
-// Experimental EmbedPDF Extension API.
-// Renders the appearance stream of a single annotation to a bitmap.
-//
-//   bitmap -  Destination bitmap handle.
-//   page   - Page that owns the annotation.
-//   annot  - Annotation handle obtained from any FPDFAnnot_* API.
-//   matrix - Matrix to transform the annotation
-//   flags  - Flags to control the rendering
-//   mode - One of `FPDF_ANNOT_APPEAR_*` above.
-//
-// Returns true if the rendering was successful, false otherwise.
-FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
-EPDF_RenderAnnotBitmap(FPDF_BITMAP bitmap,
-                       FPDF_PAGE page,
-                       FPDF_ANNOTATION annot,
-                       FPDF_ANNOT_APPEARANCEMODE appearanceMode,
-                       const FS_MATRIX* matrix,
-                       int flags);
-
-// Experimental EmbedPDF Extension API.
-// Renders the annotation's AP form content WITHOUT the AP stream's rotation
-// Matrix applied, using /EMBD_Metadata /UnrotatedRect (falling back to /Rect)
-// for the MatchRect mapping. This produces an unrotated bitmap suitable for UI
-// layers that apply CSS rotation separately.
-//
-// Same parameters as EPDF_RenderAnnotBitmap.
-//
-// Returns true if the rendering was successful, false otherwise.
-FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
-EPDF_RenderAnnotBitmapUnrotated(FPDF_BITMAP bitmap,
-                                FPDF_PAGE page,
-                                FPDF_ANNOTATION annot,
-                                FPDF_ANNOT_APPEARANCEMODE appearanceMode,
-                                const FS_MATRIX* matrix,
-                                int flags);
-
 #ifdef PDF_ENABLE_V8
 // Function: FPDF_GetRecommendedV8Flags
 //          Returns a space-separated string of command line flags that are
@@ -1908,98 +1502,6 @@ FPDF_EXPORT FPDF_RESULT FPDF_CALLCONV FPDF_BStr_Set(FPDF_BSTR* bstr,
 //          Helper function to clear a FPDF_BSTR.
 FPDF_EXPORT FPDF_RESULT FPDF_CALLCONV FPDF_BStr_Clear(FPDF_BSTR* bstr);
 #endif  // PDF_ENABLE_XFA
-
-// Experimental EmbedPDF Extension API.
-// Load a page by its PDF indirect object number.
-// Similar to FPDF_LoadPage() but keyed by the page dictionary's object
-// number instead of page index.
-//
-//   document - handle to the document.
-//   obj_num  - the indirect object number of the page dictionary.
-//
-// Returns a handle to the loaded page, or NULL if the object number
-// does not correspond to a page. The caller must close the returned
-// handle with FPDF_ClosePage().
-FPDF_EXPORT FPDF_PAGE FPDF_CALLCONV
-EPDFDoc_LoadPageByObjectNumber(FPDF_DOCUMENT document, unsigned int obj_num);
-
-// Experimental EmbedPDF Extension API.
-// Load a page by its PDF indirect object number with rotation normalized to
-// 0 degrees. Like EPDFDoc_LoadPageByObjectNumber(), but forces the page's
-// rotation override to 0 so all subsequent operations (GetPageWidth,
-// annotations, text, rendering) use normalized coordinates as if the page had
-// no rotation. The intrinsic rotation is surfaced separately via
-// EPDF_GetPageRotationByIndex().
-//
-//   document - handle to the document.
-//   obj_num  - the indirect object number of the page dictionary.
-//
-// Returns a handle to the loaded page, or NULL if the object number
-// does not correspond to a page. The caller must close the returned
-// handle with FPDF_ClosePage().
-FPDF_EXPORT FPDF_PAGE FPDF_CALLCONV
-EPDFDoc_LoadPageByObjectNumberNormalized(FPDF_DOCUMENT document,
-                                         unsigned int obj_num);
-
-// Experimental EmbedPDF Extension API.
-// Get the PDF indirect object number of a page's dictionary by page index.
-// Unlike FPDF_LoadPage(), this does not construct a page object or parse page
-// content.
-//
-//   document   - handle to the document.
-//   page_index - zero-based page index.
-//
-// Returns the page dictionary object number (> 0) on success, or 0 if the
-// document/index is invalid, the page dictionary is a direct object, or the
-// page is an XFA page.
-FPDF_EXPORT unsigned int FPDF_CALLCONV
-EPDFDoc_GetPageObjectNumberByIndex(FPDF_DOCUMENT document, int page_index);
-
-// Experimental EmbedPDF Extension API.
-// Delete the first visible page whose page dictionary has |obj_num| as its PDF
-// indirect object number. Unlike FPDFPage_Delete(), this remains stable across
-// page moves because it is keyed by page identity rather than page position.
-//
-//   document - handle to the document.
-//   obj_num  - the indirect object number of the page dictionary.
-//
-// Returns TRUE if a matching page was found and deleted, or FALSE if |document|
-// is invalid, |obj_num| is 0, or |obj_num| does not correspond to a visible
-// page. If a malformed PDF references the same /Page object more than once,
-// the first visible occurrence resolved by PDFium is deleted.
-FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
-EPDFDoc_DeletePageByObjectNumber(FPDF_DOCUMENT document, unsigned int obj_num);
-
-// Experimental EmbedPDF Extension API.
-// Set the rotation of the page whose page dictionary has |obj_num| as its PDF
-// indirect object number. Unlike FPDFPage_SetRotation(), this does not require
-// loading or parsing the page.
-//
-//   document - handle to the document.
-//   obj_num  - the indirect object number of the page dictionary.
-//   rotate   - the rotation value, one of:
-//                0 - No rotation.
-//                1 - Rotated 90 degrees clockwise.
-//                2 - Rotated 180 degrees clockwise.
-//                3 - Rotated 270 degrees clockwise.
-//
-// Returns TRUE if a matching page was found and updated, or FALSE if |document|
-// is invalid, |obj_num| is 0, |rotate| is outside 0..3, or |obj_num| does not
-// correspond to a visible page.
-FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
-EPDFDoc_SetPageRotationByObjectNumber(FPDF_DOCUMENT document,
-                                      unsigned int obj_num,
-                                      int rotate);
-
-// Experimental EmbedPDF Extension API.
-// Get the PDF indirect object number of a page's dictionary.
-//
-//   page - handle to the page.
-//
-// Returns the object number (> 0) on success, or 0 if the page handle is
-// invalid, the page dictionary is a direct object, or the page is an XFA page.
-FPDF_EXPORT unsigned int FPDF_CALLCONV
-EPDFPage_GetObjectNumber(FPDF_PAGE page);
 
 #ifdef __cplusplus
 }

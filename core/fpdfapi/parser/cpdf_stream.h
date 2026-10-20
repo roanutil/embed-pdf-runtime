@@ -14,6 +14,7 @@
 #include <variant>
 
 #include "core/fpdfapi/parser/cpdf_object.h"
+#include "core/fxcrt/cfx_shared_bytes.h"
 #include "core/fxcrt/data_vector.h"
 #include "core/fxcrt/fx_string_wrappers.h"
 #include "core/fxcrt/retain_ptr.h"
@@ -29,10 +30,12 @@ class CPDF_Stream final : public CPDF_Object {
   // CPDF_Object:
   Type GetType() const override;
   RetainPtr<CPDF_Object> Clone() const override;
+  // EmbedPDF(layer-door): the copy a layer makes of a base object.
   RetainPtr<CPDF_Object> CloneForHolder(
       CPDF_IndirectObjectHolder* holder) const override;
   WideString GetUnicodeText() const override;
   CPDF_Stream* AsMutableStream() override;
+  // EmbedPDF(save-generations): writers carry the write context.
   using CPDF_Object::WriteTo;
   bool WriteTo(IFX_ArchiveStream* archive,
                const CPDF_Encryptor* encryptor,
@@ -63,15 +66,17 @@ class CPDF_Stream final : public CPDF_Object {
   bool IsFileBased() const {
     return std::holds_alternative<RetainPtr<IFX_SeekableReadStream>>(data_);
   }
-  // EmbedPDF: the read-only view a file-based stream's bytes live in (null
-  // for memory-based data). Two streams with the same view hold the same
-  // bytes; SetData() replaces the view with owned memory.
+  // EmbedPDF(layer-door, layer-save): the read-only view a file-based
+  // stream's bytes live in (null for memory-based data). Two streams with the
+  // same view hold the same bytes; SetData() replaces the view with owned
+  // memory.
   RetainPtr<IFX_SeekableReadStream> BackingView() const;
-  // EmbedPDF: raw (still-encoded) bytes [offset, offset + buffer.size()),
-  // from memory or from the view, without loading the whole stream.
+  // EmbedPDF(layer-save): raw (still-encoded) bytes
+  // [offset, offset + buffer.size()), from memory or from the view, without
+  // loading the whole stream.
   bool ReadRawBlock(pdfium::span<uint8_t> buffer, FX_FILESIZE offset) const;
   bool IsMemoryBased() const {
-    return std::holds_alternative<DataVector<uint8_t>>(data_);
+    return std::holds_alternative<RetainPtr<const CFX_SharedBytes>>(data_);
   }
   bool HasFilter() const;
 
@@ -95,20 +100,31 @@ class CPDF_Stream final : public CPDF_Object {
   // Takes `data`.
   // `dict` must be non-null and be a direct object.
   CPDF_Stream(DataVector<uint8_t> data, RetainPtr<CPDF_Dictionary> dict);
+  // EmbedPDF(layer-door): shares `bytes` (a copy's source's). `dict` as above.
+  CPDF_Stream(RetainPtr<const CFX_SharedBytes> bytes,
+              RetainPtr<CPDF_Dictionary> dict);
   ~CPDF_Stream() override;
 
   const CPDF_Dictionary* GetDictInternal() const override;
   RetainPtr<CPDF_Object> CloneNonCyclic(
       bool bDirect,
       std::set<const CPDF_Object*>* pVisited) const override;
+  // EmbedPDF(layer-door, write-generation): copy-up, freeze and stamp walks.
   RetainPtr<CPDF_Object> CloneForHolderNonCyclic(
       CPDF_IndirectObjectHolder* holder,
       std::set<const CPDF_Object*>* pVisited) const override;
   void FreezeChildren(std::set<const CPDF_Object*>* visited) override;
+  void StampWriteGenerationOfChildren(uint32_t generation) override;
 
   void SetLengthInDict(int length);
 
-  std::variant<RetainPtr<IFX_SeekableReadStream>, DataVector<uint8_t>> data_;
+  // EmbedPDF(layer-door): in-memory bytes are shared and immutable
+  // (CFX_SharedBytes): a copy for a holder shares them, and SetData() and
+  // TakeData() give this stream a new buffer instead of writing into the
+  // shared one.
+  std::variant<RetainPtr<IFX_SeekableReadStream>,
+               RetainPtr<const CFX_SharedBytes>>
+      data_;
   RetainPtr<CPDF_Dictionary> dict_;
 };
 

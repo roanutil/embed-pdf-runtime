@@ -33,8 +33,8 @@ CFX_FloatRect CPDF_Path::GetBoundingBoxForStrokePath(float line_width,
   return ref_.GetObject()->GetBoundingBoxForStrokePath(line_width, miter_limit);
 }
 
-bool CPDF_Path::IsRect() const {
-  return ref_.GetObject()->IsRect();
+std::optional<CFX_PointF> CPDF_Path::GetRectOppositeCorner() const {
+  return ref_.GetObject()->GetRectOppositeCorner();
 }
 
 void CPDF_Path::Transform(const CFX_Matrix& matrix) {
@@ -55,14 +55,18 @@ void CPDF_Path::AppendRect(float left, float bottom, float right, float top) {
 
 void CPDF_Path::AppendPoint(const CFX_PointF& point,
                             CFX_Path::Point::Type type) {
-  CFX_Path data;
-  data.AppendPoint(point, type);
-  Append(data, nullptr);
+  // EmbedPDF(render-speedup): append in place, not through a temporary path.
+  ref_.GetPrivateCopy()->AppendPoint(point, type);
 }
 
 void CPDF_Path::AppendPointAndClose(const CFX_PointF& point,
                                     CFX_Path::Point::Type type) {
-  CFX_Path data;
-  data.AppendPointAndClose(point, type);
-  Append(data, nullptr);
+  // EmbedPDF(render-speedup): append in place, not through a temporary path.
+  ref_.GetPrivateCopy()->AppendPointAndClose(point, type);
+}
+
+// EmbedPDF(render-speedup): the content parser appends a path's points at
+// once.
+void CPDF_Path::AppendPoints(pdfium::span<const CFX_Path::Point> points) {
+  ref_.GetPrivateCopy()->AppendPoints(points);
 }

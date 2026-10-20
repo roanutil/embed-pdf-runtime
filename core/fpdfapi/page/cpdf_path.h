@@ -7,6 +7,7 @@
 #ifndef CORE_FPDFAPI_PAGE_CPDF_PATH_H_
 #define CORE_FPDFAPI_PAGE_CPDF_PATH_H_
 
+#include <optional>
 #include <vector>
 
 #include "core/fxcrt/shared_copy_on_write.h"
@@ -29,7 +30,7 @@ class CPDF_Path {
   CFX_FloatRect GetBoundingBoxForStrokePath(float line_width,
                                             float miter_limit) const;
 
-  bool IsRect() const;
+  std::optional<CFX_PointF> GetRectOppositeCorner() const;
   void Transform(const CFX_Matrix& matrix);
 
   void Append(const CFX_Path& path, const CFX_Matrix* pMatrix);
@@ -37,6 +38,9 @@ class CPDF_Path {
   void AppendRect(float left, float bottom, float right, float top);
   void AppendPoint(const CFX_PointF& point, CFX_Path::Point::Type type);
   void AppendPointAndClose(const CFX_PointF& point, CFX_Path::Point::Type type);
+  // EmbedPDF(render-speedup): the content parser appends a path's points at
+  // once.
+  void AppendPoints(pdfium::span<const CFX_Path::Point> points);
 
   // TODO(tsepez): Remove when all access thru this class.
   const CFX_Path* GetObject() const { return ref_.GetObject(); }

@@ -6,8 +6,10 @@
 
 #include "core/fpdfapi/render/cpdf_rendertiling.h"
 
+#include <cmath>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <utility>
 
 #include "core/fpdfapi/page/cpdf_form.h"
@@ -19,12 +21,22 @@
 #include "core/fpdfapi/render/cpdf_renderstatus.h"
 #include "core/fxcrt/fx_safe_types.h"
 #include "core/fxcrt/span_util.h"
-#include "core/fxge/cfx_defaultrenderdevice.h"
+#include "core/fxge/cfx_renderdevice.h"
 #include "core/fxge/dib/cfx_dibitmap.h"
 
 namespace {
 
-RetainPtr<CFX_DIBitmap> DrawPatternBitmap(
+std::optional<int> CheckedFloatToInt(float value) {
+  if (!pdfium::IsValueInRangeForNumericType<int>(value)) {
+    return std::nullopt;
+  }
+  return static_cast<int>(value);
+}
+
+}  // namespace
+
+// static
+RetainPtr<CFX_DIBitmap> CPDF_RenderTiling::DrawPatternBitmap(
     CPDF_Document* doc,
     CPDF_PageImageCache* pCache,
     CPDF_TilingPattern* pPattern,
@@ -41,9 +53,12 @@ RetainPtr<CFX_DIBitmap> DrawPatternBitmap(
                                            : FXDIB_Format::k8bppMask)) {
     return nullptr;
   }
-  CFX_DefaultRenderDevice bitmap_device;
-  bitmap_device.AttachWithBackdropAndGroupKnockout(
-      pBitmap, /*pBackdropBitmap=*/nullptr, /*bGroupKnockout=*/true);
+  std::unique_ptr<CFX_RenderDevice> bitmap_device =
+      CFX_RenderDevice::CreateForBitmap(pBitmap);
+  if (!bitmap_device) {
+    return nullptr;
+  }
+  bitmap_device->SetGroupKnockout(true);
   CFX_FloatRect cell_bbox =
       pPattern->pattern_to_form().TransformRect(pPattern->bbox());
   cell_bbox = mtObject2Device.TransformRect(cell_bbox);
@@ -62,12 +77,10 @@ RetainPtr<CFX_DIBitmap> DrawPatternBitmap(
 
   CPDF_RenderContext context(doc, nullptr, pCache);
   context.AppendLayer(pPatternForm, mtPattern2Bitmap);
-  context.Render(&bitmap_device, nullptr, &options, nullptr);
+  context.Render(bitmap_device.get(), nullptr, &options, nullptr);
 
   return pBitmap;
 }
-
-}  // namespace
 
 // static
 RetainPtr<CFX_DIBitmap> CPDF_RenderTiling::Draw(
@@ -101,16 +114,32 @@ RetainPtr<CFX_DIBitmap> CPDF_RenderTiling::Draw(
     height = 1;
   }
 
+  const float x_step = pPattern->x_step();
+  const float y_step = pPattern->y_step();
+  if (!std::isfinite(x_step) || !std::isfinite(y_step) || x_step == 0.0f ||
+      y_step == 0.0f) {
+    return nullptr;
+  }
+
   CFX_FloatRect clip_box_p =
       mtPattern2Device.GetInverse().TransformRect(CFX_FloatRect(clip_box));
-  int min_col = static_cast<int>(
-      ceil((clip_box_p.left - pPattern->bbox().right) / pPattern->x_step()));
-  int max_col = static_cast<int>(
-      floor((clip_box_p.right - pPattern->bbox().left) / pPattern->x_step()));
-  int min_row = static_cast<int>(
-      ceil((clip_box_p.bottom - pPattern->bbox().top) / pPattern->y_step()));
-  int max_row = static_cast<int>(
-      floor((clip_box_p.top - pPattern->bbox().bottom) / pPattern->y_step()));
+  std::optional<int> maybe_min_col = CheckedFloatToInt(
+      std::ceil((clip_box_p.left - pPattern->bbox().right) / x_step));
+  std::optional<int> maybe_max_col = CheckedFloatToInt(
+      std::floor((clip_box_p.right - pPattern->bbox().left) / x_step));
+  std::optional<int> maybe_min_row = CheckedFloatToInt(
+      std::ceil((clip_box_p.bottom - pPattern->bbox().top) / y_step));
+  std::optional<int> maybe_max_row = CheckedFloatToInt(
+      std::floor((clip_box_p.top - pPattern->bbox().bottom) / y_step));
+  if (!maybe_min_col.has_value() || !maybe_max_col.has_value() ||
+      !maybe_min_row.has_value() || !maybe_max_row.has_value()) {
+    return nullptr;
+  }
+
+  int min_col = maybe_min_col.value();
+  int max_col = maybe_max_col.value();
+  int min_row = maybe_min_row.value();
+  int max_row = maybe_max_row.value();
 
   // Make sure we can fit the needed width * height into an int.
   if (height > std::numeric_limits<int>::max() / width) {
@@ -155,34 +184,11 @@ RetainPtr<CFX_DIBitmap> CPDF_RenderTiling::Draw(
     return nullptr;
   }
 
-  bool bAligned =
-      pPattern->bbox().left == 0 && pPattern->bbox().bottom == 0 &&
-      pPattern->bbox().right == pPattern->x_step() &&
-      pPattern->bbox().top == pPattern->y_step() &&
-      (mtPattern2Device.IsScaled() || mtPattern2Device.Is90Rotated());
-  if (bAligned) {
-    int orig_x = FXSYS_roundf(mtPattern2Device.e);
-    int orig_y = FXSYS_roundf(mtPattern2Device.f);
-    min_col = (clip_box.left - orig_x) / width;
-    if (clip_box.left < orig_x) {
-      min_col--;
-    }
-
-    max_col = (clip_box.right - orig_x) / width;
-    if (clip_box.right <= orig_x) {
-      max_col--;
-    }
-
-    min_row = (clip_box.top - orig_y) / height;
-    if (clip_box.top < orig_y) {
-      min_row--;
-    }
-
-    max_row = (clip_box.bottom - orig_y) / height;
-    if (clip_box.bottom <= orig_y) {
-      max_row--;
-    }
-  }
+  // EmbedPDF(bug-fix): every cell is placed at its own position, rounded to
+  // the pixel. Upstream stepped aligned cells by the cell's width rounded up
+  // to whole pixels, which moves each cell a fraction of a pixel further from
+  // the pattern's origin, which can lie hundreds of cells off the page: the
+  // tiling drifted, by an amount that changed with every zoom.
   float left_offset = cell_bbox.left - mtPattern2Device.e;
   float top_offset = cell_bbox.bottom - mtPattern2Device.f;
   RetainPtr<CFX_DIBitmap> pPatternBitmap;
@@ -202,7 +208,7 @@ RetainPtr<CFX_DIBitmap> CPDF_RenderTiling::Draw(
   }
 
   if (options.ColorModeIs(CPDF_RenderOptions::kGray)) {
-    pPatternBitmap->ConvertColorScale(0, 0xffffff);
+    pPatternBitmap->ConvertColorScale(/*is_white_on_black=*/false);
   }
 
   FX_ARGB fill_argb = pRenderStatus->GetFillArgb(pPageObj);
@@ -216,29 +222,22 @@ RetainPtr<CFX_DIBitmap> CPDF_RenderTiling::Draw(
   pdfium::span<const uint8_t> src_buf = pPatternBitmap->GetBuffer();
   for (int col = min_col; col <= max_col; col++) {
     for (int row = min_row; row <= max_row; row++) {
-      int start_x;
-      int start_y;
-      if (bAligned) {
-        start_x =
-            FXSYS_roundf(mtPattern2Device.e) + col * width - clip_box.left;
-        start_y =
-            FXSYS_roundf(mtPattern2Device.f) + row * height - clip_box.top;
-      } else {
-        CFX_PointF original = mtPattern2Device.Transform(
-            CFX_PointF(col * pPattern->x_step(), row * pPattern->y_step()));
+      // EmbedPDF(bug-fix): every cell is placed at its own position; the
+      // aligned shortcut that stepped by rounded cell widths is gone.
+      CFX_PointF original = mtPattern2Device.Transform(
+          CFX_PointF(col * pPattern->x_step(), row * pPattern->y_step()));
 
-        FX_SAFE_INT32 safeStartX = FXSYS_roundf(original.x + left_offset);
-        FX_SAFE_INT32 safeStartY = FXSYS_roundf(original.y + top_offset);
+      FX_SAFE_INT32 safeStartX = FXSYS_roundf(original.x + left_offset);
+      FX_SAFE_INT32 safeStartY = FXSYS_roundf(original.y + top_offset);
 
-        safeStartX -= clip_box.left;
-        safeStartY -= clip_box.top;
-        if (!safeStartX.IsValid() || !safeStartY.IsValid()) {
-          return nullptr;
-        }
-
-        start_x = safeStartX.ValueOrDie();
-        start_y = safeStartY.ValueOrDie();
+      safeStartX -= clip_box.left;
+      safeStartY -= clip_box.top;
+      if (!safeStartX.IsValid() || !safeStartY.IsValid()) {
+        return nullptr;
       }
+
+      const int start_x = safeStartX.ValueOrDie();
+      const int start_y = safeStartY.ValueOrDie();
       if (width == 1 && height == 1) {
         if (start_x < 0 || start_x >= clip_box.Width() || start_y < 0 ||
             start_y >= clip_box.Height()) {
@@ -258,12 +257,11 @@ RetainPtr<CFX_DIBitmap> CPDF_RenderTiling::Draw(
       } else {
         if (pPattern->colored()) {
           pScreen->CompositeBitmap(start_x, start_y, width, height,
-                                   pPatternBitmap, 0, 0, BlendMode::kNormal,
-                                   nullptr, false);
+                                   pPatternBitmap, 0, 0, BlendMode::kNormal);
         } else {
           pScreen->CompositeMask(start_x, start_y, width, height,
                                  pPatternBitmap, fill_argb, 0, 0,
-                                 BlendMode::kNormal, nullptr, false);
+                                 BlendMode::kNormal);
         }
       }
     }

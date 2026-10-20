@@ -101,13 +101,13 @@ outline_aa::outline_aa() :
     m_max_y(-0x7FFFFFFF),
     m_sorted(false)
 {
-    m_cur_cell.set(0x7FFF, 0x7FFF, 0, 0);
+    m_cur_cell.set(0x7FFFFFFF, 0x7FFFFFFF, 0, 0);
 }
 void outline_aa::reset()
 {
     m_num_cells = 0;
     m_cur_block = 0;
-    m_cur_cell.set(0x7FFF, 0x7FFF, 0, 0);
+    m_cur_cell.set(0x7FFFFFFF, 0x7FFFFFFF, 0, 0);
     m_sorted = false;
     m_min_x =  0x7FFFFFFF;
     m_min_y =  0x7FFFFFFF;
@@ -134,7 +134,11 @@ AGG_INLINE void outline_aa::add_cur_cell()
 {
     if(m_cur_cell.area | m_cur_cell.cover) {
         if((m_num_cells & cell_block_mask) == 0) {
-            if(m_num_blocks >= cell_block_limit) {
+            // EmbedPDF(render-speedup): one rasterizer draws many paths.
+            // Count the blocks this outline uses, not the ones allocated: an
+            // outline reused after reset() keeps its blocks, and must reach
+            // the limit exactly where a new outline would.
+            if(m_cur_block >= cell_block_limit) {
                 return;
             }
             allocate_block();

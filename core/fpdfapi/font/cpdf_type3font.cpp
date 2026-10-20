@@ -35,14 +35,6 @@ CPDF_Type3Font::CPDF_Type3Font(CPDF_Document* document,
 
 CPDF_Type3Font::~CPDF_Type3Font() = default;
 
-bool CPDF_Type3Font::IsType3Font() const {
-  return true;
-}
-
-const CPDF_Type3Font* CPDF_Type3Font::AsType3Font() const {
-  return this;
-}
-
 CPDF_Type3Font* CPDF_Type3Font::AsType3Font() {
   return this;
 }
@@ -59,7 +51,17 @@ void CPDF_Type3Font::WillBeDestroyed() {
   }
 }
 
+// EmbedPDF(faithful-content-rewrite, redaction): one test for whether glyphs
+// borrow the resources of the content drawing them.
+// static
+bool CPDF_Type3Font::GlyphsUseContentResources(
+    const CPDF_Dictionary* font_dict) {
+  return !font_dict->GetDictFor("Resources");
+}
+
 bool CPDF_Type3Font::Load() {
+  // EmbedPDF(reads-dont-write): read without the mutable getter; the cast only
+  // fits the member's mutable type, nothing writes through it.
   RetainPtr<const CPDF_Dictionary> font_resources =
       font_dict_->GetDictFor("Resources");
   font_resources_ =
@@ -96,6 +98,8 @@ bool CPDF_Type3Font::Load() {
       }
     }
   }
+  // EmbedPDF(reads-dont-write): read without the mutable getter; the cast only
+  // fits the member's mutable type, nothing writes through it.
   RetainPtr<const CPDF_Dictionary> char_procs =
       font_dict_->GetDictFor("CharProcs");
   char_procs_ =
@@ -106,10 +110,13 @@ bool CPDF_Type3Font::Load() {
   return true;
 }
 
-void CPDF_Type3Font::LoadGlyphMap() {}
-
 void CPDF_Type3Font::CheckType3FontMetrics() {
   CheckFontMetrics();
+}
+
+// EmbedPDF(redaction): the Type3 redactor finds a glyph's procedure by this.
+const char* CPDF_Type3Font::GetCharProcName(uint32_t charcode) const {
+  return GetAdobeCharName(base_encoding_, char_names_, charcode);
 }
 
 CPDF_Type3Char* CPDF_Type3Font::LoadChar(uint32_t charcode) {
@@ -122,7 +129,8 @@ CPDF_Type3Char* CPDF_Type3Font::LoadChar(uint32_t charcode) {
     return it->second.get();
   }
 
-  const char* name = GetAdobeCharName(base_encoding_, char_names_, charcode);
+  // EmbedPDF(redaction): the same name lookup the Type3 redactor uses.
+  const char* name = GetCharProcName(charcode);
   if (!name) {
     return nullptr;
   }
@@ -131,6 +139,8 @@ CPDF_Type3Char* CPDF_Type3Font::LoadChar(uint32_t charcode) {
     return nullptr;
   }
 
+  // EmbedPDF(reads-dont-write): read without the mutable getter; the cast only
+  // fits the member's mutable type, nothing writes through it.
   RetainPtr<const CPDF_Stream> const_stream =
       ToStream(char_procs_->GetDirectObjectFor(name));
   RetainPtr<CPDF_Stream> pStream =
@@ -139,8 +149,14 @@ CPDF_Type3Char* CPDF_Type3Font::LoadChar(uint32_t charcode) {
     return nullptr;
   }
 
+  // EmbedPDF(faithful-content-rewrite, redaction): glyphs borrow the
+  // content's resources by the one test resource pruning and the Type3
+  // redactor also use.
   std::unique_ptr<CPDF_Font::FormIface> pForm = form_factory_->CreateForm(
-      document_, font_resources_ ? font_resources_ : page_resources_, pStream);
+      document_,
+      GlyphsUseContentResources(font_dict_.Get()) ? page_resources_
+                                                  : font_resources_,
+      pStream);
 
   auto pNewChar = std::make_unique<CPDF_Type3Char>();
 
@@ -167,7 +183,7 @@ CPDF_Type3Char* CPDF_Type3Font::LoadChar(uint32_t charcode) {
   return pCachedChar;
 }
 
-int CPDF_Type3Font::GetCharWidthF(uint32_t charcode) {
+int CPDF_Type3Font::GetCharWidth(uint32_t charcode) {
   if (charcode >= std::size(char_width_l_)) {
     charcode = 0;
   }

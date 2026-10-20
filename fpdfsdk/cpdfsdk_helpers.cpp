@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "build/build_config.h"
+#include "constants/catalog.h"
 #include "constants/form_fields.h"
 #include "constants/stream_dict_common.h"
 #include "core/fpdfapi/page/cpdf_annotcontext.h"
@@ -32,14 +33,14 @@
 #include "fpdfsdk/cpdfsdk_formfillenvironment.h"
 
 #if defined(PDF_USE_SKIA)
-#include "core/fxge/cfx_defaultrenderdevice.h"
+#include "core/fxge/cfx_gemodule.h"
 #endif
 
 namespace {
 
 constexpr char kQuadPoints[] = "QuadPoints";
 
-// EmbedPDF: thread-confined runtime - config callbacks, NOT runtime knobs.
+// EmbedPDF(thread-confined-globals): config callbacks, NOT runtime knobs.
 // These two process-globals are intentionally left process-wide (not EPDF_TLS):
 // they are immutable configuration that MUST be set once during process
 // bootstrap, before any worker thread starts, and MUST NOT be mutated while
@@ -74,7 +75,8 @@ bool DocHasXFA(const CPDF_Document* doc) {
     return false;
   }
 
-  RetainPtr<const CPDF_Dictionary> form = root->GetDictFor("AcroForm");
+  RetainPtr<const CPDF_Dictionary> form =
+      root->GetDictFor(pdfium::catalog::kAcroForm);
   return form && form->GetArrayFor("XFA");
 }
 
@@ -91,7 +93,11 @@ unsigned long GetStreamMaybeCopyAndReturnLengthImpl(
   }
 
   pdfium::span<const uint8_t> stream_data_span = stream_acc->GetSpan();
-  if (!buffer.empty() && buffer.size() <= stream_data_span.size()) {
+  // EmbedPDF(bug-fix): copy when the buffer is large enough, as every
+  // caller's API documents. The comparison was inverted: a larger buffer came
+  // back unfilled (with success), and a smaller one failed fxcrt::Copy()'s
+  // CHECK.
+  if (!buffer.empty() && buffer.size() >= stream_data_span.size()) {
     fxcrt::Copy(stream_data_span, buffer);
   }
   return pdfium::checked_cast<unsigned long>(stream_data_span.size());
@@ -231,10 +237,23 @@ FPDF_DOCUMENT FPDFDocumentFromCPDFDocument(CPDF_Document* doc) {
   return reinterpret_cast<FPDF_DOCUMENT>(doc);
 }
 
+// EmbedPDF(sliced-load): a page still loading in slices finishes its load
+// before a read sees it; CPDFPageFromFPDFPageAsIs() is the mid-load view.
 CPDF_Page* CPDFPageFromFPDFPage(FPDF_PAGE page) {
+  CPDF_Page* pdf_page = CPDFPageFromFPDFPageAsIs(page);
+  if (pdf_page && pdf_page->GetParseState() ==
+                      CPDF_PageObjectHolder::ParseState::kParsing) {
+    pdf_page->ParseContent();
+  }
+  return pdf_page;
+}
+
+CPDF_Page* CPDFPageFromFPDFPageAsIs(FPDF_PAGE page) {
   return page ? IPDFPageFromFPDFPage(page)->AsPDFPage() : nullptr;
 }
 
+// EmbedPDF(view-scope): read entry points unwrap a handle and open its
+// document's view scope in one step.
 ScopedFPDFDocumentView::ScopedFPDFDocumentView(FPDF_DOCUMENT document)
     : document_(CPDFDocumentFromFPDFDocument(document)),
       view_scope_(document_) {}
@@ -247,6 +266,15 @@ ScopedFPDFPageView::ScopedFPDFPageView(FPDF_PAGE page)
 
 ScopedFPDFPageView::~ScopedFPDFPageView() = default;
 
+// EmbedPDF(annot-identity): a handle whose annotation is gone unwraps to
+// null.
+CPDF_AnnotContext* CPDFAnnotContextFromFPDFAnnotation(FPDF_ANNOTATION annot) {
+  auto* context = reinterpret_cast<CPDF_AnnotContext*>(annot);
+  return context && context->IsValid() ? context : nullptr;
+}
+
+// EmbedPDF(view-scope): an annotation handle unwrapped with its document's
+// view scope open.
 ScopedFPDFAnnotationView::ScopedFPDFAnnotationView(
     FPDF_ANNOTATION annotation)
     : annotation_(CPDFAnnotContextFromFPDFAnnotation(annotation)),
@@ -267,9 +295,8 @@ FXDIB_Format FXDIBFormatFromFPDFFormat(int format) {
       return FXDIB_Format::kBgra;
 #if defined(PDF_USE_SKIA)
     case FPDFBitmap_BGRA_Premul:
-      return CFX_DefaultRenderDevice::UseSkiaRenderer()
-                 ? FXDIB_Format::kBgraPremul
-                 : FXDIB_Format::kInvalid;
+      return CFX_GEModule::IsSkiaRenderer() ? FXDIB_Format::kBgraPremul
+                                            : FXDIB_Format::kInvalid;
 #endif
     default:
       return FXDIB_Format::kInvalid;
@@ -279,7 +306,7 @@ FXDIB_Format FXDIBFormatFromFPDFFormat(int format) {
 void ValidateBitmapPremultiplyState(CFX_DIBitmap* bitmap) {
 #if defined(PDF_USE_SKIA)
   const bool should_be_premultiplied =
-      CFX_DefaultRenderDevice::UseSkiaRenderer() &&
+      CFX_GEModule::IsSkiaRenderer() &&
       bitmap->GetFormat() == FXDIB_Format::kBgraPremul;
   CHECK_EQ(should_be_premultiplied, bitmap->IsPremultiplied());
 #else
@@ -291,12 +318,6 @@ CPDFSDK_InteractiveForm* FormHandleToInteractiveForm(FPDF_FORMHANDLE hHandle) {
   CPDFSDK_FormFillEnvironment* pFormFillEnv =
       CPDFSDKFormFillEnvironmentFromFPDFFormHandle(hHandle);
   return pFormFillEnv ? pFormFillEnv->GetInteractiveForm() : nullptr;
-}
-
-ByteString ByteStringFromFPDFWideString(FPDF_WIDESTRING wide_string) {
-  // SAFETY: caller ensures `wide_string` is NUL-terminated and enforced
-  // by UNSAFE_BUFFER_USAGE in header file.
-  return UNSAFE_BUFFERS(WideStringFromFPDFWideString(wide_string).ToUTF8());
 }
 
 WideString WideStringFromFPDFWideString(FPDF_WIDESTRING wide_string) {
@@ -332,8 +353,10 @@ RetainPtr<const CPDF_Array> GetQuadPointsArrayFromDictionary(
 
 RetainPtr<CPDF_Array> GetMutableQuadPointsArrayFromDictionary(
     CPDF_Dictionary* dict) {
-  return pdfium::WrapRetain(
-      const_cast<CPDF_Array*>(GetQuadPointsArrayFromDictionary(dict).Get()));
+  // EmbedPDF(layer-door): the mutable accessor, so an indirect /QuadPoints
+  // opens through the document's write door (a layer transaction copies it
+  // up).
+  return dict->GetMutableArrayFor("QuadPoints");
 }
 
 RetainPtr<CPDF_Array> AddQuadPointsArrayToDictionary(CPDF_Dictionary* dict) {
@@ -458,7 +481,8 @@ void ReportUnsupportedFeatures(const CPDF_Document* doc) {
     RaiseUnsupportedError(FPDF_UNSP_DOC_PORTABLECOLLECTION);
   }
 
-  RetainPtr<const CPDF_Dictionary> pNameDict = pRootDict->GetDictFor("Names");
+  RetainPtr<const CPDF_Dictionary> pNameDict =
+      pRootDict->GetDictFor(pdfium::catalog::kNames);
   if (pNameDict) {
     if (pNameDict->KeyExist("EmbeddedFiles")) {
       RaiseUnsupportedError(FPDF_UNSP_DOC_ATTACHMENT);

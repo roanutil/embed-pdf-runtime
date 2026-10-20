@@ -9,6 +9,12 @@ source_set("edit") {
   sources = [
     "cpdf_creator.cpp",
     "cpdf_creator.h",
+    "cpdf_font_util.cpp",
+    "cpdf_font_util.h",
+    "cpdf_fontsubsetter.cpp",
+    "cpdf_fontsubsetter.h",
+    "cpdf_image_redactor.cpp",
+    "cpdf_image_redactor.h",
     "cpdf_npagetooneexporter.cpp",
     "cpdf_npagetooneexporter.h",
     "cpdf_pagecontentgenerator.cpp",
@@ -21,8 +27,12 @@ source_set("edit") {
     "cpdf_pageorganizer.h",
     "cpdf_path_redactor.cpp",
     "cpdf_path_redactor.h",
+    "cpdf_redaction_copies.cpp",
+    "cpdf_redaction_copies.h",
     "cpdf_redaction_mark_sanitizer.cpp",
     "cpdf_redaction_mark_sanitizer.h",
+    "cpdf_resourceuse.cpp",
+    "cpdf_resourceuse.h",
     "cpdf_save_object_reader.cpp",
     "cpdf_save_object_reader.h",
     "cpdf_save_trailer.cpp",
@@ -31,18 +41,25 @@ source_set("edit") {
     "cpdf_stringarchivestream.h",
     "cpdf_text_redactor.cpp",
     "cpdf_text_redactor.h",
+    "cpdf_tounicodecmap.cpp",
+    "cpdf_tounicodecmap.h",
+    "cpdf_type3_redactor.cpp",
+    "cpdf_type3_redactor.h",
   ]
   configs += [
     "../../../:pdfium_strict_config",
     "../../../:pdfium_noshorten_config",
   ]
-  deps = [
-    ":contentstream_write_utils",
-    "../../../constants",
+  public_deps = [
     "../../fxcrt",
+    "../parser",
+  ]
+  deps = [
+    "../../../constants",
+    "../../fxge",
     "../font",
     "../page",
-    "../parser",
+    "//third_party/harfbuzz",
   ]
   if (pdf_use_skia) {
     deps += [ "../../../skia" ]
@@ -52,29 +69,20 @@ source_set("edit") {
   visibility = [ "../../../*" ]
 }
 
-source_set("contentstream_write_utils") {
-  sources = [
-    "cpdf_contentstream_write_utils.cpp",
-    "cpdf_contentstream_write_utils.h",
-  ]
-  configs += [
-    "../../../:pdfium_strict_config",
-    "../../../:pdfium_noshorten_config",
-  ]
-  deps = [ "../../fxcrt" ]
-}
-
 pdfium_unittest_source_set("unittests") {
   sources = [
     "cpdf_creator_unittest.cpp",
-    "cpdf_save_trailer_unittest.cpp",
     "cpdf_npagetooneexporter_unittest.cpp",
     "cpdf_pagecontentgenerator_unittest.cpp",
     "cpdf_path_redactor_unittest.cpp",
+    "cpdf_redaction_copies_unittest.cpp",
+    "cpdf_save_trailer_unittest.cpp",
     "cpdf_text_redactor_unittest.cpp",
+    "cpdf_tounicodecmap_unittest.cpp",
   ]
   deps = [
     ":edit",
+    "../../fxcrt",
     "../../fxge",
     "../font",
     "../page",
@@ -91,6 +99,17 @@ pdfium_unittest_source_set("unittests") {
 }
 
 pdfium_embeddertest_source_set("embeddertests") {
-  sources = [ "cpdf_creator_embeddertest.cpp" ]
+  sources = [
+    "cpdf_creator_embeddertest.cpp",
+    "cpdf_fontsubsetter_embeddertest.cpp",
+  ]
+  deps = [
+    ":edit",
+    "../../../testing:path_service",
+    "../../../testing:test_support",
+    "../../fxge",
+    "../font",
+    "../parser",
+  ]
   pdfium_root_dir = "../../../"
 }

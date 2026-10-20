@@ -27,7 +27,7 @@
 
 #if defined(PDF_USE_SKIA)
 #include "core/fxcrt/data_vector.h"
-#include "core/fxge/cfx_defaultrenderdevice.h"
+#include "core/fxge/cfx_gemodule.h"
 #include "third_party/skia/include/core/SkImage.h"   // nogncheck
 #include "third_party/skia/include/core/SkRefCnt.h"  // nogncheck
 #endif
@@ -57,8 +57,7 @@ class CachedImage final : public CFX_DIBBase {
     SetPitch(image_->GetPitch());
 
     if (image_->HasPalette()) {
-      pdfium::span<const uint32_t> palette = image_->GetPaletteSpan();
-      palette_ = DataVector<uint32_t>(palette.begin(), palette.end());
+      palette_ = ToDataVector(image_->GetPaletteSpan());
     }
   }
 
@@ -102,7 +101,7 @@ class CachedImage final : public CFX_DIBBase {
 RetainPtr<CFX_DIBBase> MakeCachedImage(RetainPtr<CFX_DIBBase> image,
                                        bool realize_hint) {
 #if defined(PDF_USE_SKIA)
-  if (CFX_DefaultRenderDevice::UseSkiaRenderer()) {
+  if (CFX_GEModule::IsSkiaRenderer()) {
     // Ignore `realize_hint`, as `RealizeSkImage()` doesn't benefit from it.
     return pdfium::MakeRetain<CachedImage>(std::move(image));
   }
@@ -224,6 +223,11 @@ bool CPDF_PageImageCache::Continue(PauseIndicatorIface* pPause) {
 
 void CPDF_PageImageCache::ResetBitmapForImage(RetainPtr<CPDF_Image> pImage) {
   RetainPtr<const CPDF_Stream> pStream = pImage->GetStream();
+  // EmbedPDF(decoded-image-store): resetting an image's bitmap drops its
+  // stored decodes too.
+  if (CPDF_DecodedImageStore* store = CPDF_DecodedImageStore::Get()) {
+    store->DropStream(pStream.Get());
+  }
   const auto it = image_cache_.find(pStream);
   if (it == image_cache_.end()) {
     return;
@@ -279,6 +283,35 @@ CPDF_DIB::LoadState CPDF_PageImageCache::Entry::StartGetCachedBitmap(
     return CPDF_DIB::LoadState::kSuccess;
   }
 
+  // EmbedPDF(decoded-image-store): consulted only where the cache would
+  // decode; a stored decode leaves the entry as a new decode would.
+  store_key_ = CPDF_DecodedImageStore::KeyFor(*image_, pPageResources, bStdCS,
+                                              eFamily, bLoadMask);
+  if (store_key_) {
+    // The levels StartLoadDIBBase() would compute, from the same dictionary.
+    RetainPtr<const CPDF_Dictionary> dict = image_->GetStream()->GetDict();
+    store_levels_ = CPDF_DIB::ResolutionLevelsToSkip(
+        dict->GetIntegerFor("Width"), dict->GetIntegerFor("Height"),
+        max_size_required);
+    std::optional<CPDF_DecodedImageStore::Decoded> decoded =
+        CPDF_DecodedImageStore::Get()->Find(store_key_.value(), store_levels_);
+    if (decoded.has_value()) {
+      // Leave what a decode that completes at once leaves: see below and
+      // ContinueGetCachedBitmap().
+      store_key_.reset();
+      cached_set_max_size_required_ =
+          (max_size_required.width != 0 && max_size_required.height != 0);
+      matte_color_ = decoded->matte_color;
+      time_count_ = pPageImageCache->GetTimeCount();
+      cached_bitmap_ = std::move(decoded->bitmap);
+      cached_mask_ = std::move(decoded->mask);
+      cur_bitmap_ = cached_bitmap_;
+      cur_mask_ = cached_mask_;
+      CalcSize();
+      return CPDF_DIB::LoadState::kFail;
+    }
+  }
+
   cur_bitmap_ = image_->CreateNewDIB();
   CPDF_DIB::LoadState ret = cur_bitmap_.AsRaw<CPDF_DIB>()->StartLoadDIBBase(
       true, pFormResources, pPageResources, bStdCS, eFamily, bLoadMask,
@@ -314,17 +347,50 @@ bool CPDF_PageImageCache::Entry::Continue(
   return false;
 }
 
+// EmbedPDF(decoded-image-store): decide whether the store keeps this decode:
+// it must fit, and a JPX or DCT decode must skip the levels its key asked for.
+// A huge image the store keeps is decoded in full; the bitmap holds the same
+// rows.
 void CPDF_PageImageCache::Entry::ContinueGetCachedBitmap(
     CPDF_PageImageCache* pPageImageCache) {
-  matte_color_ = cur_bitmap_.AsRaw<CPDF_DIB>()->GetMatteColor();
+  const CPDF_DIB* dib = cur_bitmap_.AsRaw<CPDF_DIB>();
+  matte_color_ = dib->GetMatteColor();
   cur_mask_ = cur_bitmap_.AsRaw<CPDF_DIB>()->DetachMask();
   time_count_ = pPageImageCache->GetTimeCount();
-  if (cur_bitmap_->GetPitch() * cur_bitmap_->GetHeight() < kHugeImageSize) {
+
+  std::optional<CPDF_DecodedImageStore::Key> store_key =
+      std::exchange(store_key_, std::nullopt);
+  std::optional<uint8_t> levels_skipped;
+  if (dib->SkipsResolutionLevels()) {
+    levels_skipped = dib->resolution_levels_to_skip();
+    // Keep only what a request with the key's levels would decode.
+    if (levels_skipped.value() != store_levels_) {
+      store_key.reset();
+    }
+  }
+  const size_t bytes = cur_bitmap_->GetPitch() * cur_bitmap_->GetHeight();
+  const size_t mask_bytes =
+      cur_mask_ ? cur_mask_->GetPitch() * cur_mask_->GetHeight() : 0;
+  if (store_key && !CPDF_DecodedImageStore::Get()->Fits(bytes + mask_bytes)) {
+    store_key.reset();
+  }
+
+  RetainPtr<CFX_DIBBase> decoded;
+  if (bytes < kHugeImageSize) {
     cached_bitmap_ = MakeCachedImage(cur_bitmap_, /*realize_hint=*/true);
     cur_bitmap_.Reset();
+  } else if (store_key &&
+             (decoded = MakeCachedImage(cur_bitmap_, /*realize_hint=*/true))) {
+    // The store keeps decoded bitmaps, so a huge image it keeps is decoded in
+    // full now. The bitmap holds the rows the decoder gives, so it renders
+    // the same bytes.
+    cached_bitmap_ = std::move(decoded);
+    cur_bitmap_.Reset();
   } else {
+    store_key.reset();
     cached_bitmap_ = MakeCachedImage(cur_bitmap_, /*realize_hint=*/false);
   }
+  const bool has_mask = !!cur_mask_;
   if (cur_mask_) {
     cached_mask_ = MakeCachedImage(cur_mask_, /*realize_hint=*/true);
     cur_mask_.Reset();
@@ -332,6 +398,17 @@ void CPDF_PageImageCache::Entry::ContinueGetCachedBitmap(
   cur_bitmap_ = cached_bitmap_;
   cur_mask_ = cached_mask_;
   CalcSize();
+
+  // EmbedPDF(decoded-image-store): keep the finished decode, with its mask,
+  // for later page loads.
+  if (store_key && cached_bitmap_ && (cached_mask_ || !has_mask)) {
+    CPDF_DecodedImageStore::Decoded kept;
+    kept.bitmap = cached_bitmap_;
+    kept.mask = cached_mask_;
+    kept.matte_color = matte_color_;
+    CPDF_DecodedImageStore::Get()->Insert(store_key.value(), kept,
+                                          levels_skipped);
+  }
 }
 
 void CPDF_PageImageCache::Entry::CalcSize() {

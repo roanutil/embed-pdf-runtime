@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+#include "constants/catalog.h"
 #include "core/fpdfapi/parser/cpdf_array.h"
 #include "core/fpdfapi/parser/cpdf_dictionary.h"
 #include "core/fpdfapi/parser/cpdf_document.h"
@@ -30,22 +31,42 @@ struct NodeToInsert {
   int index = -1;
 };
 
-std::pair<WideString, WideString> GetNodeLimitsAndSanitize(
-    CPDF_Array* pLimits) {
-  DCHECK(pLimits);
-  WideString csLeft = pLimits->GetUnicodeTextAt(0);
-  WideString csRight = pLimits->GetUnicodeTextAt(1);
+// EmbedPDF(reads-dont-write): `write_back` is false for a lookup, which reads
+// the limits in order and writes nothing: no padding, no reordering.
+std::pair<WideString, WideString> GetNodeLimits(CPDF_Array* limits,
+                                                bool write_back = true) {
+  if (!write_back) {
+    WideString left = limits->GetUnicodeTextAt(0);
+    WideString right = limits->GetUnicodeTextAt(1);
+    if (left.Compare(right) > 0) {
+      std::swap(left, right);
+    }
+    return {std::move(left), std::move(right)};
+  }
+
+  while (limits->size() < 2) {
+    limits->AppendNew<CPDF_String>("");
+  }
+
+  RetainPtr<CPDF_Object> obj0 = limits->GetMutableObjectAt(0);
+  RetainPtr<CPDF_Object> obj1 = limits->GetMutableObjectAt(1);
+  WideString left = obj0->GetUnicodeText();
+  WideString right = obj1->GetUnicodeText();
+
   // If the lower limit is greater than the upper limit, swap them.
-  if (csLeft.Compare(csRight) > 0) {
-    pLimits->SetNewAt<CPDF_String>(0, csRight.AsStringView());
-    pLimits->SetNewAt<CPDF_String>(1, csLeft.AsStringView());
-    csLeft = pLimits->GetUnicodeTextAt(0);
-    csRight = pLimits->GetUnicodeTextAt(1);
+  if (left.Compare(right) > 0) {
+    std::swap(left, right);
+    limits->SetAt(0, std::move(obj1));
+    limits->SetAt(1, std::move(obj0));
   }
-  while (pLimits->size() > 2) {
-    pLimits->RemoveAt(pLimits->size() - 1);
+
+  return {std::move(left), std::move(right)};
+}
+
+void TrimNodeLimits(CPDF_Array* limits) {
+  while (limits->size() > 2) {
+    limits->RemoveAt(limits->size() - 1);
   }
-  return {csLeft, csRight};
 }
 
 // Get the limit arrays that leaf array |pFind| is under in the tree with root
@@ -108,7 +129,8 @@ bool UpdateNodesAndLimitsUponDeletion(CPDF_Dictionary* pNode,
   WideString csLeft;
   WideString csRight;
   if (pLimits) {
-    std::tie(csLeft, csRight) = GetNodeLimitsAndSanitize(pLimits.Get());
+    TrimNodeLimits(pLimits.Get());
+    std::tie(csLeft, csRight) = GetNodeLimits(pLimits.Get());
   }
 
   RetainPtr<const CPDF_Array> pNames = pNode->GetArrayFor("Names");
@@ -242,13 +264,21 @@ RetainPtr<const CPDF_Object> SearchNameNodeByNameInternal(
   }
 
   if (pLimits) {
-    auto [csLeft, csRight] = GetNodeLimitsAndSanitize(pLimits.Get());
+    // When lookup-only: do not truncate the /Limits array.
+    // EmbedPDF(reads-dont-write): nor reorder or pad it (GetNodeLimits()).
+    const bool lookup_only = !node_to_insert;
+    if (!lookup_only) {
+      TrimNodeLimits(pLimits.Get());
+    }
+    auto [left, right] =
+        GetNodeLimits(pLimits.Get(), /*write_back=*/!lookup_only);
+
     // Skip this node if the name to look for is smaller than its lower limit.
-    if (csName.Compare(csLeft) < 0) {
+    if (csName.Compare(left) < 0) {
       return nullptr;
     }
 
-    if (csName.Compare(csRight) > 0) {
+    if (csName.Compare(right) > 0) {
       // If only trying to find the name node, and not where the name should be
       // added, skip this node.
       if (!node_to_insert) {
@@ -353,8 +383,8 @@ std::optional<IndexSearchResult> SearchNameNodeByIndexInternal(
     }
 
     size_t index = 2 * (nTargetPairIndex - *nCurPairIndex);
-    // EmbedPDF: a pair whose value does not resolve (a reference to a
-    // missing object) is still the pair at this index. Bailing here used to
+    // EmbedPDF(bug-fix): a pair whose value does not resolve (a reference to
+    // a missing object) is still the pair at this index. Bailing here used to
     // desynchronize `nCurPairIndex` from GetCount() and hide the key, so a
     // dangling entry could be neither reported nor deleted. Callers already
     // handle a null value.
@@ -447,7 +477,8 @@ RetainPtr<const CPDF_Array> GetNamedDestFromObject(
 
 RetainPtr<const CPDF_Array> LookupOldStyleNamedDest(CPDF_Document* doc,
                                                     const ByteString& name) {
-  RetainPtr<const CPDF_Dictionary> pDests = doc->GetRoot()->GetDictFor("Dests");
+  RetainPtr<const CPDF_Dictionary> pDests =
+      doc->GetRoot()->GetDictFor(pdfium::catalog::kDests);
   if (!pDests) {
     return nullptr;
   }
@@ -457,6 +488,7 @@ RetainPtr<const CPDF_Array> LookupOldStyleNamedDest(CPDF_Document* doc,
 
 }  // namespace
 
+// EmbedPDF(reads-dont-write): a tree knows whether it may be written.
 CPDF_NameTree::CPDF_NameTree(RetainPtr<CPDF_Dictionary> pRoot, bool read_only)
     : root_(std::move(pRoot)), read_only_(read_only) {
   DCHECK(root_);
@@ -472,7 +504,8 @@ std::unique_ptr<CPDF_NameTree> CPDF_NameTree::Create(CPDF_Document* doc,
     return nullptr;
   }
 
-  RetainPtr<CPDF_Dictionary> pNames = pRoot->GetMutableDictFor("Names");
+  RetainPtr<CPDF_Dictionary> pNames =
+      pRoot->GetMutableDictFor(pdfium::catalog::kNames);
   if (!pNames) {
     return nullptr;
   }
@@ -482,10 +515,13 @@ std::unique_ptr<CPDF_NameTree> CPDF_NameTree::Create(CPDF_Document* doc,
     return nullptr;
   }
 
+  // EmbedPDF(reads-dont-write): this tree may be written.
   return pdfium::WrapUnique(
       new CPDF_NameTree(std::move(pCategory), /*read_only=*/false));
 }
 
+// EmbedPDF(reads-dont-write): a tree for reading: found through const getters,
+// and it refuses writes.
 // static
 std::unique_ptr<CPDF_NameTree> CPDF_NameTree::CreateForReading(
     CPDF_Document* doc,
@@ -523,10 +559,12 @@ std::unique_ptr<CPDF_NameTree> CPDF_NameTree::CreateWithRootNameArray(
   }
 
   // Retrieve the document's Names dictionary; create it if missing.
-  RetainPtr<CPDF_Dictionary> pNames = pRoot->GetMutableDictFor("Names");
+  RetainPtr<CPDF_Dictionary> pNames =
+      pRoot->GetMutableDictFor(pdfium::catalog::kNames);
   if (!pNames) {
     pNames = doc->NewIndirect<CPDF_Dictionary>();
-    pRoot->SetNewFor<CPDF_Reference>("Names", doc, pNames->GetObjNum());
+    pRoot->SetNewFor<CPDF_Reference>(pdfium::catalog::kNames, doc,
+                                     pNames->GetObjNum());
   }
 
   // Create the |category| dictionary if missing.
@@ -538,12 +576,14 @@ std::unique_ptr<CPDF_NameTree> CPDF_NameTree::CreateWithRootNameArray(
                                       pCategory->GetObjNum());
   }
 
+  // EmbedPDF(reads-dont-write): this tree may be written.
   return pdfium::WrapUnique(new CPDF_NameTree(pCategory, /*read_only=*/false));
 }
 
 // static
 std::unique_ptr<CPDF_NameTree> CPDF_NameTree::CreateForTesting(
     CPDF_Dictionary* pRoot) {
+  // EmbedPDF(reads-dont-write): this tree may be written.
   return pdfium::WrapUnique(
       new CPDF_NameTree(pdfium::WrapRetain(pRoot), /*read_only=*/false));
 }
@@ -553,6 +593,8 @@ RetainPtr<const CPDF_Array> CPDF_NameTree::LookupNamedDest(
     CPDF_Document* doc,
     const ByteString& name) {
   RetainPtr<const CPDF_Array> dest_array;
+  // EmbedPDF(reads-dont-write): a lookup opens the tree for reading; Create()
+  // takes it through the mutable getters.
   std::unique_ptr<CPDF_NameTree> name_tree = CreateForReading(doc, "Dests");
   if (name_tree) {
     dest_array = name_tree->LookupNewStyleNamedDest(name);
@@ -570,11 +612,13 @@ size_t CPDF_NameTree::GetCount() const {
 
 bool CPDF_NameTree::AddValueAndName(RetainPtr<CPDF_Object> pObj,
                                     const WideString& name) {
+  // EmbedPDF(reads-dont-write): a tree opened for reading is never written.
   CHECK(!read_only_);
   NodeToInsert node_to_insert;
   // Handle the corner case where the root node is empty. i.e. No kids and no
   // names. In which case, just insert into it and skip all the searches.
-  RetainPtr<CPDF_Array> pNames = root_->GetMutableArrayFor("Names");
+  RetainPtr<CPDF_Array> pNames =
+      root_->GetMutableArrayFor(pdfium::catalog::kNames);
   if (pNames && pNames->IsEmpty() && !root_->GetArrayFor("Kids")) {
     node_to_insert.names = pNames;
   }
@@ -631,6 +675,7 @@ bool CPDF_NameTree::AddValueAndName(RetainPtr<CPDF_Object> pObj,
 }
 
 bool CPDF_NameTree::DeleteValueAndName(size_t nIndex) {
+  // EmbedPDF(reads-dont-write): a tree opened for reading is never written.
   CHECK(!read_only_);
   std::optional<IndexSearchResult> result =
       SearchNameNodeByIndex(root_.Get(), nIndex);

@@ -14,6 +14,8 @@
 #include "core/fxcrt/span.h"
 #include "core/fxcrt/unowned_ptr.h"
 
+// EmbedPDF(redaction): for GetFontResources().
+class CPDF_Dictionary;
 class CPDF_Document;
 class CPDF_Font;
 
@@ -39,15 +41,26 @@ class CPDF_TextState {
   ~CPDF_TextState();
 
   void Emplace();
+  // EmbedPDF(faithful-content-rewrite, redaction): whether there is a state
+  // to read (a page object made through the API may have none).
+  bool HasRef() const { return !!ref_; }
 
   RetainPtr<CPDF_Font> GetFont() const;
   void SetFont(RetainPtr<CPDF_Font> font);
 
+  // EmbedPDF(redaction): the resources of the content whose Tf selected the
+  // font. It looked the name up in them, and a Type3 font without /Resources
+  // draws its glyphs with them (CPDF_Type3Font::SetPageResources()). Text a
+  // form shows in a font the content around it selected carries that
+  // content's.
+  RetainPtr<const CPDF_Dictionary> GetFontResources() const;
+  void SetFontResources(RetainPtr<const CPDF_Dictionary> resources);
+
   float GetFontSize() const;
   void SetFontSize(float size);
 
-  pdfium::span<const float> GetMatrix() const;
-  pdfium::span<float> GetMutableMatrix();
+  pdfium::span<const float, 4> GetMatrix() const;
+  pdfium::span<float, 4> GetMutableMatrix();
 
   float GetCharSpace() const;
   void SetCharSpace(float sp);
@@ -60,8 +73,8 @@ class CPDF_TextState {
   TextRenderingMode GetTextMode() const;
   void SetTextMode(TextRenderingMode mode);
 
-  pdfium::span<const float> GetCTM() const;
-  pdfium::span<float> GetMutableCTM();
+  pdfium::span<const float, 4> GetCTM() const;
+  pdfium::span<float, 4> GetMutableCTM();
 
  private:
   class TextData final : public Retainable {
@@ -75,6 +88,8 @@ class CPDF_TextState {
     float GetFontSizeH() const;
 
     RetainPtr<CPDF_Font> font_;
+    // EmbedPDF(redaction): see GetFontResources().
+    RetainPtr<const CPDF_Dictionary> font_resources_;
     UnownedPtr<const CPDF_Document> document_;
     float font_size_ = 1.0f;
     float char_space_ = 0.0f;

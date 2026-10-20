@@ -21,6 +21,7 @@
 #include "core/fxcrt/fx_safe_types.h"
 #include "core/fxcrt/span.h"
 #include "core/fxcrt/stl_util.h"
+#include "third_party/abseil-cpp/absl/cleanup/cleanup.h"
 
 namespace {
 
@@ -52,7 +53,7 @@ int CPVT_VariableText::Provider::GetCharWidth(int32_t nFontIndex,
     return 0;
   }
 
-  return pPDFFont->GetCharWidthF(charcode);
+  return pPDFFont->GetCharWidth(charcode);
 }
 
 int32_t CPVT_VariableText::Provider::GetTypeAscent(int32_t nFontIndex) {
@@ -68,8 +69,9 @@ int32_t CPVT_VariableText::Provider::GetTypeDescent(int32_t nFontIndex) {
 int32_t CPVT_VariableText::Provider::GetWordFontIndex(uint16_t word,
                                                       FX_Charset charset,
                                                       int32_t nFontIndex) {
-  // EmbedPDF: delegate font choice to IPVT_FontMap so CPDF_AnnotFontMap can
-  // route individual FreeText glyphs to registered fallback fonts.
+  // EmbedPDF(fonts): delegate font choice to IPVT_FontMap so
+  // CPDF_AnnotFontMap can route individual FreeText glyphs to registered
+  // fallback fonts.
   return font_map_->GetWordFontIndex(word, charset, nFontIndex);
 }
 
@@ -89,6 +91,23 @@ void CPVT_VariableText::Iterator::SetAt(int32_t nWordIndex) {
 
 void CPVT_VariableText::Iterator::SetAt(const CPVT_WordPlace& place) {
   cur_pos_ = place;
+}
+
+float CPVT_VariableText::Iterator::GetLineCaretX(const CPVT_Line& line) {
+  absl::Cleanup scoped_set_at = [this, old_place = GetWordPlace()] {
+    SetAt(old_place);
+  };
+  SetAt(line.lineplace);
+
+  if (NextWord()) {
+    CPVT_Word first_word;
+    if (GetWord(first_word) && GetWordPlace().LineCmp(line.lineplace) == 0 &&
+        first_word.is_rtl()) {
+      return line.ptLine.x + line.fLineWidth;
+    }
+  }
+
+  return line.ptLine.x;
 }
 
 bool CPVT_VariableText::Iterator::NextWord() {
@@ -119,7 +138,6 @@ bool CPVT_VariableText::Iterator::NextLine() {
 }
 
 bool CPVT_VariableText::Iterator::GetWord(CPVT_Word& word) const {
-  word.WordPlace = cur_pos_;
   if (!fxcrt::IndexInBounds(vt_->section_array_, cur_pos_.nSecIndex)) {
     return false;
   }
@@ -134,16 +152,13 @@ bool CPVT_VariableText::Iterator::GetWord(CPVT_Word& word) const {
     return false;
   }
 
-  word.Word = pInfo->Word;
-  word.nCharset = pInfo->nCharset;
-  word.fWidth = vt_->GetWordWidth(*pInfo);
-  word.ptWord =
+  word = CPVT_Word(
+      pInfo->Word, pInfo->nCharset,
       vt_->InToOut(CFX_PointF(pInfo->fWordX + pSection->GetRect().left,
-                              pInfo->fWordY + pSection->GetRect().top));
-  word.fAscent = vt_->GetWordAscent(*pInfo);
-  word.fDescent = vt_->GetWordDescent(*pInfo);
-  word.nFontIndex = pInfo->nFontIndex;
-  word.fFontSize = vt_->GetWordFontSize();
+                              pInfo->fWordY + pSection->GetRect().top)),
+      vt_->GetWordAscent(*pInfo), vt_->GetWordDescent(*pInfo),
+      vt_->GetWordWidth(*pInfo), pInfo->nFontIndex, vt_->GetFontSize(),
+      pInfo->is_rtl);
   return true;
 }
 
@@ -620,10 +635,6 @@ const CFX_FloatRect& CPVT_VariableText::GetPlateRect() const {
   return plate_rect_;
 }
 
-float CPVT_VariableText::GetWordFontSize() const {
-  return GetFontSize();
-}
-
 float CPVT_VariableText::GetWordWidth(int32_t nFontIndex,
                                       uint16_t Word,
                                       uint16_t SubWord,
@@ -635,7 +646,7 @@ float CPVT_VariableText::GetWordWidth(int32_t nFontIndex,
 
 float CPVT_VariableText::GetWordWidth(const CPVT_WordInfo& WordInfo) const {
   return GetWordWidth(WordInfo.nFontIndex, WordInfo.Word, GetSubWord(),
-                      GetWordFontSize(), WordInfo.fWordTail);
+                      GetFontSize(), WordInfo.fWordTail);
 }
 
 float CPVT_VariableText::GetLineAscent() {
@@ -669,11 +680,11 @@ float CPVT_VariableText::GetWordDescent(const CPVT_WordInfo& WordInfo,
 }
 
 float CPVT_VariableText::GetWordAscent(const CPVT_WordInfo& WordInfo) const {
-  return GetFontAscent(WordInfo.nFontIndex, GetWordFontSize());
+  return GetFontAscent(WordInfo.nFontIndex, GetFontSize());
 }
 
 float CPVT_VariableText::GetWordDescent(const CPVT_WordInfo& WordInfo) const {
-  return GetFontDescent(WordInfo.nFontIndex, GetWordFontSize());
+  return GetFontDescent(WordInfo.nFontIndex, GetFontSize());
 }
 
 float CPVT_VariableText::GetLineLeading() {
@@ -948,10 +959,6 @@ CPVT_VariableText::Provider* CPVT_VariableText::GetProvider() {
 
 CFX_PointF CPVT_VariableText::GetBTPoint() const {
   return CFX_PointF(plate_rect_.left, plate_rect_.top);
-}
-
-CFX_PointF CPVT_VariableText::GetETPoint() const {
-  return CFX_PointF(plate_rect_.right, plate_rect_.bottom);
 }
 
 CFX_PointF CPVT_VariableText::InToOut(const CFX_PointF& point) const {

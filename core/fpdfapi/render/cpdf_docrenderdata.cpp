@@ -19,6 +19,7 @@
 #include "core/fpdfapi/page/cpdf_transferfunc.h"
 #include "core/fpdfapi/parser/cpdf_array.h"
 #include "core/fpdfapi/parser/cpdf_document.h"
+#include "core/fpdfapi/parser/cpdf_object_walker.h"
 #include "core/fpdfapi/render/cpdf_type3cache.h"
 #include "core/fxcrt/compiler_specific.h"
 #include "core/fxcrt/fixed_size_data_vector.h"
@@ -40,6 +41,7 @@ CPDF_DocRenderData* CPDF_DocRenderData::FromDocument(const CPDF_Document* doc) {
 
 CPDF_DocRenderData::CPDF_DocRenderData() = default;
 
+// EmbedPDF(layer-seam): a layer's render data falls back to its base's.
 CPDF_DocRenderData::CPDF_DocRenderData(CPDF_DocRenderData* fallback)
     : fallback_(fallback) {}
 
@@ -53,6 +55,7 @@ RetainPtr<CPDF_Type3Cache> CPDF_DocRenderData::GetCachedType3(
     return pdfium::WrapRetain(it->second.Get());
   }
 
+  // EmbedPDF(layer-seam): an unpromoted base font uses the base's cache.
   if (fallback_ && font->GetFontDictObjNum() != 0 &&
       !GetDocument()->IsObjectPromoted(font->GetFontDictObjNum())) {
     return fallback_->GetCachedType3(font);
@@ -63,6 +66,18 @@ RetainPtr<CPDF_Type3Cache> CPDF_DocRenderData::GetCachedType3(
   return cache;
 }
 
+// EmbedPDF(layer-transaction): forget transfer functions derived from object
+// versions a commit or abort left unreachable.
+void CPDF_DocRenderData::ForgetObjectTree(const CPDF_Object* root) {
+  CPDF_ObjectWalker walker(pdfium::WrapRetain(root));
+  while (RetainPtr<const CPDF_Object> object = walker.GetNext()) {
+    auto it = transfer_func_map_.find(object);
+    if (it != transfer_func_map_.end()) {
+      transfer_func_map_.erase(it);
+    }
+  }
+}
+
 RetainPtr<CPDF_TransferFunc> CPDF_DocRenderData::GetTransferFunc(
     RetainPtr<const CPDF_Object> obj) {
   CHECK(obj);
@@ -71,6 +86,7 @@ RetainPtr<CPDF_TransferFunc> CPDF_DocRenderData::GetTransferFunc(
     return pdfium::WrapRetain(it->second.Get());
   }
 
+  // EmbedPDF(layer-seam): an unpromoted base object uses the base's cache.
   if (fallback_ && CanUseFallbackForObject(obj.Get())) {
     return fallback_->GetTransferFunc(obj);
   }
@@ -80,6 +96,8 @@ RetainPtr<CPDF_TransferFunc> CPDF_DocRenderData::GetTransferFunc(
   return func;
 }
 
+// EmbedPDF(layer-seam): an indirect object the layer hasn't promoted reads the
+// same in the base, so the base's render data serves it.
 bool CPDF_DocRenderData::CanUseFallbackForObject(
     const CPDF_Object* object) const {
   if (!object) {
@@ -109,8 +127,8 @@ RetainPtr<CPDF_TransferFunc> CPDF_DocRenderData::CreateTransferFunc(
     }
 
     for (uint32_t i = 0; i < 3; ++i) {
-      pFuncs[2 - i] = CPDF_Function::Load(pArray->GetDirectObjectAt(i));
-      if (!pFuncs[2 - i]) {
+      pFuncs[i] = CPDF_Function::Load(pArray->GetDirectObjectAt(i));
+      if (!pFuncs[i]) {
         return nullptr;
       }
     }
@@ -143,7 +161,7 @@ RetainPtr<CPDF_TransferFunc> CPDF_DocRenderData::CreateTransferFunc(
           continue;
         }
         pFuncs[i]->Call(pdfium::span_from_ref(input), output);
-        size_t o = FXSYS_roundf(output[0] * 255);
+        uint8_t o = std::clamp(FXSYS_roundf(output[0] * 255.0f), 0, 255);
         if (o != v) {
           bIdentity = false;
         }
@@ -156,7 +174,7 @@ RetainPtr<CPDF_TransferFunc> CPDF_DocRenderData::CreateTransferFunc(
       if (pFuncs[0]->OutputCount() <= kMaxOutputs) {
         pFuncs[0]->Call(pdfium::span_from_ref(input), output);
       }
-      size_t o = FXSYS_roundf(output[0] * 255);
+      uint8_t o = std::clamp(FXSYS_roundf(output[0] * 255.0f), 0, 255);
       if (o != v) {
         bIdentity = false;
       }

@@ -20,10 +20,13 @@
 #include "core/fpdfapi/parser/cpdf_stream_acc.h"
 #include "core/fpdfapi/parser/cpdf_string.h"
 #include "core/fpdfdoc/cpdf_annotfontmap.h"
-#include "core/fpdfdoc/cpdf_generateap.h"
+#include "core/fpdfdoc/cpdf_appearancegenerator.h"
 #include "fpdfsdk/cpdfsdk_helpers.h"
 #include "public/cpp/fpdf_scopers.h"
+#include "public/epdf_annot.h"
 #include "public/epdf_font.h"
+#include "public/epdf_layer.h"
+#include "public/epdf_save.h"
 #include "public/fpdf_edit.h"
 #include "public/fpdf_save.h"
 #include "testing/embedder_test.h"
@@ -526,7 +529,8 @@ TEST_F(EPDFMeasureEmbedderTest, LineAppearanceLeadersInlineGapAndStableBounds) {
             ap.find(L"100 130 m 300 130 l S"));  // inline gap
   FS_RECTF before, after;
   ASSERT_TRUE(FPDFAnnot_GetRect(a.get(), &before));
-  EXPECT_GT(before.top, 135);
+  // The leaders reach 135, and their butt ends stop there.
+  EXPECT_FLOAT_EQ(135, before.top);
   ASSERT_TRUE(EPDFAnnot_GenerateAppearance(a.get()));
   ASSERT_TRUE(FPDFAnnot_GetRect(a.get(), &after));
   EXPECT_FLOAT_EQ(before.top, after.top);
@@ -566,8 +570,9 @@ TEST_F(EPDFMeasureEmbedderTest, ShortDistanceOmitsShaftAndBoundsCanShrink) {
   EXPECT_NE(std::wstring::npos, appearance.find(L"130 85 m 150 85 l S"));
   FS_RECTF original;
   ASSERT_TRUE(FPDFAnnot_GetRect(annot.get(), &original));
-  EXPECT_LT(original.left, 80);
-  EXPECT_GT(original.right, 150);
+  // The stubs reach 80 and 150, and their butt ends stop there.
+  EXPECT_FLOAT_EQ(80, original.left);
+  EXPECT_FLOAT_EQ(150, original.right);
 
   EPDF_CAPTION_OFFSET offset{100, -150};
   ASSERT_TRUE(EPDFAnnot_SetLineCaption(annot.get(), true, EPDF_CAPTION_INLINE,
@@ -679,7 +684,7 @@ TEST_F(EPDFMeasureEmbedderTest, LayerAppearanceAndEphemeralRead) {
       CPDFAnnotContextFromFPDFAnnotation(a.get())->GetAnnotDict();
   auto before = doc->GetLastObjNum();
   const auto loaded_count = EPDFLayer_GetPromotedObjectCount(layer.layer);
-  auto generated = CPDF_GenerateAP::GenerateEphemeralAnnotAP(
+  auto generated = CPDF_AppearanceGenerator::GenerateEphemeralAnnotAP(
       doc, dict, CPDF_Annot::Subtype::LINE);
   ASSERT_TRUE(generated);
   EXPECT_EQ(before, doc->GetLastObjNum());
@@ -943,7 +948,8 @@ TEST_F(EPDFMeasureEmbedderTest, CaptionAppearanceGolden) {
   }
   auto bitmap = RenderPageWithFlags(page.get(), nullptr, FPDF_ANNOT);
   ASSERT_TRUE(bitmap);
-  CompareBitmapWithFuzzyExpectationSuffix(bitmap.get(), "measure_captions");
+  CompareBitmapWithExpectationSuffix(bitmap.get(), "measure_captions",
+                                     kFuzzyDiffOptions);
 }
 
 TEST_F(EPDFMeasureEmbedderTest,
@@ -954,7 +960,7 @@ TEST_F(EPDFMeasureEmbedderTest,
   } fonts;
   auto bytes =
       GetFileContents(PathService::GetThirdPartyFilePath(
-                          "harfbuzz-ng/src/perf/fonts/Roboto-Regular.ttf")
+                          "harfbuzz/src/perf/fonts/Roboto-Regular.ttf")
                           .c_str());
   ASSERT_FALSE(bytes.empty());
   auto id = EPDFFont_RegisterMemFont64("Roboto", 400, false, bytes.data(),
@@ -977,7 +983,7 @@ TEST_F(EPDFMeasureEmbedderTest,
       CPDFAnnotContextFromFPDFAnnotation(a.get())->GetAnnotDict();
   auto original = dict->Clone();
   auto objects = doc->GetLastObjNum();
-  auto generated = CPDF_GenerateAP::GenerateEphemeralAnnotAP(
+  auto generated = CPDF_AppearanceGenerator::GenerateEphemeralAnnotAP(
       doc, dict, CPDF_Annot::Subtype::LINE);
   ASSERT_TRUE(generated);
   ASSERT_TRUE(generated->font_lifetime);

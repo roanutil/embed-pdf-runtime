@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "core/fxcrt/cfx_datetime.h"
+#include "core/fxcrt/check.h"
 #include "core/fxcrt/check_op.h"
 #include "core/fxcrt/code_point_view.h"
 #include "core/fxcrt/compiler_specific.h"
@@ -35,7 +36,7 @@
 #include "fxjs/xfa/cfxjse_class.h"
 #include "fxjs/xfa/cfxjse_context.h"
 #include "fxjs/xfa/cfxjse_engine.h"
-#include "fxjs/xfa/cfxjse_value.h"
+#include "fxjs/xfa/cfxjse_isolatetracker.h"
 #include "fxjs/xfa/cjx_object.h"
 #include "v8/include/v8-container.h"
 #include "v8/include/v8-function-callback.h"
@@ -302,54 +303,50 @@ const FXJSE_FUNCTION_DESCRIPTOR kFormCalcFunctions[] = {
     {kFuncTag, "var_filter", CFXJSE_FormCalcContext::fm_var_filter},
 };
 
-const uint8_t kAltTableDate[] = {
+constexpr auto kAltTableDate = std::to_array<const uint8_t>({
     255, 255, 255, 3,   9,   255, 255, 255, 255, 255, 255,
     255, 2,   255, 255, 255, 255, 255, 255, 255, 255, 255,
     255, 255, 1,   255, 255, 255, 255, 255, 255, 255, 255,
-};
-static_assert(std::size(kAltTableDate) == L'a' - L'A' + 1,
-              "Invalid kAltTableDate size.");
+});
+static_assert(kAltTableDate.size() == L'a' - L'A' + 1);
 
-const uint8_t kAltTableTime[] = {
+constexpr auto kAltTableTime = std::to_array<const uint8_t>({
     14,  255, 255, 3,   9,   255, 255, 15,  255, 255, 255,
     255, 6,   255, 255, 255, 255, 255, 7,   255, 255, 255,
     255, 255, 1,   17,  255, 255, 255, 255, 255, 255, 255,
-};
-static_assert(std::size(kAltTableTime) == L'a' - L'A' + 1,
-              "Invalid kAltTableTime size.");
+});
+static_assert(kAltTableTime.size() == L'a' - L'A' + 1);
 
 void AlternateDateTimeSymbols(WideString* pPattern,
                               const WideString& wsAltSymbols,
                               bool bIsDate) {
-  const uint8_t* pAltTable = bIsDate ? kAltTableDate : kAltTableTime;
+  const auto& alt_table = bIsDate ? kAltTableDate : kAltTableTime;
   int32_t nLength = pPattern->GetLength();
   bool bInConstRange = false;
   bool bEscape = false;
   int32_t i = 0;
-  UNSAFE_TODO({
-    while (i < nLength) {
-      wchar_t wc = (*pPattern)[i];
-      if (wc == L'\'') {
-        bInConstRange = !bInConstRange;
-        if (bEscape) {
-          i++;
-        } else {
-          pPattern->Delete(i);
-          nLength--;
-        }
-        bEscape = !bEscape;
-        continue;
+  while (i < nLength) {
+    wchar_t wc = (*pPattern)[i];
+    if (wc == L'\'') {
+      bInConstRange = !bInConstRange;
+      if (bEscape) {
+        i++;
+      } else {
+        pPattern->Delete(i);
+        nLength--;
       }
-      if (!bInConstRange && wc >= L'A' && wc <= L'a') {
-        uint8_t nAlt = pAltTable[wc - L'A'];
-        if (nAlt != 255) {
-          pPattern->SetAt(i, wsAltSymbols[nAlt]);
-        }
-      }
-      i++;
-      bEscape = false;
+      bEscape = !bEscape;
+      continue;
     }
-  });
+    if (!bInConstRange && wc >= L'A' && wc <= L'a') {
+      uint8_t nAlt = alt_table[wc - L'A'];
+      if (nAlt != 255) {
+        pPattern->SetAt(i, wsAltSymbols[nAlt]);
+      }
+    }
+    i++;
+    bEscape = false;
+  }
 }
 
 std::pair<bool, CXFA_LocaleValue::ValueType> PatternStringType(
@@ -521,7 +518,7 @@ bool IsPartOfNumberW(wchar_t ch) {
 
 ByteString GUIDString(bool bSeparator) {
   std::array<uint8_t, 16> data;
-  FX_Random_GenerateMT(
+  FX_Random::Fill(
       fxcrt::reinterpret_span<uint32_t, uint8_t>(pdfium::span(data)));
   data[6] = (data[6] & 0x0F) | 0x40;
 
@@ -1085,7 +1082,7 @@ v8::Local<v8::Value> GetExtractedValue(v8::Isolate* pIsolate,
 v8::Local<v8::Value> GetSimpleValue(
     const v8::FunctionCallbackInfo<v8::Value>& info,
     uint32_t index) {
-  DCHECK(index < static_cast<uint32_t>(info.Length()));
+  DCHECK_LT(index, static_cast<uint32_t>(info.Length()));
   return GetExtractedValue(info.GetIsolate(), info[index]);
 }
 
@@ -1797,7 +1794,7 @@ void CFXJSE_FormCalcContext::IsoTime2Num(
     info.GetReturnValue().Set(0);
     return;
   }
-  bsArg = bsArg.Last(bsArg.GetLength() - (pos.value() + 1));
+  bsArg = bsArg.Substr(pos.value() + 1);
 
   CXFA_LocaleValue timeValue(CXFA_LocaleValue::ValueType::kTime,
                              WideString::FromUTF8(bsArg.AsStringView()), pMgr);
@@ -3070,8 +3067,7 @@ void CFXJSE_FormCalcContext::Eval(
   ByteString bsScript = FX_UTF8Encode(wsJavaScriptBuf.value().AsStringView());
   CFXJSE_Context::ExecutionResult result = pNewContext->ExecuteScript(
       bsScript.AsStringView(), v8::Local<v8::Object>());
-
-  info.GetReturnValue().Set(result.value->DirectGetValue());
+  info.GetReturnValue().Set(v8::Local<v8::Value>::New(pIsolate, result.value));
 }
 
 // static
@@ -3580,25 +3576,22 @@ void CFXJSE_FormCalcContext::Format(
           info.GetReturnValue().SetEmptyString();
           return;
         }
-        auto wsDatePattern = WideString::FromASCII("date{");
-        wsDatePattern += wsPattern.First(iTChar.value()) + L"} ";
-
-        auto wsTimePattern = WideString::FromASCII("time{");
-        wsTimePattern +=
-            wsPattern.Last(wsPattern.GetLength() - (iTChar.value() + 1)) + L"}";
-        wsPattern = wsDatePattern + wsTimePattern;
+        wsPattern = WideString(
+            {L"date{", wsPattern.AsStringView().First(iTChar.value()),
+             L"} time{", wsPattern.AsStringView().Substr(iTChar.value() + 1),
+             L'}'});
       } break;
       case CXFA_LocaleValue::ValueType::kDate: {
-        wsPattern = L"date{" + wsPattern + L"}";
+        wsPattern = WideString({L"date{", wsPattern.AsStringView(), L'}'});
       } break;
       case CXFA_LocaleValue::ValueType::kTime: {
-        wsPattern = L"time{" + wsPattern + L"}";
+        wsPattern = WideString({L"time{", wsPattern.AsStringView(), L'}'});
       } break;
       case CXFA_LocaleValue::ValueType::kText: {
-        wsPattern = L"text{" + wsPattern + L"}";
+        wsPattern = WideString({L"text{", wsPattern.AsStringView(), L'}'});
       } break;
       case CXFA_LocaleValue::ValueType::kFloat: {
-        wsPattern = L"num{" + wsPattern + L"}";
+        wsPattern = WideString({L"num{", wsPattern.AsStringView(), L'}'});
       } break;
       default: {
         WideString wsTestPattern = L"num{" + wsPattern + L"}";
@@ -3768,12 +3761,9 @@ void CFXJSE_FormCalcContext::Parse(
         info.GetReturnValue().SetEmptyString();
         return;
       }
-      WideString wsDatePattern(L"date{" + wsPattern.First(iTChar.value()) +
-                               L"} ");
-      WideString wsTimePattern(
-          L"time{" +
-          wsPattern.Last(wsPattern.GetLength() - (iTChar.value() + 1)) + L"}");
-      wsPattern = wsDatePattern + wsTimePattern;
+      wsPattern = WideString(
+          {L"date{", wsPattern.AsStringView().First(iTChar.value()), L"} time{",
+           wsPattern.AsStringView().Substr(iTChar.value() + 1), L'}'});
       CXFA_LocaleValue localeValue(dwPatternType, wsValue, wsPattern, pLocale,
                                    pMgr);
       if (!localeValue.IsValid()) {
@@ -3786,7 +3776,7 @@ void CFXJSE_FormCalcContext::Parse(
       return;
     }
     case CXFA_LocaleValue::ValueType::kDate: {
-      wsPattern = L"date{" + wsPattern + L"}";
+      wsPattern = WideString({L"date{", wsPattern.AsStringView(), L'}'});
       CXFA_LocaleValue localeValue(dwPatternType, wsValue, wsPattern, pLocale,
                                    pMgr);
       if (!localeValue.IsValid()) {
@@ -3799,7 +3789,7 @@ void CFXJSE_FormCalcContext::Parse(
       return;
     }
     case CXFA_LocaleValue::ValueType::kTime: {
-      wsPattern = L"time{" + wsPattern + L"}";
+      wsPattern = WideString({L"time{", wsPattern.AsStringView(), L'}'});
       CXFA_LocaleValue localeValue(dwPatternType, wsValue, wsPattern, pLocale,
                                    pMgr);
       if (!localeValue.IsValid()) {
@@ -3812,7 +3802,7 @@ void CFXJSE_FormCalcContext::Parse(
       return;
     }
     case CXFA_LocaleValue::ValueType::kText: {
-      wsPattern = L"text{" + wsPattern + L"}";
+      wsPattern = WideString({L"text{", wsPattern.AsStringView(), L'}'});
       CXFA_LocaleValue localeValue(CXFA_LocaleValue::ValueType::kText, wsValue,
                                    wsPattern, pLocale, pMgr);
       if (!localeValue.IsValid()) {
@@ -3825,7 +3815,7 @@ void CFXJSE_FormCalcContext::Parse(
       return;
     }
     case CXFA_LocaleValue::ValueType::kFloat: {
-      wsPattern = L"num{" + wsPattern + L"}";
+      wsPattern = WideString({L"num{", wsPattern.AsStringView(), L'}'});
       CXFA_LocaleValue localeValue(CXFA_LocaleValue::ValueType::kFloat, wsValue,
                                    wsPattern, pLocale, pMgr);
       if (!localeValue.IsValid()) {
@@ -5090,7 +5080,7 @@ ByteString CFXJSE_FormCalcContext::GenerateSomExpression(ByteStringView bsName,
 }
 
 std::optional<WideTextBuffer> CFXJSE_FormCalcContext::Translate(
-    cppgc::Heap* pHeap,
+    FXGC_Heap* pHeap,
     WideStringView wsFormcalc) {
   if (wsFormcalc.IsEmpty()) {
     return WideTextBuffer();
@@ -5127,7 +5117,18 @@ CFXJSE_FormCalcContext::CFXJSE_FormCalcContext(v8::Isolate* pIsolate,
                                  ->GetTemplate(isolate_)));
 }
 
-CFXJSE_FormCalcContext::~CFXJSE_FormCalcContext() = default;
+CFXJSE_FormCalcContext::~CFXJSE_FormCalcContext() {
+  // Clear the binding the same way CFXJSE_Engine does for every other bound
+  // so later calls on the retained object do not see this binding.
+  if (!value_.IsEmpty()) {
+    CFXJSE_ScopeUtil_IsolateHandle scope(GetIsolate());
+    v8::Local<v8::Value> value =
+        v8::Local<v8::Value>::New(GetIsolate(), value_);
+    if (value->IsObject()) {
+      FXJSE_ClearObjectBinding(value.As<v8::Object>());
+    }
+  }
+}
 
 CFXJSE_FormCalcContext* CFXJSE_FormCalcContext::AsFormCalcContext() {
   return this;
@@ -5286,7 +5287,7 @@ bool CFXJSE_FormCalcContext::IsIsoDateFormat(ByteStringView bsData,
 
   int32_t iStyle = pData[4] == '-' ? 1 : 0;
   size_t iPosOff = iStyle == 0 ? 4 : 5;
-  if (!FXSYS_IsDecimalDigit(pData[iPosOff]) ||
+  if (iPosOff + 1 >= pData.size() || !FXSYS_IsDecimalDigit(pData[iPosOff]) ||
       !FXSYS_IsDecimalDigit(pData[iPosOff + 1])) {
     return false;
   }
@@ -5310,7 +5311,7 @@ bool CFXJSE_FormCalcContext::IsIsoDateFormat(ByteStringView bsData,
       return true;
     }
   }
-  if (!FXSYS_IsDecimalDigit(pData[iPosOff]) ||
+  if (iPosOff + 1 >= pData.size() || !FXSYS_IsDecimalDigit(pData[iPosOff]) ||
       !FXSYS_IsDecimalDigit(pData[iPosOff + 1])) {
     return false;
   }
@@ -5599,8 +5600,7 @@ void CFXJSE_FormCalcContext::ApplyToObject(
 
 void CFXJSE_FormCalcContext::ThrowNoDefaultPropertyException(
     ByteStringView name) const {
-  ByteString msg(name);
-  msg += " doesn't have a default property.";
+  ByteString msg({name, " doesn't have a default property."});
   ThrowException(msg.AsStringView());
 }
 
@@ -5619,19 +5619,15 @@ void CFXJSE_FormCalcContext::ThrowServerDeniedException() const {
 void CFXJSE_FormCalcContext::ThrowPropertyNotInObjectException(
     ByteStringView name,
     ByteStringView exp) const {
-  ByteString msg("An attempt was made to reference property '");
-  msg += name;
-  msg += "' of a non-object in SOM expression ";
-  msg += exp;
-  msg += ".";
+  ByteString msg({"An attempt was made to reference property '", name,
+                  "' of a non-object in SOM expression ", exp, '.'});
   ThrowException(msg.AsStringView());
 }
 
 void CFXJSE_FormCalcContext::ThrowParamCountMismatchException(
     ByteStringView method) const {
-  ByteString msg("Incorrect number of parameters calling method '");
-  msg += method;
-  msg += "'.";
+  ByteString msg(
+      {"Incorrect number of parameters calling method '", method, "'."});
   ThrowException(msg.AsStringView());
 }
 

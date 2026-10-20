@@ -23,6 +23,7 @@
 
 class CFX_RenderDevice;
 class CPDF_Array;
+// EmbedPDF(reads-dont-write): fonts of an appearance built in memory.
 class CPDF_AnnotFontMap;
 class CPDF_Dictionary;
 class CPDF_Document;
@@ -65,6 +66,9 @@ class CPDF_Annot {
     REDACT
   };
 
+  // EmbedPDF(annot-appearance): the annotation properties our appearance
+  // generator and the EPDFAnnot_* functions use, with their PDF names: border
+  // styles, line endings, standard fonts, alignment, icons and reply types.
   enum class BorderStyle {
     kUnknown = 0,
     kSolid,
@@ -194,7 +198,20 @@ class CPDF_Annot {
                                           size_t nIndex);
   static size_t QuadPointCount(const CPDF_Array* pArray);
 
+  // EmbedPDF(reads-dont-write): an annotation made to answer a question about
+  // its drawing, such as where it draws, gets its appearance only when drawn,
+  // so asking writes nothing.
+  // When an annotation without an appearance gets one generated.
+  enum class MissingAppearance {
+    kGenerateNow,
+    // Only once it is drawn.
+    kGenerateWhenDrawn,
+  };
+
   CPDF_Annot(RetainPtr<CPDF_Dictionary> dict, CPDF_Document* document);
+  CPDF_Annot(RetainPtr<CPDF_Dictionary> dict,
+             CPDF_Document* document,
+             MissingAppearance missing_appearance);
   ~CPDF_Annot();
 
   Subtype GetSubtype() const;
@@ -204,6 +221,36 @@ class CPDF_Annot {
   RetainPtr<CPDF_Dictionary> GetMutableAnnotDict() { return annot_dict_; }
 
   bool IsHidden() const;
+
+  // EmbedPDF(bug-fix): whether the Invisible flag leaves |annot_dict| undrawn.
+  // ISO 32000-2 12.5.3 limits the flag to a type that isn't a standard one,
+  // which no handler draws; on a standard annotation it means nothing. Upstream
+  // drew such an unknown annotation anyway, and its flatten skipped every
+  // annotation with the flag. The renderer and flatten both ask here.
+  static bool IsHiddenByInvisibleFlag(const CPDF_Dictionary* annot_dict);
+
+  // EmbedPDF(annot-appearance): draw this state of an appearance subdictionary
+  // (/AP /N /Yes), whatever /AS says. Only a stored state is drawn: a mode
+  // whose entry is a single stream, a state the subdictionary lacks, or no
+  // /AP draws nothing.
+  void SetAppearanceState(const ByteString& state);
+
+  // EmbedPDF(annot-appearance, reads-dont-write): the box an appearance draws
+  // in, measured without writing one.
+  // Where the appearance for `mode` is drawn, in page space, without writing
+  // anything: a stored appearance is fitted into /Rect; with none, the normal
+  // appearance PDFium draws in memory takes its own box, which can reach past
+  // /Rect. Nothing when there is nothing to draw without writing one (a
+  // hidden annotation, or a kind PDFium draws only by generating an
+  // appearance into the file).
+  std::optional<CFX_FloatRect> GetDrawingRect(AppearanceMode mode);
+
+  // EmbedPDF(annot-appearance, reads-dont-write): what flattening paints for
+  // an annotation without a stored appearance.
+  // The normal appearance PDFium draws in memory when there is no stored one,
+  // built without writing anything. This object keeps it, and the fonts it
+  // uses, alive. Null when there is a stored appearance or nothing to draw.
+  RetainPtr<const CPDF_Stream> GetAppearanceDrawnInMemory();
 
   bool DrawAppearance(CPDF_Page* pPage,
                       CFX_RenderDevice* pDevice,
@@ -215,7 +262,6 @@ class CPDF_Annot {
                      AppearanceMode mode);
 
   void ClearCachedAP();
-  void DrawBorder(CFX_RenderDevice* pDevice, const CFX_Matrix* pUser2Device);
   CPDF_Form* GetAPForm(CPDF_Page* pPage, AppearanceMode mode);
   void SetOpenState(bool bOpenState) { open_state_ = bOpenState; }
   void SetPopupAnnotOpenState(bool bOpenState);
@@ -224,6 +270,12 @@ class CPDF_Annot {
 
  private:
   void GenerateAPIfNeeded();
+  // EmbedPDF(annot-appearance): draws a chosen appearance state.
+  // The stored stream drawn for `mode`: the chosen state when one was set
+  // (SetAppearanceState), else the one /AS selects.
+  RetainPtr<CPDF_Stream> GetStoredAP(AppearanceMode mode) const;
+  // EmbedPDF(reads-dont-write): a missing appearance is built in memory, not
+  // written to the file.
   RetainPtr<CPDF_Stream> GetOrBuildEphemeralAP(AppearanceMode mode);
   bool CanGenerateEphemeralAP() const;
   bool ShouldGenerateAP() const;
@@ -233,18 +285,23 @@ class CPDF_Annot {
 
   RetainPtr<CPDF_Dictionary> const annot_dict_;
   UnownedPtr<CPDF_Document> const document_;
+  // EmbedPDF(reads-dont-write): a missing appearance is built in memory, not
+  // written to the file: its fonts, its stream and the box it draws in.
   // Render-only caption fonts may refer to scratch streams. Destroy them
   // after both the parsed AP forms and the ephemeral stream.
   std::unique_ptr<CPDF_AnnotFontMap> ephemeral_font_lifetime_;
   std::map<RetainPtr<CPDF_Stream>, std::unique_ptr<CPDF_Form>> ap_map_;
   RetainPtr<CPDF_Stream> ephemeral_normal_ap_;
   std::optional<CFX_FloatRect> ephemeral_rect_;
+  // EmbedPDF(annot-appearance): the state SetAppearanceState() chose.
+  std::optional<ByteString> appearance_state_;
   // If non-null, then this is not a popup annotation.
   UnownedPtr<CPDF_Annot> popup_annot_;
   const Subtype subtype_;
   const bool is_text_markup_annotation_;
   // |open_state_| is only set for popup annotations.
   bool open_state_ = false;
+  // EmbedPDF(reads-dont-write): the in-memory appearance has been built.
   bool ephemeral_built_ = false;
   bool has_generated_ap_;
 };
@@ -252,12 +309,23 @@ class CPDF_Annot {
 // Get the AP in an annotation dict for a given appearance mode.
 // If |eMode| is not Normal and there is not AP for that mode, falls back to
 // the Normal AP.
+// EmbedPDF(reads-dont-write): reads take a const dictionary.
 RetainPtr<CPDF_Stream> GetAnnotAP(const CPDF_Dictionary* pAnnotDict,
                                   CPDF_Annot::AppearanceMode eMode);
 
 // Get the AP in an annotation dict for a given appearance mode.
 // No fallbacks to Normal like in GetAnnotAP.
+// EmbedPDF(reads-dont-write): reads take a const dictionary.
 RetainPtr<CPDF_Stream> GetAnnotAPNoFallback(const CPDF_Dictionary* pAnnotDict,
                                             CPDF_Annot::AppearanceMode eMode);
+
+// EmbedPDF(layer-door): GetAnnotAP() for writing. The same stream, reached
+// through the mutable accessors, so every indirect step goes through the
+// document's write door and a layer transaction copies the stream (and an
+// indirect /AP dictionary) up before it is written. GetAnnotAP() is for
+// reading only. |pAnnotDict| must itself be the writable version (from
+// CPDF_AnnotContext::GetMutableAnnotDict()).
+RetainPtr<CPDF_Stream> GetMutableAnnotAP(CPDF_Dictionary* pAnnotDict,
+                                         CPDF_Annot::AppearanceMode eMode);
 
 #endif  // CORE_FPDFDOC_CPDF_ANNOT_H_

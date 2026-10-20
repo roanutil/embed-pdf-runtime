@@ -23,9 +23,7 @@ class CPDF_ImageObject final : public CPDF_PageObject {
   // CPDF_PageObject
   Type GetType() const override;
   void Transform(const CFX_Matrix& matrix) override;
-  bool IsImage() const override;
   CPDF_ImageObject* AsImage() override;
-  const CPDF_ImageObject* AsImage() const override;
 
   void CalcBoundingBox();
   void SetImage(RetainPtr<CPDF_Image> pImage);
@@ -37,10 +35,19 @@ class CPDF_ImageObject final : public CPDF_PageObject {
   void SetImageMatrix(const CFX_Matrix& matrix);
   const CFX_Matrix& matrix() const { return matrix_; }
 
+  // EmbedPDF(lean-page-objects): moved here from CPDF_PageObject.
+  // The unit square the image matrix maps, once the bounding box is known.
+  const CFX_FloatRect& GetOriginalRect() const { return original_rect_; }
+  const CFX_Matrix& original_matrix() const { return original_matrix_; }
+
  private:
   void MaybePurgeCache();
 
   CFX_Matrix matrix_;
+  // EmbedPDF(lean-page-objects): moved here from CPDF_PageObject.
+  CFX_FloatRect original_rect_;
+  // TODO(thestig): Use with `CPDF_FormObject` and `CPDF_PageObject` as well.
+  CFX_Matrix original_matrix_;
   RetainPtr<CPDF_Image> image_;
 };
 

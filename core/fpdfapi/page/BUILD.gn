@@ -25,10 +25,16 @@ source_set("page") {
     "cpdf_contentmarkitem.h",
     "cpdf_contentmarks.cpp",
     "cpdf_contentmarks.h",
+    "cpdf_contentnames.cpp",
+    "cpdf_contentnames.h",
     "cpdf_contentparser.cpp",
     "cpdf_contentparser.h",
+    "cpdf_contentversions.cpp",
+    "cpdf_contentversions.h",
     "cpdf_devicecs.cpp",
     "cpdf_devicecs.h",
+    "cpdf_decodedimagestore.cpp",
+    "cpdf_decodedimagestore.h",
     "cpdf_dib.cpp",
     "cpdf_dib.h",
     "cpdf_docpagedata.cpp",
@@ -59,6 +65,8 @@ source_set("page") {
     "cpdf_meshstream.h",
     "cpdf_occontext.cpp",
     "cpdf_occontext.h",
+    "cpdf_paintedbounds.cpp",
+    "cpdf_paintedbounds.h",
     "cpdf_page.cpp",
     "cpdf_page.h",
     "cpdf_pageimagecache.cpp",
@@ -67,8 +75,12 @@ source_set("page") {
     "cpdf_pagemodule.h",
     "cpdf_pageobject.cpp",
     "cpdf_pageobject.h",
+    "cpdf_pageobjectgroups.cpp",
+    "cpdf_pageobjectgroups.h",
     "cpdf_pageobjectholder.cpp",
     "cpdf_pageobjectholder.h",
+    "cpdf_parsedsize.cpp",
+    "cpdf_parsedsize.h",
     "cpdf_path.cpp",
     "cpdf_path.h",
     "cpdf_pathobject.cpp",
@@ -111,15 +123,14 @@ source_set("page") {
   ]
   configs += [ "../../../:pdfium_strict_config" ]
   public_deps = [
-    "../../fxge",
-    "../parser",
-  ]
-  deps = [
     "../../../constants",
     "../../fxcodec",
     "../../fxcrt",
+    "../../fxge",
     "../font",
+    "../parser",
   ]
+  deps = [ "//third_party/abseil-cpp:absl" ]
   allow_circular_includes_from = []
   if (pdf_use_skia) {
     allow_circular_includes_from += [ "../../fxge" ]
@@ -134,17 +145,18 @@ source_set("unit_test_support") {
     "test_with_page_module.h",
   ]
   configs += [ "../../../:pdfium_strict_config" ]
-  deps = [
-    "../page",
-    "//testing/gtest",
-  ]
+  public_deps = [ "//testing/gtest" ]
+  deps = [ "../page" ]
 }
 
 pdfium_unittest_source_set("unittests") {
   sources = [
     "cpdf_colorspace_unittest.cpp",
+    "cpdf_contentnames_unittest.cpp",
     "cpdf_devicecs_unittest.cpp",
+    "cpdf_dib_unittest.cpp",
     "cpdf_function_unittest.cpp",
+    "cpdf_page_unittest.cpp",
     "cpdf_pageimagecache_unittest.cpp",
     "cpdf_pageobjectholder_unittest.cpp",
     "cpdf_psengine_unittest.cpp",
@@ -153,7 +165,11 @@ pdfium_unittest_source_set("unittests") {
   ]
   deps = [
     ":page",
+    ":unit_test_support",
+    "../../../constants",
+    "../../../testing:path_service",
     "../parser",
+    "../parser:unit_test_support",
     "../render",
   ]
   pdfium_root_dir = "../../../"

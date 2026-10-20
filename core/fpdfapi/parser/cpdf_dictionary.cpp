@@ -18,13 +18,13 @@
 #include "core/fpdfapi/parser/cpdf_reference.h"
 #include "core/fpdfapi/parser/cpdf_stream.h"
 #include "core/fpdfapi/parser/cpdf_string.h"
+#include "core/fpdfapi/parser/cpdf_write_generation.h"
 #include "core/fpdfapi/parser/fpdf_parser_utility.h"
 #include "core/fxcrt/check.h"
 #include "core/fxcrt/containers/contains.h"
 #include "core/fxcrt/fx_stream.h"
 
-CPDF_Dictionary::CPDF_Dictionary()
-    : CPDF_Dictionary(WeakPtr<ByteStringPool>()) {}
+CPDF_Dictionary::CPDF_Dictionary() : CPDF_Dictionary(nullptr) {}
 
 CPDF_Dictionary::CPDF_Dictionary(const WeakPtr<ByteStringPool>& pPool)
     : pool_(pPool) {}
@@ -52,6 +52,7 @@ RetainPtr<CPDF_Object> CPDF_Dictionary::Clone() const {
   return CloneObjectNonCyclic(false);
 }
 
+// EmbedPDF(layer-door): the copy a layer makes when it promotes a base object.
 RetainPtr<CPDF_Object> CPDF_Dictionary::CloneForHolder(
     CPDF_IndirectObjectHolder* holder) const {
   std::set<const CPDF_Object*> visited;
@@ -76,6 +77,7 @@ RetainPtr<CPDF_Object> CPDF_Dictionary::CloneNonCyclic(
   return pCopy;
 }
 
+// EmbedPDF(layer-door): references in the copy resolve through `holder`.
 RetainPtr<CPDF_Object> CPDF_Dictionary::CloneForHolderNonCyclic(
     CPDF_IndirectObjectHolder* holder,
     std::set<const CPDF_Object*>* pVisited) const {
@@ -94,10 +96,18 @@ RetainPtr<CPDF_Object> CPDF_Dictionary::CloneForHolderNonCyclic(
   return pCopy;
 }
 
+// EmbedPDF(write-generation): freezing or stamping a dictionary reaches its
+// values.
 void CPDF_Dictionary::FreezeChildren(std::set<const CPDF_Object*>* visited) {
   CPDF_DictionaryLocker locker(this);
   for (const auto& item : locker) {
     item.second->FreezeForHolder(visited);
+  }
+}
+
+void CPDF_Dictionary::StampWriteGenerationOfChildren(uint32_t generation) {
+  for (const auto& item : map_) {
+    item.second->StampWriteGeneration(generation);
   }
 }
 
@@ -131,6 +141,9 @@ RetainPtr<const CPDF_Object> CPDF_Dictionary::GetDirectObjectFor(
 
 RetainPtr<CPDF_Object> CPDF_Dictionary::GetMutableDirectObjectFor(
     ByteStringView key) {
+  // EmbedPDF(layer-door): a mutable child resolves its reference through the
+  // layer's door, so the caller writes the layer's copy, never the frozen
+  // base. Upstream casts the const lookup to mutable.
   RetainPtr<CPDF_Object> p = GetMutableObjectFor(key);
   return p ? p->GetMutableDirect() : nullptr;
 }
@@ -201,6 +214,7 @@ RetainPtr<const CPDF_Dictionary> CPDF_Dictionary::GetDictFor(
 
 RetainPtr<CPDF_Dictionary> CPDF_Dictionary::GetMutableDictFor(
     ByteStringView key) {
+  // EmbedPDF(layer-door): resolve through the door, as above.
   RetainPtr<CPDF_Object> p = GetMutableDirectObjectFor(key);
   if (!p) {
     return nullptr;
@@ -233,6 +247,7 @@ RetainPtr<const CPDF_Array> CPDF_Dictionary::GetArrayFor(
 }
 
 RetainPtr<CPDF_Array> CPDF_Dictionary::GetMutableArrayFor(ByteStringView key) {
+  // EmbedPDF(layer-door): resolve through the door, as above.
   return ToArray(GetMutableDirectObjectFor(key));
 }
 
@@ -256,6 +271,7 @@ RetainPtr<const CPDF_Stream> CPDF_Dictionary::GetStreamFor(
 
 RetainPtr<CPDF_Stream> CPDF_Dictionary::GetMutableStreamFor(
     ByteStringView key) {
+  // EmbedPDF(layer-door): resolve through the door, as above.
   return ToStream(GetMutableDirectObjectFor(key));
 }
 
@@ -316,7 +332,9 @@ void CPDF_Dictionary::SetFor(const ByteString& key,
 CPDF_Object* CPDF_Dictionary::SetForInternal(const ByteString& key,
                                              RetainPtr<CPDF_Object> pObj) {
   CHECK(!IsLocked());
-  DCHECK(!IsFrozen());
+  // EmbedPDF(write-generation, reads-dont-write): a write past the layer's
+  // door, or one during a read-only walk, is a bug.
+  DCHECK_PDF_WRITABLE(this);
   DCHECK_PDF_GRAPH_MUTABLE_FOR(this);
   if (!pObj) {
     map_.erase(key);
@@ -324,6 +342,9 @@ CPDF_Object* CPDF_Dictionary::SetForInternal(const ByteString& key,
   }
   CHECK(pObj->IsInline());
   CHECK(!pObj->IsStream());
+  // EmbedPDF(write-generation): a detached child joins this dictionary's
+  // write generation.
+  pObj->StampWriteGeneration(write_generation());
   CPDF_Object* pRet = pObj.Get();
   map_[MaybeIntern(key)] = std::move(pObj);
   return pRet;
@@ -338,8 +359,10 @@ void CPDF_Dictionary::ConvertToIndirectObjectFor(
     return;
   }
 
+  // EmbedPDF(write-generation, reads-dont-write): a write past the layer's
+  // door, or one during a read-only walk, is a bug.
   DCHECK_PDF_GRAPH_MUTABLE_FOR(this);
-  DCHECK(!IsFrozen());
+  DCHECK_PDF_WRITABLE(this);
   pHolder->AddIndirectObject(it->second);
   it->second = it->second->MakeReference(pHolder);
 }
@@ -348,9 +371,11 @@ RetainPtr<CPDF_Object> CPDF_Dictionary::RemoveFor(ByteStringView key) {
   CHECK(!IsLocked());
   auto it = map_.find(key);
   if (it == map_.end()) {
-    return RetainPtr<CPDF_Object>();
+    return nullptr;
   }
-  DCHECK(!IsFrozen());
+  // EmbedPDF(write-generation, reads-dont-write): a write past the layer's
+  // door, or one during a read-only walk, is a bug.
+  DCHECK_PDF_WRITABLE(this);
   DCHECK_PDF_GRAPH_MUTABLE_FOR(this);
   auto node = map_.extract(it);
   return std::move(node.mapped());
@@ -369,8 +394,10 @@ void CPDF_Dictionary::ReplaceKey(const ByteString& oldkey,
     return;
   }
 
+  // EmbedPDF(write-generation, reads-dont-write): a write past the layer's
+  // door, or one during a read-only walk, is a bug.
   DCHECK_PDF_GRAPH_MUTABLE_FOR(this);
-  DCHECK(!IsFrozen());
+  DCHECK_PDF_WRITABLE(this);
   map_[MaybeIntern(newkey)] = std::move(old_it->second);
   map_.erase(old_it);
 }
@@ -399,6 +426,7 @@ ByteString CPDF_Dictionary::MaybeIntern(const ByteString& str) {
   return pool_ ? pool_->Intern(str) : str;
 }
 
+// EmbedPDF(save-generations): writers carry the write context.
 bool CPDF_Dictionary::WriteTo(IFX_ArchiveStream* archive,
                               const CPDF_Encryptor* encryptor,
                               const CPDF_WriteContext* context) const {
@@ -406,9 +434,10 @@ bool CPDF_Dictionary::WriteTo(IFX_ArchiveStream* archive,
     return false;
   }
 
-  // With no encryption there is no special handling of /Contents. In
-  // particular, equality checks must not resolve an indirect /Type or /FT
-  // and populate the document's object cache merely to compare two values.
+  // EmbedPDF(save-traversal): with no encryption there is no special handling
+  // of /Contents. In particular, equality checks must not resolve an indirect
+  // /Type or /FT and populate the document's object cache merely to compare
+  // two values.
   const bool is_signature =
       encryptor && CPDF_CryptoHandler::IsSignatureDictionary(this);
 

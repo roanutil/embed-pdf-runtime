@@ -6,28 +6,49 @@
 
 #include "core/fpdfapi/page/cpdf_page.h"
 
+#include <limits>
 #include <set>
 #include <utility>
+#include <vector>
 
 #include "constants/page_object.h"
 #include "core/fpdfapi/page/cpdf_contentparser.h"
+#include "core/fpdfapi/page/cpdf_form.h"
+#include "core/fpdfapi/page/cpdf_formobject.h"
 #include "core/fpdfapi/page/cpdf_pageimagecache.h"
 #include "core/fpdfapi/page/cpdf_pageobject.h"
 #include "core/fpdfapi/parser/cpdf_array.h"
 #include "core/fpdfapi/parser/cpdf_dictionary.h"
 #include "core/fpdfapi/parser/cpdf_document.h"
 #include "core/fpdfapi/parser/cpdf_document_view_scope.h"
+#include "core/fpdfapi/parser/cpdf_name.h"
 #include "core/fpdfapi/parser/cpdf_object.h"
+#include "core/fpdfapi/parser/cpdf_stream.h"
 #include "core/fxcrt/check.h"
 #include "core/fxcrt/check_op.h"
 #include "core/fxcrt/containers/contains.h"
+
+// EmbedPDF(page-residency): for IsContentCurrent().
+namespace {
+
+// A content check made at no epoch: the next one compares again.
+constexpr uint64_t kContentUnchecked = std::numeric_limits<uint64_t>::max();
+
+}  // namespace
 
 CPDF_Page::CPDF_Page(CPDF_Document* document,
                      RetainPtr<CPDF_Dictionary> pPageDict)
     : CPDF_PageObjectHolder(document, std::move(pPageDict), nullptr, nullptr),
       page_size_(100, 100),
       pdf_document_(document) {
+  // EmbedPDF(view-scope, reads-dont-write): read the page's resources
+  // through the document's view and without the mutable getter.
   CPDF_DocumentViewScope document_view(document);
+  // Callers check first. Upstream requires a /Type of /Page or none, and adds
+  // a missing one; loading a page is a read, and on a layer it would write the
+  // frozen base. Any leaf of the page tree is a page, as upstream's tree walk
+  // makes it one (CPDF_Document::IsPageTreeLeaf()).
+  CHECK(CPDF_Document::IsPageTreeLeaf(GetDict().Get()));
 
   // Cannot initialize |resources_| and |page_resources_| via the
   // CPDF_PageObjectHolder ctor because GetPageAttr() requires
@@ -41,9 +62,31 @@ CPDF_Page::CPDF_Page(CPDF_Document* document,
   UpdateDimensions();
   transparency_.SetIsolated();
   LoadTransparencyInfo();
+  // EmbedPDF(page-residency): a page just made matches the document.
+  content_checked_epoch_ = document ? document->GetOverlayEpoch() : 0;
 }
 
 CPDF_Page::~CPDF_Page() = default;
+
+// static
+bool CPDF_Page::IsValidPageDict(const CPDF_Dictionary* page_dict) {
+  return IsValidPageDictLoose(page_dict) &&
+         page_dict->KeyExist(pdfium::page_object::kType);
+}
+
+// static
+bool CPDF_Page::IsValidPageDictLoose(const CPDF_Dictionary* page_dict) {
+  if (!page_dict) {
+    return false;
+  }
+  RetainPtr<const CPDF_Object> type =
+      page_dict->GetObjectFor(pdfium::page_object::kType);
+  if (!type) {
+    return true;
+  }
+  RetainPtr<const CPDF_Name> name_type = ToName(type->GetDirect());
+  return name_type && name_type->GetString() == "Page";
+}
 
 CPDF_Page* CPDF_Page::AsPDFPage() {
   return this;
@@ -69,6 +112,7 @@ bool CPDF_Page::IsPage() const {
   return true;
 }
 
+// EmbedPDF(overlay-epoch): re-read /Resources when the overlay epoch moved.
 RetainPtr<const CPDF_Dictionary> CPDF_Page::GetResources() const {
   RefreshResourcesIfNeeded();
   return CPDF_PageObjectHolder::GetResources();
@@ -80,6 +124,7 @@ RetainPtr<const CPDF_Dictionary> CPDF_Page::GetPageResources() const {
 }
 
 void CPDF_Page::ParseContent() {
+  // EmbedPDF(view-scope): parse through the document's view.
   CPDF_DocumentViewScope document_view(GetDocument());
 
   if (GetParseState() == ParseState::kParsed) {
@@ -94,10 +139,81 @@ void CPDF_Page::ParseContent() {
   ContinueParse(nullptr);
 }
 
+// EmbedPDF(page-residency): what the parsed page costs, and whether it still
+// matches the document.
+const CPDF_ParsedSize& CPDF_Page::GetParsedSize() const {
+  if (GetParseState() == ParseState::kParsed &&
+      parsed_size_edits_ != GetObjectEdits()) {
+    parsed_size_ = CPDF_ParsedSize::Of(*this);
+    parsed_size_edits_ = GetObjectEdits();
+  }
+  return parsed_size_;
+}
+
+bool CPDF_Page::IsContentCurrent() const {
+  CPDF_Document* document = GetDocument();
+  if (!document) {
+    return true;
+  }
+  // Nothing makes a version without moving the epoch.
+  const uint64_t epoch = document->GetOverlayEpoch();
+  if (content_checked_epoch_ == epoch) {
+    return content_current_;
+  }
+
+  CPDF_DocumentViewScope document_view(document);
+  content_current_ = GetBox(pdfium::page_object::kMediaBox) == read_mediabox_ &&
+                     GetBox(pdfium::page_object::kCropBox) == read_cropbox_ &&
+                     GetOriginalRotation() == read_rotation_ &&
+                     content_versions_.Match(document, GetDict().Get());
+  content_checked_epoch_ = epoch;
+  return content_current_;
+}
+
+void CPDF_Page::StartContentRecords() {
+  parsed_size_ = CPDF_ParsedSize();
+  parsed_size_edits_ = GetObjectEdits();
+  content_versions_.Clear();
+  content_checked_epoch_ = GetDocument()->GetOverlayEpoch();
+  content_current_ = true;
+}
+
+void CPDF_Page::ContentGenerated(bool was_current) {
+  NoteObjectsEdited();
+  if (!was_current) {
+    return;
+  }
+
+  // The generator wrote this page's /Contents and the stream of every form it
+  // regenerated; every other form still holds the version it was parsed from,
+  // which matched.
+  CPDF_DocumentViewScope document_view(GetDocument());
+  content_versions_.Clear();
+  for (auto& stream : CPDF_ContentVersions::ContentStreamsOf(GetDict().Get())) {
+    content_versions_.AddContentStream(std::move(stream));
+  }
+  std::vector<const CPDF_PageObjectHolder*> holders = {this};
+  while (!holders.empty()) {
+    const CPDF_PageObjectHolder* holder = holders.back();
+    holders.pop_back();
+    for (const auto& object : *holder) {
+      if (const CPDF_FormObject* form_object = object->AsForm()) {
+        content_versions_.AddFormStream(form_object->form()->GetParsedStream());
+        holders.push_back(form_object->form());
+      }
+    }
+  }
+  content_checked_epoch_ = GetDocument()->GetOverlayEpoch();
+  content_current_ = true;
+}
+
 RetainPtr<CPDF_Object> CPDF_Page::GetMutablePageAttr(ByteStringView name) {
   return pdfium::WrapRetain(const_cast<CPDF_Object*>(GetPageAttr(name).Get()));
 }
 
+// EmbedPDF(layer-door): the page's resources open for writing on their first
+// actual write. On a layer, inherited resources become the page's own copy
+// rather than a write to the parent's.
 void CPDF_Page::EnsureMutableBackingObjectForResources() {
   RetainPtr<CPDF_Dictionary> page_dict = GetMutableDict();
   if (GetDocument() && GetDocument()->IsLayerDocument() &&
@@ -113,6 +229,7 @@ void CPDF_Page::EnsureMutableBackingObjectForPageResources() {
   page_resources_ = resources_;
 }
 
+// EmbedPDF(overlay-epoch): re-read /Resources when the overlay epoch moved.
 void CPDF_Page::RefreshResourcesIfNeeded() const {
   CPDF_Document* document = GetDocument();
   if (!document) {
@@ -138,6 +255,8 @@ void CPDF_Page::RefreshResourcesIfNeeded() const {
 }
 
 RetainPtr<const CPDF_Object> CPDF_Page::GetPageAttr(ByteStringView name) const {
+  // EmbedPDF(view-scope): inherited attributes resolve through the
+  // document's view.
   CPDF_DocumentViewScope document_view(GetDocument());
 
   std::set<RetainPtr<const CPDF_Dictionary>> visited;
@@ -253,7 +372,8 @@ CFX_Matrix CPDF_Page::GetDisplayMatrix() const {
 }
 
 int CPDF_Page::GetPageRotation() const {
-  // EmbedPDF: If rotation override is set, use it instead of dictionary value
+  // EmbedPDF(rotation-override): if a rotation override is set, use it
+  // instead of the dictionary value.
   if (rotation_override_.has_value()) {
     return rotation_override_.value();
   }
@@ -268,6 +388,8 @@ int CPDF_Page::GetOriginalRotation() const {
   return (rotation < 0) ? (rotation + 4) : rotation;
 }
 
+// EmbedPDF(rotation-override): set (or with -1, clear) the override and
+// compute the page's size and matrix again.
 void CPDF_Page::SetRotationOverride(int rotation) {
   // Set override (-1 clears it)
   if (rotation < 0) {
@@ -326,6 +448,13 @@ void CPDF_Page::UpdateDimensions() {
 
   page_size_.width = bbox_.Width();
   page_size_.height = bbox_.Height();
+
+  // EmbedPDF(page-residency): what this page now shows, for
+  // IsContentCurrent().
+  read_mediabox_ = GetBox(pdfium::page_object::kMediaBox);
+  read_cropbox_ = GetBox(pdfium::page_object::kCropBox);
+  read_rotation_ = GetOriginalRotation();
+  content_checked_epoch_ = kContentUnchecked;
 
   switch (GetPageRotation()) {
     case 0:

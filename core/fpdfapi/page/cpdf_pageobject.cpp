@@ -6,40 +6,35 @@
 
 #include "core/fpdfapi/page/cpdf_pageobject.h"
 
+#include <atomic>
 #include <utility>
 
 #include "core/fxcrt/fx_coordinates.h"
+
+// EmbedPDF(render-speedup): a process-wide count of bounds changes to held
+// objects, so a holder knows when its object groups are stale.
+namespace {
+
+std::atomic<uint64_t> g_held_bounds_generation{0};
+
+}  // namespace
+
+// static
+uint64_t CPDF_PageObject::HeldBoundsGeneration() {
+  return g_held_bounds_generation.load(std::memory_order_relaxed);
+}
+
+// static
+void CPDF_PageObject::NoteHeldBoundsChanged() {
+  g_held_bounds_generation.fetch_add(1, std::memory_order_relaxed);
+}
 
 CPDF_PageObject::CPDF_PageObject(int32_t content_stream)
     : content_stream_(content_stream) {}
 
 CPDF_PageObject::~CPDF_PageObject() = default;
 
-bool CPDF_PageObject::IsText() const {
-  return false;
-}
-
-bool CPDF_PageObject::IsPath() const {
-  return false;
-}
-
-bool CPDF_PageObject::IsImage() const {
-  return false;
-}
-
-bool CPDF_PageObject::IsShading() const {
-  return false;
-}
-
-bool CPDF_PageObject::IsForm() const {
-  return false;
-}
-
 CPDF_TextObject* CPDF_PageObject::AsText() {
-  return nullptr;
-}
-
-const CPDF_TextObject* CPDF_PageObject::AsText() const {
   return nullptr;
 }
 
@@ -47,15 +42,7 @@ CPDF_PathObject* CPDF_PageObject::AsPath() {
   return nullptr;
 }
 
-const CPDF_PathObject* CPDF_PageObject::AsPath() const {
-  return nullptr;
-}
-
 CPDF_ImageObject* CPDF_PageObject::AsImage() {
-  return nullptr;
-}
-
-const CPDF_ImageObject* CPDF_PageObject::AsImage() const {
   return nullptr;
 }
 
@@ -63,15 +50,7 @@ CPDF_ShadingObject* CPDF_PageObject::AsShading() {
   return nullptr;
 }
 
-const CPDF_ShadingObject* CPDF_PageObject::AsShading() const {
-  return nullptr;
-}
-
 CPDF_FormObject* CPDF_PageObject::AsForm() {
-  return nullptr;
-}
-
-const CPDF_FormObject* CPDF_PageObject::AsForm() const {
   return nullptr;
 }
 
@@ -86,13 +65,13 @@ void CPDF_PageObject::SetDefaultStates() {
 
 void CPDF_PageObject::CopyData(const CPDF_PageObject* pSrc) {
   graphic_states_ = pSrc->graphic_states_;
-  rect_ = pSrc->rect_;
+  // EmbedPDF(render-speedup): every rect write goes through SetRect(), which
+  // tells holders when a held object's bounds change.
+  SetRect(pSrc->rect_);
   dirty_ = true;
 }
-
-void CPDF_PageObject::InitializeOriginalMatrix(const CFX_Matrix& matrix) {
-  original_matrix_ = matrix;
-}
+// EmbedPDF(lean-page-objects): InitializeOriginalMatrix() moved to
+// CPDF_ImageObject, the only object with an original matrix.
 
 void CPDF_PageObject::SetIsActive(bool value) {
   if (is_active_ != value) {

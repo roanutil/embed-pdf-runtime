@@ -37,27 +37,30 @@ class CPDF_TextObject final : public CPDF_PageObject {
   // CPDF_PageObject:
   Type GetType() const override;
   void Transform(const CFX_Matrix& matrix) override;
-  bool IsText() const override;
   CPDF_TextObject* AsText() override;
-  const CPDF_TextObject* AsText() const override;
 
   std::unique_ptr<CPDF_TextObject> Clone() const;
 
   size_t CountItems() const;
   Item GetItemInfo(size_t index) const;
 
-  size_t CountChars() const;
+  size_t CharCount() const { return char_codes_.size(); }
   uint32_t GetCharCode(size_t index) const;
   Item GetCharInfo(size_t index) const;
-  float GetCharWidth(uint32_t charcode) const;
+  float GetCharWidth(uint32_t char_code) const;
   int CountWords() const;
-  WideString GetWordString(int nWordIndex) const;
+  WideString GetWordString(int word_index) const;
 
   CFX_PointF GetPos() const { return pos_; }
   CFX_Matrix GetTextMatrix() const;
+  // EmbedPDF(lean-page-objects): the glyphs' box in text space, as the last
+  // position calculation found it.
+  const CFX_FloatRect& GetOriginalRect() const { return original_rect_; }
 
   RetainPtr<CPDF_Font> GetFont() const;
   float GetFontSize() const;
+  // EmbedPDF(redaction): redaction measures text with the spacing it was
+  // shown with.
   float GetCharSpace() const;
   float GetWordSpace() const;
 
@@ -68,15 +71,18 @@ class CPDF_TextObject final : public CPDF_PageObject {
   void SetPosition(const CFX_PointF& pos) { pos_ = pos; }
 
   const std::vector<uint32_t>& GetCharCodes() const { return char_codes_; }
-  const std::vector<float>& GetCharPositions() const { return char_pos_; }
+  const std::vector<float>& GetCharKernings() const { return char_kernings_; }
+  const std::vector<float>& GetCharPositions() const { return char_positions_; }
 
-  // Caller is expected to call SetDirty(true) when done changing the object.
+  // Caller is expected to call SetDirty(true) when done changing the object
+  // using these setters.
+  //
+  // `absolute_positions` must be one less than the `char_codes_` size.
+  bool SetAbsolutePositions(pdfium::span<const float> absolute_positions);
   void SetTextMatrix(const CFX_Matrix& matrix);
 
   void SetSegments(pdfium::span<const ByteString> strings,
                    pdfium::span<const float> kernings);
-
-  bool GetSeparatorAdjustment(size_t index, float* out_thousandths) const;
 
   CFX_PointF CalcPositionData(float horz_scale);
 
@@ -84,8 +90,20 @@ class CPDF_TextObject final : public CPDF_PageObject {
   float CalcPositionDataInternal(const RetainPtr<CPDF_Font>& font);
 
   CFX_PointF pos_;
+  // EmbedPDF(lean-page-objects): moved here from CPDF_PageObject.
+  CFX_FloatRect original_rect_;
+
+  // For a text object with N characters:
+  // - `char_codes_` has N elements.
+  // - `char_kernings_` has N elements, where each value is the adjustment
+  //   applied after the character at the same index. The last element always
+  //   has a value of 0.
+  // - `char_positions_` has N elements, where each value is the horizontal or
+  //   vertical offsets for the character at the same index, depending on text
+  //   direction. The first element is always 0.
   std::vector<uint32_t> char_codes_;
-  std::vector<float> char_pos_;
+  std::vector<float> char_kernings_;
+  std::vector<float> char_positions_;
 };
 
 #endif  // CORE_FPDFAPI_PAGE_CPDF_TEXTOBJECT_H_

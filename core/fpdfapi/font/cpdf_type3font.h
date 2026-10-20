@@ -28,17 +28,22 @@ class CPDF_Type3Font final : public CPDF_SimpleFont {
   ~CPDF_Type3Font() override;
 
   // CPDF_Font:
-  bool IsType3Font() const override;
-  const CPDF_Type3Font* AsType3Font() const override;
   CPDF_Type3Font* AsType3Font() override;
   void WillBeDestroyed() override;
-  int GetCharWidthF(uint32_t charcode) override;
+  int GetCharWidth(uint32_t charcode) override;
   FX_RECT GetCharBBox(uint32_t charcode) override;
 
   void SetPageResources(CPDF_Dictionary* pResources) {
     page_resources_.Reset(pResources);
   }
+  // EmbedPDF(faithful-content-rewrite, redaction): whether the font's glyph
+  // procedures look names up in the resources of the content using the font
+  // (SetPageResources()): when the font has no /Resources of its own.
+  static bool GlyphsUseContentResources(const CPDF_Dictionary* font_dict);
   CPDF_Type3Char* LoadChar(uint32_t charcode);
+  // EmbedPDF(redaction): the /CharProcs name of the glyph `charcode` draws, or
+  // null.
+  const char* GetCharProcName(uint32_t charcode) const;
   void CheckType3FontMetrics();
 
   CFX_Matrix& GetFontMatrix() { return font_matrix_; }
@@ -50,9 +55,6 @@ class CPDF_Type3Font final : public CPDF_SimpleFont {
 
   // CPDF_Font:
   bool Load() override;
-
-  // CPDF_SimpleFont:
-  void LoadGlyphMap() override;
 
   // The depth char loading is in, to avoid recurive calling LoadChar().
   int char_loading_depth_ = 0;

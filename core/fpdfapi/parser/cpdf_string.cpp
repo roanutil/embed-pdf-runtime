@@ -12,6 +12,7 @@
 
 #include "core/fpdfapi/parser/cpdf_encryptor.h"
 #include "core/fpdfapi/parser/cpdf_read_only_graph_guard.h"
+#include "core/fpdfapi/parser/cpdf_write_generation.h"
 #include "core/fpdfapi/parser/fpdf_parser_decode.h"
 #include "core/fxcrt/check.h"
 #include "core/fxcrt/data_vector.h"
@@ -19,24 +20,13 @@
 
 CPDF_String::CPDF_String() = default;
 
-CPDF_String::CPDF_String(WeakPtr<ByteStringPool> pool,
-                         pdfium::span<const uint8_t> data,
-                         DataType is_hex)
-    : data_(ByteStringView(data)), output_is_hex_(true) {
-  if (pool) {
-    data_ = pool->Intern(data_);
-  }
-}
+CPDF_String::CPDF_String(pdfium::span<const uint8_t> data, DataType is_hex)
+    : data_(ByteStringView(data)), output_is_hex_(true) {}
 
-CPDF_String::CPDF_String(WeakPtr<ByteStringPool> pool, const ByteString& str)
-    : data_(str) {
-  if (pool) {
-    data_ = pool->Intern(data_);
-  }
-}
+CPDF_String::CPDF_String(const ByteString& str) : data_(str) {}
 
-CPDF_String::CPDF_String(WeakPtr<ByteStringPool> pool, WideStringView str)
-    : CPDF_String(pool, PDF_EncodeText(str)) {
+CPDF_String::CPDF_String(WideStringView str)
+    : CPDF_String(PDF_EncodeText(str)) {
   // Delegates to ctor above.
 }
 
@@ -58,8 +48,10 @@ ByteString CPDF_String::GetString() const {
 }
 
 void CPDF_String::SetString(const ByteString& str) {
+  // EmbedPDF(write-generation, reads-dont-write): a write past the layer's
+  // door, or one during a read-only walk, is a bug.
   DCHECK_PDF_GRAPH_MUTABLE_FOR(this);
-  DCHECK(!IsFrozen());
+  DCHECK_PDF_WRITABLE(this);
   data_ = str;
 }
 
@@ -71,6 +63,7 @@ WideString CPDF_String::GetUnicodeText() const {
   return PDF_DecodeText(data_.unsigned_span());
 }
 
+// EmbedPDF(save-generations): writers carry the write context.
 bool CPDF_String::WriteTo(IFX_ArchiveStream* archive,
                           const CPDF_Encryptor* encryptor,
                           const CPDF_WriteContext* context) const {

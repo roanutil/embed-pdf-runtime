@@ -15,11 +15,11 @@
 #include <vector>
 
 #include "core/fpdfapi/parser/cpdf_object.h"
+#include "core/fxcrt/bytestring_pool.h"
 #include "core/fxcrt/check.h"
 #include "core/fxcrt/fx_coordinates.h"
 #include "core/fxcrt/fx_string.h"
 #include "core/fxcrt/retain_ptr.h"
-#include "core/fxcrt/string_pool_template.h"
 #include "core/fxcrt/weak_ptr.h"
 
 class CPDF_IndirectObjectHolder;
@@ -36,9 +36,11 @@ class CPDF_Dictionary final : public CPDF_Object {
   // CPDF_Object:
   Type GetType() const override;
   RetainPtr<CPDF_Object> Clone() const override;
+  // EmbedPDF(layer-door): the copy a layer makes of a base object.
   RetainPtr<CPDF_Object> CloneForHolder(
       CPDF_IndirectObjectHolder* holder) const override;
   CPDF_Dictionary* AsMutableDictionary() override;
+  // EmbedPDF(save-generations): writers carry the write context.
   using CPDF_Object::WriteTo;
   bool WriteTo(IFX_ArchiveStream* archive,
                const CPDF_Encryptor* encryptor,
@@ -46,6 +48,7 @@ class CPDF_Dictionary final : public CPDF_Object {
 
   bool IsLocked() const { return !!lock_count_; }
 
+  bool IsEmpty() const { return map_.empty(); }
   size_t size() const { return map_.size(); }
   RetainPtr<const CPDF_Object> GetObjectFor(ByteStringView key) const;
   RetainPtr<CPDF_Object> GetMutableObjectFor(ByteStringView key);
@@ -152,10 +155,12 @@ class CPDF_Dictionary final : public CPDF_Object {
   RetainPtr<CPDF_Object> CloneNonCyclic(
       bool bDirect,
       std::set<const CPDF_Object*>* visited) const override;
+  // EmbedPDF(layer-door, write-generation): copy-up, freeze and stamp walks.
   RetainPtr<CPDF_Object> CloneForHolderNonCyclic(
       CPDF_IndirectObjectHolder* holder,
       std::set<const CPDF_Object*>* visited) const override;
   void FreezeChildren(std::set<const CPDF_Object*>* visited) override;
+  void StampWriteGenerationOfChildren(uint32_t generation) override;
 
   mutable uint32_t lock_count_ = 0;
   WeakPtr<ByteStringPool> pool_;

@@ -12,6 +12,7 @@
 #include <set>
 #include <type_traits>
 
+#include "core/fpdfapi/parser/cpdf_write_generation.h"
 #include "core/fxcrt/fx_string.h"
 #include "core/fxcrt/retain_ptr.h"
 
@@ -26,7 +27,7 @@ class CPDF_Number;
 class CPDF_Reference;
 class CPDF_Stream;
 class CPDF_String;
-class CPDF_WriteContext;
+class CPDF_WriteContext;  // EmbedPDF(save-generations): see WriteTo().
 class IFX_ArchiveStream;
 
 // ISO 32000-1:2008 defines PDF objects. When CPDF_Parser parses a PDF object,
@@ -75,15 +76,28 @@ class CPDF_Object : public Retainable {
   // Create a deep copy of the object.
   virtual RetainPtr<CPDF_Object> Clone() const = 0;
 
-  // Create a deep copy of the object for `holder`. References in the clone are
-  // retargeted to `holder`, so promoted layer objects resolve through the
-  // layer overlay rather than the frozen base.
+  // EmbedPDF(layer-door): a deep copy of the object for `holder`. References
+  // in the clone are retargeted to `holder`, so promoted layer objects
+  // resolve through the layer overlay rather than the frozen base.
   virtual RetainPtr<CPDF_Object> CloneForHolder(
       CPDF_IndirectObjectHolder* holder) const;
 
   void Freeze();
   void FreezeForHolder(std::set<const CPDF_Object*>* visited);
-  bool IsFrozen() const { return frozen_; }
+  bool IsFrozen() const {
+    return write_generation_ == CPDF_WriteGeneration::kFrozen;
+  }
+
+  // EmbedPDF(write-generation): which layer transaction may write this object
+  // (see CPDF_WriteGeneration): 0 while detached, kFrozen once frozen.
+  uint32_t write_generation() const { return write_generation_; }
+  // Gives `generation` to this object and to every direct child below it
+  // that is still detached (0). A reference is a direct child; what it refers
+  // to is not. A nonzero generation is never changed.
+  void StampWriteGeneration(uint32_t generation);
+  // Whether a write is allowed now: not frozen, and, while a layer
+  // transaction is open on this thread, detached or that transaction's own.
+  bool IsWritable() const;
 
   // Create a deep copy of the object except any reference object be
   // copied to the object it points to directly.
@@ -108,6 +122,8 @@ class CPDF_Object : public Retainable {
   virtual CPDF_Stream* AsMutableStream();
   virtual CPDF_String* AsMutableString();
 
+  // EmbedPDF(save-generations): writers carry the write context; this keeps
+  // upstream's two-argument calls working.
   bool WriteTo(IFX_ArchiveStream* archive,
                const CPDF_Encryptor* encryptor) const {
     return WriteTo(archive, encryptor, nullptr);
@@ -126,6 +142,7 @@ class CPDF_Object : public Retainable {
       bool bDirect,
       std::set<const CPDF_Object*>* pVisited) const;
 
+  // EmbedPDF(layer-door, write-generation): copy-up, freeze and stamp walks.
   virtual RetainPtr<CPDF_Object> CloneForHolderNonCyclic(
       CPDF_IndirectObjectHolder* holder,
       std::set<const CPDF_Object*>* pVisited) const;
@@ -136,8 +153,10 @@ class CPDF_Object : public Retainable {
       CPDF_IndirectObjectHolder* holder) const;
 
   virtual void FreezeChildren(std::set<const CPDF_Object*>* visited);
+  virtual void StampWriteGenerationOfChildren(uint32_t generation);
 
   RetainPtr<const CPDF_Object> GetDirect() const;  // Wraps virtual method.
+  // EmbedPDF(layer-door): virtual so a reference resolves through the door.
   virtual RetainPtr<CPDF_Object> GetMutableDirect();
   // Wraps virtual method.
   RetainPtr<const CPDF_Dictionary> GetDict() const;  // Wraps virtual method.
@@ -179,15 +198,16 @@ class CPDF_Object : public Retainable {
 
   uint32_t obj_num_ = 0;
   uint32_t gen_num_ = 0;
-  bool frozen_ = false;
+  // EmbedPDF(write-generation): frozen is a generation (kFrozen), so the word
+  // replaces the old `bool frozen_` and objects stay the size they were.
+  uint32_t write_generation_ = 0;
 };
 
 template <typename T>
 struct CanInternStrings {
   static constexpr bool value = std::is_same<T, CPDF_Array>::value ||
                                 std::is_same<T, CPDF_Dictionary>::value ||
-                                std::is_same<T, CPDF_Name>::value ||
-                                std::is_same<T, CPDF_String>::value;
+                                std::is_same<T, CPDF_Name>::value;
 };
 
 #endif  // CORE_FPDFAPI_PARSER_CPDF_OBJECT_H_

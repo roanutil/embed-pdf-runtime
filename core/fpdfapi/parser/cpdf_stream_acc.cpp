@@ -6,6 +6,8 @@
 
 #include "core/fpdfapi/parser/cpdf_stream_acc.h"
 
+#include <memory>
+#include <optional>
 #include <utility>
 #include <variant>
 
@@ -13,9 +15,11 @@
 #include "core/fpdfapi/parser/cpdf_dictionary.h"
 #include "core/fpdfapi/parser/cpdf_stream.h"
 #include "core/fpdfapi/parser/fpdf_parser_decode.h"
+#include "core/fxcodec/flate/flatemodule.h"
 #include "core/fxcrt/check_op.h"
 #include "core/fxcrt/compiler_specific.h"
 #include "core/fxcrt/data_vector.h"
+#include "core/fxcrt/pauseindicator_iface.h"
 
 CPDF_StreamAcc::CPDF_StreamAcc(RetainPtr<const CPDF_Stream> pStream)
     : stream_(std::move(pStream)) {}
@@ -59,6 +63,79 @@ void CPDF_StreamAcc::LoadAllDataRaw() {
   LoadAllData(true, 0, false);
 }
 
+// EmbedPDF(sliced-load): a long content stream inflates in slices that can
+// pause between steps.
+bool CPDF_StreamAcc::LoadAllDataFilteredInSteps(PauseIndicatorIface* pause) {
+  if (step_load_ == StepLoad::kNotStarted) {
+    if (!StartInflating()) {
+      step_load_ = StepLoad::kLoaded;
+      LoadAllDataFiltered();
+      return true;
+    }
+    step_load_ = StepLoad::kInflating;
+  }
+  if (step_load_ == StepLoad::kLoaded) {
+    return true;
+  }
+
+  static constexpr size_t kInflateStepBytes = 1024 * 1024;
+  while (uncompressor_->Continue(kInflateStepBytes)) {
+    if (pause && pause->NeedToPauseNow()) {
+      return false;
+    }
+  }
+  FinishInflating();
+  step_load_ = StepLoad::kLoaded;
+  return true;
+}
+
+// The streams LoadAllDataFiltered() inflates with FlateUncompress() and
+// nothing else: one FlateDecode filter, no DecodeParms (so no predictor), raw
+// bytes to read. Inflating them in pieces gives the same bytes.
+bool CPDF_StreamAcc::StartInflating() {
+  if (!stream_ || !stream_->HasFilter() || stream_->GetRawSize() == 0) {
+    return false;
+  }
+  std::optional<DecoderArray> decoders = GetDecoderArray(stream_->GetDict());
+  if (!decoders.has_value() || decoders.value().size() != 1) {
+    return false;
+  }
+  const ByteString& filter = decoders.value().front().first;
+  if ((filter != "FlateDecode" && filter != "Fl") ||
+      ToDictionary(decoders.value().front().second)) {
+    return false;
+  }
+
+  pdfium::span<const uint8_t> src;
+  if (stream_->IsMemoryBased()) {
+    src = stream_->GetInMemoryRawData();
+    inflate_src_ = src;
+  } else {
+    DataVector<uint8_t> raw = ReadRawStream();
+    if (raw.empty()) {
+      return false;
+    }
+    inflate_src_ = std::move(raw);
+    src = pdfium::span(std::get<DataVector<uint8_t>>(inflate_src_));
+  }
+  uncompressor_ =
+      std::make_unique<fxcodec::FlateUncompressor>(src, /*orig_size=*/0);
+  return true;
+}
+
+void CPDF_StreamAcc::FinishInflating() {
+  DataAndBytesConsumed result = uncompressor_->TakeResult();
+  uncompressor_.reset();
+  // As in ProcessFilteredData(): a stream that inflates to nothing keeps its
+  // raw bytes.
+  if (result.data.empty()) {
+    data_ = std::move(inflate_src_);
+  } else {
+    data_ = std::move(result.data);
+  }
+  inflate_src_ = pdfium::raw_span<const uint8_t>();
+}
+
 RetainPtr<const CPDF_Stream> CPDF_StreamAcc::GetStream() const {
   return stream_;
 }
@@ -90,16 +167,14 @@ uint64_t CPDF_StreamAcc::KeyForCache() const {
 }
 
 DataVector<uint8_t> CPDF_StreamAcc::ComputeDigest() const {
-  return CRYPT_SHA1Generate(GetSpan());
+  return CryptSha1Generate(GetSpan());
 }
 
 DataVector<uint8_t> CPDF_StreamAcc::DetachData() {
   if (is_owned()) {
     return std::move(std::get<DataVector<uint8_t>>(data_));
   }
-
-  auto span = std::get<pdfium::raw_span<const uint8_t>>(data_);
-  return DataVector<uint8_t>(span.begin(), span.end());
+  return ToDataVector(std::get<pdfium::raw_span<const uint8_t>>(data_));
 }
 
 void CPDF_StreamAcc::ProcessRawData() {

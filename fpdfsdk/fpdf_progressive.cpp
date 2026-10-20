@@ -12,11 +12,15 @@
 #include "core/fpdfapi/page/cpdf_page.h"
 #include "core/fpdfapi/render/cpdf_pagerendercontext.h"
 #include "core/fpdfapi/render/cpdf_progressiverenderer.h"
-#include "core/fxge/cfx_defaultrenderdevice.h"
+#include "core/fxcrt/fx_coordinates.h"
+#include "core/fxge/cfx_gemodule.h"
+#include "core/fxge/cfx_renderdevice.h"
 #include "core/fxge/dib/cfx_dibitmap.h"
 #include "fpdfsdk/cpdfsdk_helpers.h"
 #include "fpdfsdk/cpdfsdk_pauseadapter.h"
 #include "fpdfsdk/cpdfsdk_renderpage.h"
+#include "fpdfsdk/epdf_budget_pause.h"
+#include "public/epdf_progressive.h"
 #include "public/fpdfview.h"
 
 // These checks are here because core/ and public/ cannot depend on each other.
@@ -36,6 +40,21 @@ int ToFPDFStatus(CPDF_ProgressiveRenderer::Status status) {
   return static_cast<int>(status);
 }
 
+// EmbedPDF(epdf-api): a helper for the EPDF_RenderPage* sliced render.
+// The status of a render after one of its slices. A render that ended hands
+// the bitmap back in the alpha form it came in.
+int SliceStatus(CPDF_PageRenderContext* context) {
+  const int status = ToFPDFStatus(context->renderer_->GetStatus());
+#if defined(PDF_USE_SKIA)
+  if (status != FPDF_RENDER_TOBECONTINUED &&
+      CFX_GEModule::Get()->UseSkiaRenderer() &&
+      !context->return_premultiplied_) {
+    context->device_->GetBitmap()->UnPreMultiply();
+  }
+#endif  // defined(PDF_USE_SKIA)
+  return status;
+}
+
 }  // namespace
 
 FPDF_EXPORT int FPDF_CALLCONV
@@ -53,6 +72,7 @@ FPDF_RenderPageBitmapWithColorScheme_Start(FPDF_BITMAP bitmap,
     return FPDF_RENDER_FAILED;
   }
 
+  // EmbedPDF(view-scope): read through the document's view scope.
   ScopedFPDFPageView page_view(page);
   if (!page_view) {
     return FPDF_RENDER_FAILED;
@@ -71,13 +91,22 @@ FPDF_RenderPageBitmapWithColorScheme_Start(FPDF_BITMAP bitmap,
   context->return_premultiplied_ = pBitmap->IsPremultiplied();
 
 #if defined(PDF_USE_SKIA)
-  if (CFX_DefaultRenderDevice::UseSkiaRenderer()) {
+  if (CFX_GEModule::IsSkiaRenderer()) {
     pBitmap->PreMultiply();
   }
 #endif
 
-  auto device = std::make_unique<CFX_DefaultRenderDevice>();
-  device->AttachWithRgbByteOrder(pBitmap, !!(flags & FPDF_REVERSE_BYTE_ORDER));
+  auto device =
+      CFX_RenderDevice::CreateForBitmap(pBitmap, /*backdrop_bitmap=*/nullptr,
+                                        !!(flags & FPDF_REVERSE_BYTE_ORDER));
+  if (!device) {
+#if defined(PDF_USE_SKIA)
+    if (CFX_GEModule::IsSkiaRenderer() && !context->return_premultiplied_) {
+      pBitmap->UnPreMultiply();
+    }
+#endif  // defined(PDF_USE_SKIA)
+    return FPDF_RENDER_FAILED;
+  }
   context->device_ = std::move(device);
 
   CPDFSDK_PauseAdapter pause_adapter(pause);
@@ -87,8 +116,7 @@ FPDF_RenderPageBitmapWithColorScheme_Start(FPDF_BITMAP bitmap,
 
   if (!context->renderer_) {
 #if defined(PDF_USE_SKIA)
-    if (CFX_DefaultRenderDevice::UseSkiaRenderer() &&
-        !context->return_premultiplied_) {
+    if (CFX_GEModule::IsSkiaRenderer() && !context->return_premultiplied_) {
       pBitmap->UnPreMultiply();
     }
 #endif  // defined(PDF_USE_SKIA)
@@ -107,8 +135,7 @@ FPDF_RenderPageBitmapWithColorScheme_Start(FPDF_BITMAP bitmap,
   }
 
 #if defined(PDF_USE_SKIA)
-  if (CFX_DefaultRenderDevice::UseSkiaRenderer() &&
-      !context->return_premultiplied_) {
+  if (CFX_GEModule::IsSkiaRenderer() && !context->return_premultiplied_) {
     pBitmap->UnPreMultiply();
   }
 #endif  // defined(PDF_USE_SKIA)
@@ -135,6 +162,7 @@ FPDF_EXPORT int FPDF_CALLCONV FPDF_RenderPage_Continue(FPDF_PAGE page,
     return FPDF_RENDER_FAILED;
   }
 
+  // EmbedPDF(view-scope): read through the document's view scope.
   ScopedFPDFPageView page_view(page);
   if (!page_view) {
     return FPDF_RENDER_FAILED;
@@ -156,8 +184,7 @@ FPDF_EXPORT int FPDF_CALLCONV FPDF_RenderPage_Continue(FPDF_PAGE page,
   }
 
 #if defined(PDF_USE_SKIA)
-  if (CFX_DefaultRenderDevice::UseSkiaRenderer() &&
-      !context->return_premultiplied_) {
+  if (CFX_GEModule::IsSkiaRenderer() && !context->return_premultiplied_) {
     context->device_->GetBitmap()->UnPreMultiply();
   }
 #endif  // defined(PDF_USE_SKIA)
@@ -169,4 +196,94 @@ FPDF_EXPORT void FPDF_CALLCONV FPDF_RenderPage_Close(FPDF_PAGE page) {
   if (pPage) {
     pPage->ClearRenderContext();
   }
+}
+
+// EmbedPDF(epdf-api): EPDF_RenderPageBitmapWithMatrix_Start and
+// EPDF_RenderPage_Continue, a render in slices on a time budget.
+FPDF_EXPORT int FPDF_CALLCONV
+EPDF_RenderPageBitmapWithMatrix_Start(FPDF_BITMAP bitmap,
+                                      FPDF_PAGE page,
+                                      const FS_MATRIX* matrix,
+                                      const FS_RECTF* clipping,
+                                      int flags,
+                                      int budget_ms) {
+  ScopedFPDFPageView page_view(page);
+  if (!page_view) {
+    return FPDF_RENDER_FAILED;
+  }
+  CPDF_Page* pPage = page_view.Get();
+  // A page holds one render at a time.
+  if (pPage->GetRenderContext()) {
+    return FPDF_RENDER_FAILED;
+  }
+
+  RetainPtr<CFX_DIBitmap> pBitmap(CFXDIBitmapFromFPDFBitmap(bitmap));
+  if (!pBitmap) {
+    return FPDF_RENDER_FAILED;
+  }
+  ValidateBitmapPremultiplyState(pBitmap);
+
+  auto owned_context = std::make_unique<CPDF_PageRenderContext>();
+  CPDF_PageRenderContext* context = owned_context.get();
+  pPage->SetRenderContext(std::move(owned_context));
+  context->return_premultiplied_ = pBitmap->IsPremultiplied();
+
+#if defined(PDF_USE_SKIA)
+  if (CFX_GEModule::Get()->UseSkiaRenderer()) {
+    pBitmap->PreMultiply();
+  }
+#endif
+
+  auto device = CFX_RenderDevice::CreateForBitmap(
+      pBitmap, /*backdrop_bitmap=*/nullptr,
+      !!(flags & FPDF_REVERSE_BYTE_ORDER));
+  if (!device) {
+#if defined(PDF_USE_SKIA)
+    if (CFX_GEModule::Get()->UseSkiaRenderer() &&
+        !context->return_premultiplied_) {
+      pBitmap->UnPreMultiply();
+    }
+#endif  // defined(PDF_USE_SKIA)
+    // The page stays free for the next render.
+    pPage->ClearRenderContext();
+    return FPDF_RENDER_FAILED;
+  }
+  context->device_ = std::move(device);
+
+  // The clip and transform of FPDF_RenderPageBitmapWithMatrix().
+  CFX_FloatRect clipping_rect;
+  if (clipping) {
+    clipping_rect = CFXFloatRectFromFSRectF(*clipping);
+  }
+  CFX_Matrix transform_matrix = pPage->GetDisplayMatrix();
+  if (matrix) {
+    transform_matrix *= CFXMatrixFromFSMatrix(*matrix);
+  }
+
+  EPDF_BudgetPause pause(budget_ms);
+  CPDFSDK_StartRenderPage(context, pPage, transform_matrix,
+                          clipping_rect.ToFxRect(), flags, &pause);
+  return SliceStatus(context);
+}
+
+FPDF_EXPORT int FPDF_CALLCONV EPDF_RenderPage_Continue(FPDF_PAGE page,
+                                                       int budget_ms) {
+  ScopedFPDFPageView page_view(page);
+  if (!page_view) {
+    return FPDF_RENDER_FAILED;
+  }
+  auto* context =
+      static_cast<CPDF_PageRenderContext*>(page_view.Get()->GetRenderContext());
+  if (!context || !context->renderer_) {
+    return FPDF_RENDER_FAILED;
+  }
+  // A render that already ended has handed its bitmap back.
+  if (context->renderer_->GetStatus() !=
+      CPDF_ProgressiveRenderer::kToBeContinued) {
+    return ToFPDFStatus(context->renderer_->GetStatus());
+  }
+
+  EPDF_BudgetPause pause(budget_ms);
+  context->renderer_->Continue(&pause);
+  return SliceStatus(context);
 }

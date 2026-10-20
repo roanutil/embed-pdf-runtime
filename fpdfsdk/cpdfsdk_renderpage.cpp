@@ -16,12 +16,16 @@
 #include "core/fpdfapi/render/cpdf_progressiverenderer.h"
 #include "core/fpdfapi/render/cpdf_renderoptions.h"
 #include "core/fpdfdoc/cpdf_annotlist.h"
+#include "core/fxcrt/pauseindicator_iface.h"
 #include "core/fxge/cfx_renderdevice.h"
 #include "fpdfsdk/cpdfsdk_helpers.h"
 #include "fpdfsdk/cpdfsdk_pauseadapter.h"
+#include "public/epdf_view.h"
 
 namespace {
 
+// EmbedPDF(sliced-render): takes any pause indicator, so a sliced render can
+// pause on a time budget.
 void RenderPageImpl(CPDF_PageRenderContext* context,
                     CPDF_Page* pPage,
                     const CFX_Matrix& matrix,
@@ -29,7 +33,7 @@ void RenderPageImpl(CPDF_PageRenderContext* context,
                     int flags,
                     const FPDF_COLORSCHEME* color_scheme,
                     bool need_to_restore,
-                    CPDFSDK_PauseAdapter* pause) {
+                    PauseIndicatorIface* pause) {
   if (!context->options_) {
     context->options_ = std::make_unique<CPDF_RenderOptions>();
   }
@@ -62,6 +66,8 @@ void RenderPageImpl(CPDF_PageRenderContext* context,
   context->device_->SaveState();
   context->device_->SetBaseClip(clipping_rect);
   context->device_->SetClip_Rect(clipping_rect);
+  // EmbedPDF(reads-dont-write): a render reads the page's resources without
+  // the mutable getter, which would promote them on a layer.
   context->context_ = std::make_unique<CPDF_RenderContext>(
       pPage->GetDocument(),
       pdfium::WrapRetain(
@@ -70,7 +76,13 @@ void RenderPageImpl(CPDF_PageRenderContext* context,
 
   context->context_->AppendLayer(pPage, matrix);
 
-  if (flags & FPDF_ANNOT) {
+  // EmbedPDF(annot-appearance): annotations (FPDF_ANNOT) and form field
+  // widgets (EPDF_RENDER_WIDGETS) are drawn independently, so a page picture
+  // can hold either, both or neither: a viewer paints its own layers over the
+  // rest.
+  const bool bShowAnnots = !!(flags & FPDF_ANNOT);
+  const bool bShowWidget = !!(flags & EPDF_RENDER_WIDGETS);
+  if (bShowAnnots || bShowWidget) {
     auto pOwnedList = std::make_unique<CPDF_AnnotList>(pPage);
     CPDF_AnnotList* pList = pOwnedList.get();
     context->annots_ = std::move(pOwnedList);
@@ -79,10 +91,8 @@ void RenderPageImpl(CPDF_PageRenderContext* context,
     is_printing |= context->device_->GetDeviceType() == DeviceType::kPrinter;
 #endif
 
-    // TODO(https://crbug.com/42271964) - maybe pass true here.
-    const bool bShowWidget = false;
     pList->DisplayAnnots(context->context_.get(), is_printing, matrix,
-                         bShowWidget);
+                         bShowAnnots, bShowWidget);
   }
 
   context->renderer_ = std::make_unique<CPDF_ProgressiveRenderer>(
@@ -103,6 +113,18 @@ void CPDFSDK_RenderPage(CPDF_PageRenderContext* context,
                         const FPDF_COLORSCHEME* color_scheme) {
   RenderPageImpl(context, pPage, matrix, clipping_rect, flags, color_scheme,
                  /*need_to_restore=*/true, /*pause=*/nullptr);
+}
+
+// EmbedPDF(sliced-render): a render that pauses between slices; the context
+// keeps it until the caller continues or cancels it.
+void CPDFSDK_StartRenderPage(CPDF_PageRenderContext* context,
+                             CPDF_Page* pPage,
+                             const CFX_Matrix& matrix,
+                             const FX_RECT& clipping_rect,
+                             int flags,
+                             PauseIndicatorIface* pause) {
+  RenderPageImpl(context, pPage, matrix, clipping_rect, flags,
+                 /*color_scheme=*/nullptr, /*need_to_restore=*/false, pause);
 }
 
 void CPDFSDK_RenderPageWithContext(CPDF_PageRenderContext* context,

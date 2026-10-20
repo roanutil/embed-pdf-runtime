@@ -6,6 +6,7 @@
 
 #include "core/fpdfapi/page/cpdf_clippath.h"
 
+#include <optional>
 #include <utility>
 
 #include "core/fpdfapi/page/cpdf_textobject.h"
@@ -86,10 +87,11 @@ void CPDF_ClipPath::AppendPathWithAutoMerge(
   PathData* pData = ref_.GetPrivateCopy();
   if (!pData->path_and_type_list_.empty()) {
     const CPDF_Path& old_path = pData->path_and_type_list_.back().first;
-    if (old_path.IsRect()) {
+    std::optional<CFX_PointF> corner = old_path.GetRectOppositeCorner();
+    if (corner.has_value()) {
       CFX_PointF point0 = old_path.GetPoint(0);
-      CFX_PointF point2 = old_path.GetPoint(2);
-      CFX_FloatRect old_rect(point0.x, point0.y, point2.x, point2.y);
+      CFX_FloatRect old_rect(point0.x, point0.y, corner.value().x,
+                             corner.value().y);
       CFX_FloatRect new_rect = path.GetBoundingBox();
       if (old_rect.Contains(new_rect)) {
         pData->path_and_type_list_.pop_back();
@@ -110,6 +112,42 @@ void CPDF_ClipPath::AppendTexts(
     pData->text_list_.push_back(nullptr);
   }
   pTexts->clear();
+}
+
+// EmbedPDF(redaction): clip-text copies are redacted with their text.
+void CPDF_ClipPath::EditTexts(
+    const std::function<bool(CPDF_TextObject*)>& edit) {
+  PathData* data = ref_.GetPrivateCopy();
+  std::vector<std::unique_ptr<CPDF_TextObject>> kept;
+  bool group_had_text = false;
+  bool group_kept_text = false;
+  bool clip_everything = false;
+  for (std::unique_ptr<CPDF_TextObject>& text : data->text_list_) {
+    if (!text) {
+      // The end of a BT ... ET.
+      if (group_kept_text) {
+        kept.push_back(nullptr);
+      } else if (group_had_text) {
+        clip_everything = true;
+      }
+      group_had_text = false;
+      group_kept_text = false;
+      continue;
+    }
+    group_had_text = true;
+    if (edit(text.get())) {
+      kept.push_back(std::move(text));
+      group_kept_text = true;
+    }
+  }
+  data->text_list_ = std::move(kept);
+  if (clip_everything) {
+    CPDF_Path nothing;
+    nothing.Emplace();
+    nothing.AppendRect(0, 0, 0, 0);
+    data->path_and_type_list_.emplace_back(
+        nothing, CFX_FillRenderOptions::FillType::kWinding);
+  }
 }
 
 void CPDF_ClipPath::CopyClipPath(const CPDF_ClipPath& that) {

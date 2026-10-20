@@ -3,6 +3,7 @@
 # found in the LICENSE file.
 
 import("//build/config/arm.gni")
+import("//build/config/gclient_args.gni")
 import("//build/config/linux/pkg_config.gni")
 import("//build/config/mips.gni")
 import("//build_overrides/build.gni")
@@ -37,7 +38,7 @@ if (pdf_enable_xfa) {
   }
 }
 
-if (pdf_bundle_freetype) {
+if (pdf_enable_freetype && pdf_bundle_freetype) {
   config("freetype_public_includes_config") {
     # The relative freetype/include path points to PDFium's custom config.
     # The absolute path points to whatever copy of FreeType is in
@@ -204,57 +205,62 @@ if (is_linux || is_chromeos) {
   config("system_fontconfig") {
     libs = [ "fontconfig" ]
   }
+
   group("fontconfig") {
     public_configs = [ ":system_fontconfig" ]
   }
 }
 
-config("fx_agg_warnings") {
-  visibility = [ ":fx_agg" ]
-  if (is_clang) {
-    # calc_butt_cap() in agg_vcgen_stroke.cpp is unused.
-    cflags = [ "-Wno-unused-function" ]
+if (pdf_use_agg) {
+  config("fx_agg_warnings") {
+    visibility = [ ":fx_agg" ]
+    if (is_clang) {
+      # calc_butt_cap() in agg_vcgen_stroke.cpp is unused.
+      cflags = [ "-Wno-unused-function" ]
+    }
   }
-}
-source_set("fx_agg") {
-  configs -= [ "//build/config/compiler:chromium_code" ]
-  configs += [
-    "//build/config/compiler:no_chromium_code",
-    ":pdfium_third_party_config",
 
-    # Must be after no_chromium_code for warning flags to be ordered correctly.
-    ":fx_agg_warnings",
-  ]
-  sources = [
-    "agg23/agg_array.h",
-    "agg23/agg_basics.h",
-    "agg23/agg_clip_liang_barsky.h",
-    "agg23/agg_color_gray.h",
-    "agg23/agg_conv_adaptor_vcgen.h",
-    "agg23/agg_conv_dash.h",
-    "agg23/agg_conv_stroke.h",
-    "agg23/agg_curves.cpp",
-    "agg23/agg_curves.h",
-    "agg23/agg_math.h",
-    "agg23/agg_math_stroke.h",
-    "agg23/agg_path_storage.cpp",
-    "agg23/agg_path_storage.h",
-    "agg23/agg_pixfmt_gray.h",
-    "agg23/agg_rasterizer_scanline_aa.cpp",
-    "agg23/agg_rasterizer_scanline_aa.h",
-    "agg23/agg_render_scanlines.h",
-    "agg23/agg_renderer_base.h",
-    "agg23/agg_renderer_scanline.h",
-    "agg23/agg_rendering_buffer.h",
-    "agg23/agg_scanline_u.h",
-    "agg23/agg_shorten_path.h",
-    "agg23/agg_vcgen_dash.cpp",
-    "agg23/agg_vcgen_dash.h",
-    "agg23/agg_vcgen_stroke.cpp",
-    "agg23/agg_vcgen_stroke.h",
-    "agg23/agg_vertex_sequence.h",
-  ]
-  deps = [ "../core/fxcrt" ]
+  source_set("fx_agg") {
+    configs -= [ "//build/config/compiler:chromium_code" ]
+    configs += [
+      "//build/config/compiler:no_chromium_code",
+      ":pdfium_third_party_config",
+
+      # Must be after no_chromium_code for warning flags to be ordered
+      # correctly.
+      ":fx_agg_warnings",
+    ]
+    sources = [
+      "agg23/agg_array.h",
+      "agg23/agg_basics.h",
+      "agg23/agg_clip_liang_barsky.h",
+      "agg23/agg_color_gray.h",
+      "agg23/agg_conv_adaptor_vcgen.h",
+      "agg23/agg_conv_dash.h",
+      "agg23/agg_conv_stroke.h",
+      "agg23/agg_curves.cpp",
+      "agg23/agg_curves.h",
+      "agg23/agg_math.h",
+      "agg23/agg_math_stroke.h",
+      "agg23/agg_path_storage.cpp",
+      "agg23/agg_path_storage.h",
+      "agg23/agg_pixfmt_gray.h",
+      "agg23/agg_rasterizer_scanline_aa.cpp",
+      "agg23/agg_rasterizer_scanline_aa.h",
+      "agg23/agg_render_scanlines.h",
+      "agg23/agg_renderer_base.h",
+      "agg23/agg_renderer_scanline.h",
+      "agg23/agg_rendering_buffer.h",
+      "agg23/agg_scanline_u.h",
+      "agg23/agg_shorten_path.h",
+      "agg23/agg_vcgen_dash.cpp",
+      "agg23/agg_vcgen_dash.h",
+      "agg23/agg_vcgen_stroke.cpp",
+      "agg23/agg_vcgen_stroke.h",
+      "agg23/agg_vertex_sequence.h",
+    ]
+    public_deps = [ "../core/fxcrt" ]
+  }
 }
 
 config("fx_lcms2_warnings") {
@@ -337,8 +343,8 @@ if (!build_with_chromium) {
   }
 
   # This is a meta target that forwards to the system's libjpeg,
-  # third_party/libjpeg, or third_party/libjpeg_turbo depending on the build args
-  # declared in this file.
+  # third_party/libjpeg, or third_party/libjpeg_turbo depending on the build
+  # args declared in this file.
   group("jpeg") {
     if (use_system_libjpeg) {
       public_configs = [ ":system_libjpeg_config" ]
@@ -348,6 +354,11 @@ if (!build_with_chromium) {
     } else {
       public_deps = [ "//third_party/libjpeg" ]
     }
+  }
+
+  # Stub target for //third_party/libyuv, which references
+  # //third_party:jpeg_includes when libyuv_disable_jpeg is false.
+  group("jpeg_includes") {
   }
 }
 
@@ -370,6 +381,7 @@ if (use_system_lcms2) {
     packages = [ "lcms2" ]
   }
 }
+
 group("lcms2") {
   if (use_system_lcms2) {
     public_configs = [ ":lcms2_from_pkgconfig" ]
@@ -384,6 +396,7 @@ if (use_system_libopenjpeg2) {
     packages = [ "libopenjp2" ]
   }
 }
+
 group("libopenjpeg2") {
   if (use_system_libopenjpeg2) {
     public_configs = [ ":libopenjpeg2_from_pkgconfig" ]
@@ -444,6 +457,10 @@ source_set("fx_libopenjpeg") {
 }
 
 if (!pdf_enable_rust_png) {
+  assert(
+      use_system_libpng || checkout_libpng,
+      "Cannot use bundled libpng without checkout_libpng. Enable pdf_enable_rust_png or use_system_libpng.")
+
   config("system_libpng_config") {
     libs = [ "png" ]
     defines = [ "USE_SYSTEM_LIBPNG" ]
@@ -458,7 +475,7 @@ if (!pdf_enable_rust_png) {
   }
 }
 
-if (pdf_enable_xfa_tiff) {
+if (pdf_enable_xfa) {
   if (use_system_libtiff) {
     config("system_tiff_config") {
       libs = [ "tiff" ]
@@ -534,9 +551,10 @@ if (pdf_enable_xfa_tiff) {
 if (pdf_use_partition_alloc) {
   group("pdfium_pa") {
     public_deps = [
-      "//base/allocator/partition_allocator/src/partition_alloc:partition_alloc_buildflags",
+      "//base/allocator/partition_allocator/src/partition_alloc",
+      "//base/allocator/partition_allocator/src/partition_alloc:buildflags",
       "//base/allocator/partition_allocator/src/partition_alloc:raw_ptr",
     ]
-    deps = [ "//base/allocator/partition_allocator/src/partition_alloc" ]
+    visibility = [ "../*" ]
   }
 }

@@ -9,8 +9,11 @@
 
 #include <stdint.h>
 
+namespace pdfium {
+namespace unicode {
+
 // NOTE: Order matters, less-than/greater-than comparisons are used.
-enum class FX_BIDICLASS : uint8_t {
+enum class BidiClass : uint8_t {
   kON = 0,    // Other Neutral
   kL = 1,     // Left Letter
   kR = 2,     // Right Letter
@@ -33,10 +36,10 @@ enum class FX_BIDICLASS : uint8_t {
   kN = kON,
 };
 
-// EmbedPDF: compiled unconditionally (the rich text line breaker in
+// EmbedPDF(rich-text): compiled unconditionally (the rich text line breaker in
 // core/fpdfdoc uses it); it used to be XFA-only.
 // As defined in http://www.unicode.org/reports/tr14
-enum class FX_BREAKPROPERTY : uint8_t {
+enum class BreakProperty : uint8_t {
   kOP = 0,
   kCL = 1,
   kQU = 2,
@@ -77,7 +80,7 @@ enum class FX_BREAKPROPERTY : uint8_t {
   kTB = 37,
 };
 
-enum class FX_CHARTYPE : uint8_t {
+enum class CharType : uint8_t {
   kUnknown = 0,
   kTab,
   kSpace,
@@ -92,9 +95,7 @@ enum class FX_CHARTYPE : uint8_t {
   kArabicForm,
   kArabic,
 };
-
-namespace pdfium {
-namespace unicode {
+// EmbedPDF(rich-text): the PDF_ENABLE_XFA guard ended here; see above.
 
 constexpr wchar_t kRightSingleQuotationMark = 0x2019;
 constexpr wchar_t kLineSeparator = 0x2028;
@@ -103,15 +104,22 @@ constexpr wchar_t kBoxDrawingsLightVerical = 0x2502;
 constexpr wchar_t kZeroWidthNoBreakSpace = 0xfeff;
 
 wchar_t GetMirrorChar(wchar_t wch);
-FX_BIDICLASS GetBidiClass(wchar_t wch);
+BidiClass GetBidiClass(wchar_t wch);
 
-FX_CHARTYPE GetCharType(wchar_t wch);
+// EmbedPDF(rich-text): no PDF_ENABLE_XFA guard around these two: the rich text
+// line breaker uses them too.
+CharType GetCharType(wchar_t wch);
 
 // Analagous to ULineBreak in icu's uchar.h, but permuted order, and a
 // subset lacking some more recent additions.
-FX_BREAKPROPERTY GetBreakProperty(wchar_t wch);
+BreakProperty GetBreakProperty(wchar_t wch);
 
 }  // namespace unicode
 }  // namespace pdfium
+
+using pdfium::unicode::BidiClass;
+// EmbedPDF(rich-text): no PDF_ENABLE_XFA guard, like the types they name.
+using pdfium::unicode::BreakProperty;
+using pdfium::unicode::CharType;
 
 #endif  // CORE_FXCRT_FX_UNICODE_H_

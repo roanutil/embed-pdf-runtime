@@ -7,6 +7,7 @@
 #include "public/fpdf_doc.h"
 
 #include <memory>
+#include <optional>
 #include <set>
 #include <utility>
 #include <vector>
@@ -28,13 +29,15 @@
 #include "core/fpdfdoc/cpdf_dest.h"
 #include "core/fpdfdoc/cpdf_linklist.h"
 #include "core/fpdfdoc/cpdf_pagelabel.h"
-#include "core/fxcrt/check.h"
+#include "core/fxcrt/check_op.h"
 #include "core/fxcrt/compiler_specific.h"
 #include "core/fxcrt/containers/contains.h"
 #include "core/fxcrt/numerics/safe_conversions.h"
 #include "core/fxcrt/span.h"
 #include "core/fxcrt/span_util.h"
+#include "core/fxge/dib/fx_dib.h"
 #include "fpdfsdk/cpdfsdk_helpers.h"
+#include "public/epdf_doc.h"
 #include "public/fpdf_formfill.h"
 
 namespace {
@@ -81,6 +84,7 @@ CPDF_LinkList* GetLinkList(CPDF_Page* page) {
   return pList;
 }
 
+// EmbedPDF(epdf-api): helpers for the EPDF_*Meta* functions below.
 using pdfium::metadata::kInfoAuthor;
 using pdfium::metadata::kInfoCreationDate;
 using pdfium::metadata::kInfoCreator;
@@ -139,7 +143,9 @@ inline ByteStringView StatusToTrappedName(FPDF_TRAPPED_STATUS status) {
 
 FPDF_EXPORT FPDF_BOOKMARK FPDF_CALLCONV
 FPDFBookmark_GetFirstChild(FPDF_DOCUMENT document, FPDF_BOOKMARK bookmark) {
-  CPDF_Document* doc = CPDFDocumentFromFPDFDocument(document);
+  // EmbedPDF(view-scope): read through the document's view scope.
+  ScopedFPDFDocumentView document_view(document);
+  CPDF_Document* doc = document_view.Get();
   if (!doc) {
     return nullptr;
   }
@@ -152,7 +158,9 @@ FPDFBookmark_GetFirstChild(FPDF_DOCUMENT document, FPDF_BOOKMARK bookmark) {
 
 FPDF_EXPORT FPDF_BOOKMARK FPDF_CALLCONV
 FPDFBookmark_GetNextSibling(FPDF_DOCUMENT document, FPDF_BOOKMARK bookmark) {
-  CPDF_Document* doc = CPDFDocumentFromFPDFDocument(document);
+  // EmbedPDF(view-scope): read through the document's view scope.
+  ScopedFPDFDocumentView document_view(document);
+  CPDF_Document* doc = document_view.Get();
   if (!doc) {
     return nullptr;
   }
@@ -194,7 +202,9 @@ FPDF_EXPORT int FPDF_CALLCONV FPDFBookmark_GetCount(FPDF_BOOKMARK bookmark) {
 
 FPDF_EXPORT FPDF_BOOKMARK FPDF_CALLCONV
 FPDFBookmark_Find(FPDF_DOCUMENT document, FPDF_WIDESTRING title) {
-  CPDF_Document* doc = CPDFDocumentFromFPDFDocument(document);
+  // EmbedPDF(view-scope): read through the document's view scope.
+  ScopedFPDFDocumentView document_view(document);
+  CPDF_Document* doc = document_view.Get();
   if (!doc) {
     return nullptr;
   }
@@ -213,7 +223,9 @@ FPDFBookmark_Find(FPDF_DOCUMENT document, FPDF_WIDESTRING title) {
 
 FPDF_EXPORT FPDF_DEST FPDF_CALLCONV
 FPDFBookmark_GetDest(FPDF_DOCUMENT document, FPDF_BOOKMARK bookmark) {
-  CPDF_Document* doc = CPDFDocumentFromFPDFDocument(document);
+  // EmbedPDF(view-scope): read through the document's view scope.
+  ScopedFPDFDocumentView document_view(document);
+  CPDF_Document* doc = document_view.Get();
   if (!doc) {
     return nullptr;
   }
@@ -246,6 +258,38 @@ FPDFBookmark_GetAction(FPDF_BOOKMARK bookmark) {
   CPDF_Bookmark cBookmark(
       pdfium::WrapRetain(CPDFDictionaryFromFPDFBookmark(bookmark)));
   return FPDFActionFromCPDFDictionary(cBookmark.GetAction().GetDict());
+}
+
+FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
+FPDFBookmark_GetColor(FPDF_BOOKMARK bookmark, float* R, float* G, float* B) {
+  if (!bookmark || !R || !G || !B) {
+    return false;
+  }
+  CPDF_Bookmark cpdf_bookmark(
+      pdfium::WrapRetain(CPDFDictionaryFromFPDFBookmark(bookmark)));
+  std::optional<FX_RGB_STRUCT<float>> color = cpdf_bookmark.GetColor();
+  if (!color.has_value()) {
+    return false;
+  }
+  if (color->red > 1 || color->green > 1 || color->blue > 1) {
+    return false;
+  }
+  if (color->red < 0 || color->green < 0 || color->blue < 0) {
+    return false;
+  }
+  *R = color->red;
+  *G = color->green;
+  *B = color->blue;
+  return true;
+}
+
+FPDF_EXPORT int FPDF_CALLCONV FPDFBookmark_GetStyle(FPDF_BOOKMARK bookmark) {
+  if (!bookmark) {
+    return 0;
+  }
+  CPDF_Bookmark cpdf_bookmark(
+      pdfium::WrapRetain(CPDFDictionaryFromFPDFBookmark(bookmark)));
+  return cpdf_bookmark.GetStyle();
 }
 
 FPDF_EXPORT unsigned long FPDF_CALLCONV FPDFAction_GetType(FPDF_ACTION action) {
@@ -336,6 +380,7 @@ FPDF_EXPORT int FPDF_CALLCONV FPDFDest_GetDestPageIndex(FPDF_DOCUMENT document,
   return destination.GetDestPageIndex(doc);
 }
 
+// EmbedPDF(epdf-api): EPDFDest_GetPageObjectNumber.
 FPDF_EXPORT unsigned int FPDF_CALLCONV
 EPDFDest_GetPageObjectNumber(FPDF_DOCUMENT document, FPDF_DEST dest) {
   CPDF_Document* doc = CPDFDocumentFromFPDFDocument(document);
@@ -362,7 +407,7 @@ FPDFDest_GetView(FPDF_DEST dest, unsigned long* pNumParams, FS_FLOAT* pParams) {
   CPDF_Dest destination(pdfium::WrapRetain(CPDFArrayFromFPDFDest(dest)));
   const unsigned long nParams =
       pdfium::checked_cast<unsigned long>(destination.GetNumParams());
-  DCHECK(nParams <= 4);
+  DCHECK_LE(nParams, 4);
   *pNumParams = nParams;
   for (unsigned long i = 0; i < nParams; ++i) {
     UNSAFE_TODO(pParams[i]) = destination.GetParam(i);
@@ -401,6 +446,7 @@ FPDFDest_GetLocationInPage(FPDF_DEST dest,
 FPDF_EXPORT FPDF_LINK FPDF_CALLCONV FPDFLink_GetLinkAtPoint(FPDF_PAGE page,
                                                             double x,
                                                             double y) {
+  // EmbedPDF(view-scope): read through the document's view scope.
   ScopedFPDFPageView page_view(page);
   if (!page_view) {
     return nullptr;
@@ -422,6 +468,7 @@ FPDF_EXPORT FPDF_LINK FPDF_CALLCONV FPDFLink_GetLinkAtPoint(FPDF_PAGE page,
 FPDF_EXPORT int FPDF_CALLCONV FPDFLink_GetLinkZOrderAtPoint(FPDF_PAGE page,
                                                             double x,
                                                             double y) {
+  // EmbedPDF(view-scope): read through the document's view scope.
   ScopedFPDFPageView page_view(page);
   if (!page_view) {
     return -1;
@@ -445,11 +492,14 @@ FPDF_EXPORT FPDF_DEST FPDF_CALLCONV FPDFLink_GetDest(FPDF_DOCUMENT document,
   if (!link) {
     return nullptr;
   }
+  // EmbedPDF(view-scope): read through the document's view scope.
   ScopedFPDFDocumentView document_view(document);
   if (!document_view) {
     return nullptr;
   }
   CPDF_Document* doc = document_view.Get();
+  // EmbedPDF(overlay-epoch): a link handle may hold an older version of its
+  // dictionary; use the one the document sees now.
   RetainPtr<CPDF_Dictionary> link_dict(CPDFDictionaryFromFPDFLink(link));
   if (link_dict->GetObjNum() != 0) {
     RetainPtr<CPDF_Dictionary> effective =
@@ -486,10 +536,13 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFLink_Enumerate(FPDF_PAGE page,
   if (!start_pos || !link_annot) {
     return false;
   }
+  // EmbedPDF(view-scope): read through the document's view scope.
   ScopedFPDFPageView page_view(page);
   if (!page_view) {
     return false;
   }
+  // EmbedPDF(reads-dont-write): walk /Annots without the mutable getters; the
+  // cast below only fits the handle's mutable type, nothing writes through it.
   const CPDF_Page* pPage = page_view.Get();
   RetainPtr<const CPDF_Array> pAnnots = pPage->GetAnnotsArray();
   if (!pAnnots) {
@@ -513,12 +566,15 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV FPDFLink_Enumerate(FPDF_PAGE page,
 
 FPDF_EXPORT FPDF_ANNOTATION FPDF_CALLCONV
 FPDFLink_GetAnnot(FPDF_PAGE page, FPDF_LINK link_annot) {
+  // EmbedPDF(view-scope): read through the document's view scope.
   ScopedFPDFPageView page_view(page);
   CPDF_Page* pPage = page_view.Get();
   RetainPtr<CPDF_Dictionary> pAnnotDict(CPDFDictionaryFromFPDFLink(link_annot));
   if (!pPage || !pAnnotDict) {
     return nullptr;
   }
+  // EmbedPDF(overlay-epoch): a link handle may hold an older version of its
+  // dictionary; use the one the document sees now.
   if (pAnnotDict->GetObjNum() != 0) {
     RetainPtr<CPDF_Dictionary> effective = ToDictionary(
         pPage->GetDocument()->GetOrParseIndirectObject(pAnnotDict->GetObjNum()));
@@ -674,6 +730,8 @@ FPDF_GetPageLabel(FPDF_DOCUMENT document,
       str.value(), UNSAFE_BUFFERS(SpanFromFPDFApiArgs(buffer, buflen)));
 }
 
+// EmbedPDF(epdf-api): EPDF_*MetaText, EPDF_*MetaTrapped and
+// EPDF_GetMetaKey*, on the document information dictionary.
 FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV EPDF_SetMetaText(FPDF_DOCUMENT document,
                                                      FPDF_BYTESTRING tag,
                                                      FPDF_WIDESTRING value) {
@@ -689,14 +747,13 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV EPDF_SetMetaText(FPDF_DOCUMENT document,
   }
 
   ByteString key(tag);
-  WideString wide = value ? UNSAFE_BUFFERS(WideStringFromFPDFWideString(value))
-                          : WideString();
-
-  if (wide.IsEmpty()) {
+  if (!value) {
     // RemoveFor() expects ByteStringView.
     info->RemoveFor(key.AsStringView());
     return true;
   }
+  // An empty string is a value: the key stays, present and empty.
+  WideString wide = UNSAFE_BUFFERS(WideStringFromFPDFWideString(value));
 
   // Store as Unicode CPDF_String (same pattern as FPDFAnnot_SetStringValue).
   info->SetNewFor<CPDF_String>(key, wide.AsStringView());
