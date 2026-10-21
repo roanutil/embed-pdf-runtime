@@ -11,6 +11,7 @@
 #include "core/fpdfapi/page/cpdf_dib.h"
 #include "core/fpdfapi/page/cpdf_image.h"
 #include "core/fpdfapi/page/cpdf_imageobject.h"
+#include "core/fpdfapi/page/cpdf_page.h"
 #include "core/fpdfapi/page/cpdf_pageimagecache.h"
 #include "core/fpdfapi/page/cpdf_transferfunc.h"
 #include "core/fxcrt/check.h"
@@ -30,6 +31,13 @@ bool CPDF_ImageLoader::Start(const CPDF_ImageObject* pImage,
                              const CFX_Size& max_size_required) {
   cache_ = pPageImageCache;
   image_object_ = pImage;
+  // EmbedPDF(layer-seam): the page's cache refuses an image from another
+  // document without starting an entry for it, and Finish() would then read
+  // the missing (or a stale) entry. Load such an image uncached.
+  if (cache_ && cache_->GetPage()->GetDocument() !=
+                    image_object_->GetImage()->GetDocument()) {
+    cache_ = nullptr;
+  }
   bool should_continue;
   if (cache_) {
     should_continue = cache_->StartGetCachedBitmap(

@@ -68,10 +68,20 @@ forget dropped versions at commit and abort.
 **Rule.** Upstream methods we made `virtual` or `protected` so `CPDF_LayerDocument` and
 `CPDF_BaseDocument` can override them: the document's root, info and page dictionary getters, its
 page list storage, the indirect object holder, the document's page and render data.
-**Why.** The layer steps in at these seams instead of changing every caller.
+A layer's page data falls back to its base's for objects the layer hasn't promoted, except images
+and what draws them: tiling patterns and Type3 fonts parse forms under their own document, and a
+page's image cache refuses another document's images. An image from another document loads
+uncached. A Type3 font's glyph cache lives with the document that parsed the font, so a layer's own
+Type3 font never caches its glyphs in the base.
+**Why.** The layer steps in at these seams instead of changing every caller. A base pattern or
+Type3 font on a layer page drew base images, and the image loader read the cache entry the refusal
+never started (a null read).
 **Where.** `cpdf_document.{h,cpp}`, `cpdf_indirect_object_holder.h`, `cpdf_docpagedata.{h,cpp}`,
-`cpdf_docrenderdata.{h,cpp}`.
-**Guarded by.** The build: an `override` fails when its seam disappears. The layer tests.
+`cpdf_docrenderdata.{h,cpp}`, `cpdf_imageloader.cpp`.
+**Guarded by.** The build: an `override` fails when its seam disappears. The layer tests, among
+them `EPDFLayerEmbedderTest.FreshLayerRendersImageInTilingPattern`,
+`FreshLayerRendersImageInType3Glyph`, `FreshLayerKeepsType3GlyphCacheInLayer` and
+`PageRendersImageFromAnotherDocument`.
 **When upstream touches this.** Keep the seam when upstream renames or splits a method. A new
 upstream accessor to the same state needs the same seam.
 

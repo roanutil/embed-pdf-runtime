@@ -8,14 +8,29 @@
 
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "core/fpdfapi/font/cpdf_font.h"
+#include "core/fpdfapi/font/cpdf_type3font.h"
+#include "core/fpdfapi/page/cpdf_color.h"
+#include "core/fpdfapi/page/cpdf_form.h"
+#include "core/fpdfapi/page/cpdf_page.h"
+#include "core/fpdfapi/page/cpdf_pageobject.h"
+#include "core/fpdfapi/page/cpdf_pattern.h"
+#include "core/fpdfapi/page/cpdf_textobject.h"
+#include "core/fpdfapi/page/cpdf_tilingpattern.h"
+#include "core/fpdfapi/parser/cpdf_base_document.h"
 #include "core/fpdfapi/parser/cpdf_dictionary.h"
 #include "core/fpdfapi/parser/cpdf_document.h"
+#include "core/fpdfapi/parser/cpdf_layer_document.h"
 #include "core/fpdfapi/parser/cpdf_reference.h"
+#include "core/fpdfapi/render/cpdf_docrenderdata.h"
+#include "core/fpdfapi/render/cpdf_type3cache.h"
 #include "fpdfsdk/cpdfsdk_helpers.h"
+#include "fpdfsdk/epdf_edit_test_util.h"
 #include "public/cpp/fpdf_scopers.h"
 #include "public/epdf_annot.h"
 #include "public/epdf_doc.h"
@@ -85,6 +100,51 @@ struct CountingStringFileAccess {
   size_t read_count = 0;
   size_t read_bytes = 0;
 };
+
+// A 1 × 1 red image (6), as an image XObject.
+constexpr char kRedImage[] =
+    "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 "
+    "/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /ASCIIHexDecode "
+    "/Length 7 >>\nstream\nff0000>\nendstream";
+
+// One 100 × 100 page whose content fills the page with a tiling pattern (5).
+// The pattern's cell draws the red image (6) over the whole cell.
+std::string MakeImageTilingPatternDocument() {
+  const std::string cell = "q 100 0 0 100 0 0 cm /Im1 Do Q";
+  return MakePdf({
+      "<< /Type /Catalog /Pages 2 0 R >>",
+      "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R "
+      "/Resources << /Pattern << /P1 5 0 R >> >> >>",
+      Stream("/Pattern cs /P1 scn 0 0 100 100 re f"),
+      "<< /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 "
+      "/BBox [0 0 100 100] /XStep 100 /YStep 100 "
+      "/Resources << /XObject << /Im1 6 0 R >> >> /Length " +
+          std::to_string(cell.size()) + " >>\nstream\n" + cell + "\nendstream",
+      kRedImage,
+  });
+}
+
+// One 100 × 100 page that shows one glyph of a Type3 font (5) at size 100.
+// The glyph (7) draws the red image (6) over its whole cell, plus a path, so
+// it renders as a form rather than as its sole image.
+std::string MakeImageType3FontDocument() {
+  return MakePdf({
+      "<< /Type /Catalog /Pages 2 0 R >>",
+      "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R "
+      "/Resources << /Font << /F1 5 0 R >> >> >>",
+      Stream("BT /F1 100 Tf 0 0 Td (a) Tj ET"),
+      "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] "
+      "/FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << /a 7 0 R >> "
+      "/Encoding << /Type /Encoding /Differences [97 /a] >> /FirstChar 97 "
+      "/LastChar 97 /Widths [1000] "
+      "/Resources << /XObject << /Im1 6 0 R >> >> >>",
+      kRedImage,
+      Stream("1000 0 d0 q 1000 0 0 1000 0 0 cm /Im1 Do Q "
+             "0 0 1 rg 0 0 1 1 re f"),
+  });
+}
 
 uint64_t ReadUint64LEForTest(const char* data) {
   uint64_t value = 0;
@@ -554,6 +614,137 @@ TEST_F(EPDFLayerEmbedderTest, OpenFreshLayerRendersWithEmptyOverlay) {
   }
 
   EPDF_ReleaseBaseDocument(base);
+}
+
+// A layer page draws the image inside an unpromoted tiling pattern's cell.
+// The pattern and its images are the layer's own, as images always are: a
+// pattern shared from the base drew base images, which the layer page's image
+// cache refused, and the loader then read the cache entry it never started.
+TEST_F(EPDFLayerEmbedderTest, FreshLayerRendersImageInTilingPattern) {
+  const std::string pdf = MakeImageTilingPatternDocument();
+  EPDF_BASE_DOCUMENT base = EPDF_LoadMemBaseDocument(
+      pdf.data(), static_cast<int>(pdf.size()), nullptr);
+  ASSERT_TRUE(base);
+
+  {
+    EPDFLayerOpenStatus status = EPDFLayerOpenStatus_kOpenFailed;
+    ScopedFPDFDocument layer(
+        EPDFLayer_OpenLayer(base, nullptr, nullptr, &status));
+    ASSERT_TRUE(layer);
+    EXPECT_EQ(EPDFLayerOpenStatus_kSuccess, status);
+
+    ScopedFPDFPage page(FPDF_LoadPage(layer.get(), 0));
+    ASSERT_TRUE(page);
+    CPDF_PageObject* fill =
+        CPDFPageFromFPDFPage(page.get())->GetPageObjectByIndex(0);
+    ASSERT_TRUE(fill);
+    ASSERT_TRUE(fill->color_state().GetFillColor()->IsPattern());
+    CPDF_TilingPattern* pattern =
+        fill->color_state().GetFillColor()->GetPattern()->AsTilingPattern();
+    ASSERT_TRUE(pattern);
+    std::unique_ptr<CPDF_Form> cell = pattern->Load(fill);
+    ASSERT_TRUE(cell);
+    EXPECT_EQ(CPDFDocumentFromFPDFDocument(layer.get()), cell->GetDocument());
+    EXPECT_EQ(0xFF0000u, ColorAt(page.get(), 50, 50));
+    EXPECT_EQ(0u, EPDFLayer_GetPromotedObjectCount(layer.get()));
+  }
+
+  EPDF_ReleaseBaseDocument(base);
+}
+
+// The same for an image a Type3 glyph draws: the font and its glyphs are the
+// layer's own.
+TEST_F(EPDFLayerEmbedderTest, FreshLayerRendersImageInType3Glyph) {
+  const std::string pdf = MakeImageType3FontDocument();
+  EPDF_BASE_DOCUMENT base = EPDF_LoadMemBaseDocument(
+      pdf.data(), static_cast<int>(pdf.size()), nullptr);
+  ASSERT_TRUE(base);
+
+  {
+    EPDFLayerOpenStatus status = EPDFLayerOpenStatus_kOpenFailed;
+    ScopedFPDFDocument layer(
+        EPDFLayer_OpenLayer(base, nullptr, nullptr, &status));
+    ASSERT_TRUE(layer);
+    EXPECT_EQ(EPDFLayerOpenStatus_kSuccess, status);
+
+    ScopedFPDFPage page(FPDF_LoadPage(layer.get(), 0));
+    ASSERT_TRUE(page);
+    CPDF_TextObject* text =
+        CPDFPageFromFPDFPage(page.get())->GetPageObjectByIndex(0)->AsText();
+    ASSERT_TRUE(text);
+    ASSERT_TRUE(text->text_state().GetFont()->IsType3Font());
+    EXPECT_EQ(CPDFDocumentFromFPDFDocument(layer.get()),
+              text->text_state().GetFont()->GetDocument());
+    EXPECT_EQ(0xFF0000u, ColorAt(page.get(), 50, 50));
+    EXPECT_EQ(0u, EPDFLayer_GetPromotedObjectCount(layer.get()));
+  }
+
+  EPDF_ReleaseBaseDocument(base);
+}
+
+// A layer's own Type3 font keeps its glyph cache in the layer's render data,
+// not in the base's, where it would outlive the layer's font.
+TEST_F(EPDFLayerEmbedderTest, FreshLayerKeepsType3GlyphCacheInLayer) {
+  const std::string pdf = MakeImageType3FontDocument();
+  EPDF_BASE_DOCUMENT base = EPDF_LoadMemBaseDocument(
+      pdf.data(), static_cast<int>(pdf.size()), nullptr);
+  ASSERT_TRUE(base);
+
+  {
+    EPDFLayerOpenStatus status = EPDFLayerOpenStatus_kOpenFailed;
+    ScopedFPDFDocument layer(
+        EPDFLayer_OpenLayer(base, nullptr, nullptr, &status));
+    ASSERT_TRUE(layer);
+    CPDF_Document* layer_doc = CPDFDocumentFromFPDFDocument(layer.get());
+    CPDF_Document* base_doc =
+        CPDF_LayerDocument::FromDocument(layer_doc)->GetBaseDocument();
+    ASSERT_TRUE(base_doc);
+
+    ScopedFPDFPage page(FPDF_LoadPage(layer.get(), 0));
+    ASSERT_TRUE(page);
+    CPDF_TextObject* text =
+        CPDFPageFromFPDFPage(page.get())->GetPageObjectByIndex(0)->AsText();
+    ASSERT_TRUE(text);
+    CPDF_Type3Font* font = text->text_state().GetFont()->AsType3Font();
+    ASSERT_TRUE(font);
+    EXPECT_EQ(0xFF0000u, ColorAt(page.get(), 50, 50));
+
+    // Held, so each lookup below finds a live entry if one exists.
+    RetainPtr<CPDF_Type3Cache> layer_cache =
+        CPDF_DocRenderData::FromDocument(layer_doc)->GetCachedType3(font);
+    ASSERT_TRUE(layer_cache);
+    EXPECT_EQ(
+        layer_cache,
+        CPDF_DocRenderData::FromDocument(layer_doc)->GetCachedType3(font));
+    // The base holds no entry for the layer's font, so it makes a new one.
+    EXPECT_NE(layer_cache,
+              CPDF_DocRenderData::FromDocument(base_doc)->GetCachedType3(font));
+  }
+
+  EPDF_ReleaseBaseDocument(base);
+}
+
+// Any image from another document, as an embedder can insert one, renders
+// uncached: the page's image cache refuses it without starting an entry, which
+// the loader used to read.
+TEST_F(EPDFLayerEmbedderTest, PageRendersImageFromAnotherDocument) {
+  ScopedFPDFDocument image_doc(FPDF_CreateNewDocument());
+  ScopedFPDFDocument doc(FPDF_CreateNewDocument());
+  ASSERT_TRUE(image_doc);
+  ASSERT_TRUE(doc);
+  ScopedFPDFPage page(FPDFPage_New(doc.get(), 0, 100, 100));
+  ASSERT_TRUE(page);
+
+  ScopedFPDFBitmap red(FPDFBitmap_Create(1, 1, 0));
+  ASSERT_TRUE(red);
+  ASSERT_TRUE(FPDFBitmap_FillRect(red.get(), 0, 0, 1, 1, 0xFFFF0000));
+  FPDF_PAGEOBJECT image = FPDFPageObj_NewImageObj(image_doc.get());
+  ASSERT_TRUE(image);
+  ASSERT_TRUE(FPDFImageObj_SetBitmap(nullptr, 0, image, red.get()));
+  ASSERT_TRUE(FPDFImageObj_SetMatrix(image, 100, 0, 0, 100, 0, 0));
+  FPDFPage_InsertObject(page.get(), image);
+
+  EXPECT_EQ(0xFF0000u, ColorAt(page.get(), 50, 50));
 }
 
 TEST_F(EPDFLayerEmbedderTest, OpenFreshLayerAnnotHandleDoesNotPromote) {

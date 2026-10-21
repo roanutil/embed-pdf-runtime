@@ -226,8 +226,12 @@ RetainPtr<CPDF_Font> CPDF_DocPageData::GetFont(
     return pdfium::WrapRetain(it->second.Get());
   }
 
-  // EmbedPDF(layer-seam): an unpromoted base object uses the base's entry.
-  if (fallback_ && CanUseFallbackForObject(font_dict.Get())) {
+  // EmbedPDF(layer-seam): an unpromoted base object uses the base's entry,
+  // except a Type3 font's. Its glyphs are forms parsed under the font's
+  // document, so the base's glyphs would draw base images, which the layer
+  // page's image cache rejects (see GetImage).
+  if (fallback_ && CanUseFallbackForObject(font_dict.Get()) &&
+      font_dict->GetByteStringFor("Subtype") != "Type3") {
     return fallback_->GetFont(font_dict);
   }
 
@@ -432,8 +436,13 @@ RetainPtr<CPDF_Pattern> CPDF_DocPageData::GetPattern(
     return pdfium::WrapRetain(it->second.Get());
   }
 
-  // EmbedPDF(layer-seam): an unpromoted base object uses the base's entry.
-  if (fallback_ && CanUseFallbackForObject(pPatternObj.Get())) {
+  // EmbedPDF(layer-seam): an unpromoted base object uses the base's entry,
+  // except a tiling pattern's. Its cell is a form parsed under the pattern's
+  // document, so the base's pattern would draw base images, which the layer
+  // page's image cache rejects (see GetImage).
+  if (fallback_ && CanUseFallbackForObject(pPatternObj.Get()) &&
+      pPatternObj->GetDict()->GetIntegerFor("PatternType") !=
+          CPDF_Pattern::kTiling) {
     return fallback_->GetPattern(pPatternObj, matrix);
   }
 

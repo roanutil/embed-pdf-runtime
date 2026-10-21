@@ -55,9 +55,10 @@ RetainPtr<CPDF_Type3Cache> CPDF_DocRenderData::GetCachedType3(
     return pdfium::WrapRetain(it->second.Get());
   }
 
-  // EmbedPDF(layer-seam): an unpromoted base font uses the base's cache.
-  if (fallback_ && font->GetFontDictObjNum() != 0 &&
-      !GetDocument()->IsObjectPromoted(font->GetFontDictObjNum())) {
+  // EmbedPDF(layer-seam): a font the base parsed uses the base's cache. A
+  // layer's own Type3 font (CPDF_DocPageData::GetFont never shares one) keeps
+  // its glyph cache in the layer.
+  if (fallback_ && font->GetDocument() == fallback_->GetDocument()) {
     return fallback_->GetCachedType3(font);
   }
 
