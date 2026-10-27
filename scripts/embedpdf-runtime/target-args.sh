@@ -30,7 +30,9 @@ case "$TARGET" in
     GN_TARGET_CPU="${TARGET##*-}"
     # Separate from shared darwin artifacts: SwiftPM embeds this complete
     # archive and links against the SDK's libc++, just as on iOS.
-    EXTRA_ARGS=$'\nmac_deployment_target="14.0"\nuse_custom_libcxx=false\nuse_clang_modules=false'
+    # Use Xcode's linker for host tools (nasm when cross-compiling x64).
+    # The pinned Chromium lld cannot parse newer SDK TAPI architectures.
+    EXTRA_ARGS=$'\nmac_deployment_target="14.0"\nuse_custom_libcxx=false\nuse_clang_modules=false\nuse_lld=false'
     ;;
   darwin-arm64)
     GN_TARGET_OS="mac"
