@@ -25,6 +25,13 @@ case "$TARGET" in
     GN_TARGET_CPU="wasm"
     EXTRA_ARGS=$'\nis_clang=false\nuse_custom_libcxx=false'
     ;;
+  darwin-static-arm64|darwin-static-x64)
+    GN_TARGET_OS="mac"
+    GN_TARGET_CPU="${TARGET##*-}"
+    # Separate from shared darwin artifacts: SwiftPM embeds this complete
+    # archive and links against the SDK's libc++, just as on iOS.
+    EXTRA_ARGS=$'\nmac_deployment_target="14.0"\nuse_custom_libcxx=false\nuse_clang_modules=false'
+    ;;
   darwin-arm64)
     GN_TARGET_OS="mac"
     GN_TARGET_CPU="arm64"
