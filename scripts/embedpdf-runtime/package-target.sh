@@ -26,6 +26,10 @@ case "$TARGET" in
     DLL_SOURCE="$OUT/embedpdf.dll"
     DLL_DEST="$STAGING/bin/embedpdf.dll"
     ;;
+  darwin-static-*)
+    LIB_SOURCE="$OUT/obj/libembedpdf.a"
+    LIB_DEST="$STAGING/lib/libembedpdf.a"
+    ;;
   darwin-*)
     LIB_SOURCE="$OUT/libembedpdf.dylib"
     LIB_DEST="$STAGING/lib/libembedpdf.dylib"
@@ -59,6 +63,7 @@ mkdir -p "$STAGING/include" "$STAGING/lib" "$STAGING/LICENSES" "$OUTPUT_DIR"
 cp -R "$SOURCE_DIR/public/." "$STAGING/include/"
 cp "$LIB_SOURCE" "$LIB_DEST"
 case "$TARGET" in
+  darwin-static-*) ;;
   darwin-*)
     install_name_tool -id "@rpath/libembedpdf.dylib" "$LIB_DEST"
     ;;

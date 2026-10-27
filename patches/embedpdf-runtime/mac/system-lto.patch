@@ -1,0 +1,14 @@
+diff --git a/toolchain/apple/toolchain.gni b/toolchain/apple/toolchain.gni
+--- a/toolchain/apple/toolchain.gni
++++ b/toolchain/apple/toolchain.gni
+@@ -187,6 +187,10 @@ template("single_apple_toolchain") {
+     # binary.
+     if (!toolchain_uses_lld) {
+       ld += " -B " + invoker.bin_path
++      # Chromium's clang supplies a nonexistent adjacent libLTO by default.
++      # Use the library belonging to the Xcode linker selected above; without
++      # this its warning is fatal when linking native host tools such as nasm.
++      ld += " -Wl,-lto_library," + invoker.bin_path + "../lib/libLTO.dylib"
+     }
+ 
+     coverage_wrapper = ""

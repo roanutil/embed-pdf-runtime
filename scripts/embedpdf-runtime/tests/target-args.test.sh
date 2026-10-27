@@ -169,6 +169,20 @@ for t in android-arm64 android-x64; do
   fi
 done
 
+# SwiftPM needs complete static macOS archives without changing the shared
+# darwin targets consumed by the other native runtimes.
+for pair in darwin-static-arm64:arm64 darwin-static-x64:x64; do
+  t="${pair%%:*}"
+  cpu="${pair##*:}"
+  out="$(bash "$SCRIPT" "$t" 2>/dev/null)" || { fail "$t: target-args rejected it"; continue; }
+  for arg in 'target_os="mac"' "target_cpu=\"$cpu\"" \
+    'pdf_is_complete_lib=true' 'mac_deployment_target="14.0"' \
+    'use_custom_libcxx=false' 'use_clang_modules=false' 'use_lld=false' \
+    'embedpdf_thread_local_globals=true'; do
+    grep -Fxq "$arg" <<<"$out" && pass "$t: $arg" || fail "$t: missing $arg"
+  done
+done
+
 if (( FAILURES > 0 )); then
   echo "$FAILURES failure(s)" >&2
   exit 1
