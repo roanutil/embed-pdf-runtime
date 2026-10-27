@@ -92,6 +92,7 @@ case "$TARGET" in
   darwin-static-*)
     # Keep the component target: shared-library.patch would turn the complete
     # static library into a shared_library and GN rejects complete_static_lib.
+    apply_patch_file "$SOURCE_DIR/build" "$PATCH_DIR/mac/system-lto.patch"
     ;;
   darwin-*)
     apply_patch_file "$SOURCE_DIR" "$PATCH_DIR/shared-library.patch"
