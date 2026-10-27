@@ -89,6 +89,10 @@ case "$TARGET" in
     apply_patch_file "$SOURCE_DIR/build" "$PATCH_DIR/musl/build.patch"
     copy_patch_file "$PATCH_DIR/musl/toolchain.gn" "$SOURCE_DIR/build/toolchain/linux/musl/BUILD.gn"
     ;;
+  darwin-static-*)
+    # Keep the component target: shared-library.patch would turn the complete
+    # static library into a shared_library and GN rejects complete_static_lib.
+    ;;
   darwin-*)
     apply_patch_file "$SOURCE_DIR" "$PATCH_DIR/shared-library.patch"
     apply_patch_file "$SOURCE_DIR/build" "$PATCH_DIR/mac/build.patch"
