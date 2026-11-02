@@ -6,26 +6,56 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$HERE/../target-args.sh"
-GOLDEN="${ARGS_GOLDEN_DIR:-/tmp/args-golden}"
+GOLDEN="$HERE/args-golden"
 FAILURES=0
 
 fail() { echo "FAIL: $*" >&2; FAILURES=$((FAILURES + 1)); }
 pass() { echo "ok: $*"; }
 
-# Every pre-existing target must produce byte-identical args to what
-# build-target.sh produced before target-args.sh existed.
+# The nine targets upstream's build-target.sh knows must produce the args it
+# writes, byte for byte. args-golden/ holds them as upstream's script at
+# cff0077cf writes them on a Linux host, made by deleting its side effects so
+# it only prints:
+#   git show cff0077cf:scripts/embedpdf-runtime/build-target.sh | sed \
+#     -e '/^PDF_RUNTIME_TARGET_OS_LIST=/,/^mkdir -p "$OUT"$/d' \
+#     -e 's/^cat > "$OUT\/args.gn" <<EOF$/cat <<EOF/' \
+#     -e '/^($/,/^echo "$OUT"$/d' > /tmp/upstream-args.sh
+#   for t in <targets>; do bash /tmp/upstream-args.sh $t > args-golden/$t.gn; done
+# When a sync changes upstream's args, regenerate them from the new upstream
+# ref the same way and port the change into target-args.sh.
+#
+# Both scripts add use_system_xcode=true to wasm32 on a Mac host, and the
+# goldens come from Linux, so the comparison drops that one line.
 for t in wasm32 darwin-arm64 darwin-x64 linux-x64 linux-arm64 \
          linuxmusl-x64 linuxmusl-arm64 win32-x64 win32-arm64; do
   if [[ ! -f "$GOLDEN/$t.gn" ]]; then
-    fail "$t: no golden file at $GOLDEN/$t.gn; re-run Task 2 Step 1"
+    fail "$t: no golden file at $GOLDEN/$t.gn"
     continue
   fi
-  if diff -u "$GOLDEN/$t.gn" <(bash "$SCRIPT" "$t") >/dev/null; then
+  actual="$(bash "$SCRIPT" "$t" | grep -vx 'use_system_xcode=true')"
+  if diff -u "$GOLDEN/$t.gn" <(printf '%s\n' "$actual") >/dev/null; then
     pass "$t matches golden"
   else
     fail "$t differs from golden"
-    diff -u "$GOLDEN/$t.gn" <(bash "$SCRIPT" "$t") >&2
+    diff -u "$GOLDEN/$t.gn" <(printf '%s\n' "$actual") >&2
   fi
+done
+
+ALL_TARGETS="$(grep -E '^  [a-z0-9][a-z0-9 |-]*\)$' "$SCRIPT" | tr -d ' )' | tr '|' '\n')"
+[[ -n "$ALL_TARGETS" ]] || fail "found no targets in target-args.sh"
+
+# Brotli stays out of every release build: /BrotliDecode needs a config at
+# start-up, and EPDF_InitThread passes none.
+for t in $ALL_TARGETS; do
+  bash "$SCRIPT" "$t" | grep -qx 'pdf_enable_brotli=false' \
+    && pass "$t leaves Brotli out" || fail "$t must set pdf_enable_brotli=false"
+done
+
+# Neither wasm variant builds libyuv: emsdk 3.1.72's clang crashes on its WASM
+# SIMD rows, and wasm32-eh keeps wasm32's pixels.
+for t in wasm32 wasm32-eh; do
+  bash "$SCRIPT" "$t" | grep -qx 'pdf_use_libyuv=false' \
+    && pass "$t leaves libyuv out" || fail "$t must set pdf_use_libyuv=false"
 done
 
 # An unknown target must be rejected, not silently defaulted.
@@ -36,7 +66,6 @@ else
 fi
 
 # Thread-local globals: off for every wasm target, on for everything else.
-# wasm32-eh is added in Task 4 and is skipped until it exists.
 for t in wasm32 wasm32-eh; do
   out="$(bash "$SCRIPT" "$t" 2>/dev/null)" || continue
   if grep -qx 'embedpdf_thread_local_globals=false' <<<"$out"; then
