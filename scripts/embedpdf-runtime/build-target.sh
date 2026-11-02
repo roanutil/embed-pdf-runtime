@@ -16,6 +16,12 @@ if ! GN_ARGS="$("$SOURCE_DIR/scripts/embedpdf-runtime/target-args.sh" "$TARGET")
   exit 1
 fi
 
+# Refuse a wasm build on the wrong emsdk before anything is synced, patched or
+# generated. A non-wasm target passes.
+EMSDK_VERSION_SH="$SOURCE_DIR/scripts/embedpdf-runtime/emsdk-version.sh"
+"$EMSDK_VERSION_SH" --check "$TARGET"
+EMSDK_VERSION="$("$EMSDK_VERSION_SH" "$TARGET")"
+
 GN_TARGET_OS="$(sed -n 's/^target_os="\(.*\)"$/\1/p' <<<"$GN_ARGS")"
 GN_TARGET_CPU="$(sed -n 's/^target_cpu="\(.*\)"$/\1/p' <<<"$GN_ARGS")"
 
@@ -36,6 +42,12 @@ OUT="$SOURCE_DIR/out/embedpdf-runtime/$TARGET"
 mkdir -p "$OUT"
 
 printf '%s\n' "$GN_ARGS" > "$OUT/args.gn"
+# package-target.sh records this as the archive's emsdkVersion.
+if [[ -n "$EMSDK_VERSION" ]]; then
+  echo "$EMSDK_VERSION" > "$OUT/emsdk-version.txt"
+else
+  rm -f "$OUT/emsdk-version.txt"
+fi
 
 (
   cd "$SOURCE_DIR"

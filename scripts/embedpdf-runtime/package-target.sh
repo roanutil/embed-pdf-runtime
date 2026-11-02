@@ -53,6 +53,16 @@ if [[ -n "${DLL_SOURCE:-}" && ! -f "$DLL_SOURCE" ]]; then
   exit 1
 fi
 
+# wasm targets record the emsdk build-target.sh checked the build against.
+EMSDK_METADATA=""
+if [[ "$TARGET" == wasm32* ]]; then
+  if [[ ! -f "$OUT/emsdk-version.txt" ]]; then
+    echo "missing $OUT/emsdk-version.txt; rebuild with build-target.sh $TARGET" >&2
+    exit 1
+  fi
+  EMSDK_METADATA=$',\n  "emsdkVersion": "'"$(tr -d '[:space:]' < "$OUT/emsdk-version.txt")"'"'
+fi
+
 rm -rf "$STAGING"
 mkdir -p "$STAGING/include" "$STAGING/lib" "$STAGING/LICENSES" "$OUTPUT_DIR"
 
@@ -75,7 +85,7 @@ cat > "$STAGING/BUILD-METADATA.json" <<EOF
   "name": "embedpdf-runtime",
   "target": "$TARGET",
   "sha": "$SHA",
-  "createdAt": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  "createdAt": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"${EMSDK_METADATA}
 }
 EOF
 
