@@ -26,8 +26,11 @@ case "$TARGET" in
     # No libyuv: emsdk 3.1.72's clang crashes on its WASM SIMD rows
     # (I422ToARGBRow_WASMSIMD, from the Oct 27 2026 roll). PDFium keeps its
     # own loops for pdf_use_libyuv=false; they write the same colors, and
-    # leave the unused byte of a BGRx pixel as it was instead of 0xFF. Both
-    # wasm variants build with the same emsdk clang.
+    # leave the unused byte of a BGRx pixel as it was instead of 0xFF.
+    # wasm32-eh builds with emsdk 4.0.0 instead (emsdk-version.sh), and keeps
+    # pdf_use_libyuv=false too: its pixels, pad byte included, match wasm32's,
+    # and its args stay identical to wasm32's, which
+    # tests/target-args.test.sh asserts. libyuv under emsdk 4.0.0 is untested.
     EXTRA_ARGS=$'\nis_clang=false\nuse_custom_libcxx=false\npdf_use_libyuv=false'
     # build/ reads the macOS SDK whenever the host is a Mac (gn_logs.gni), but
     # PDFium's build_overrides/build.gni decides use_system_xcode only for mac
