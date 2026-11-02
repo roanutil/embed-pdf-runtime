@@ -72,18 +72,18 @@ A layer's page data falls back to its base's for objects the layer hasn't promot
 and what draws them: tiling patterns and Type3 fonts parse forms under their own document, and a
 page's image cache refuses another document's images. An image the cache refuses loads uncached.
 A Type3 font's glyph cache lives in the layer's render data; `GetCachedType3` has no base fallback.
-This is upstream's fix (`4639ac974`), taken whole when the fork merged `cff0077cf`. The fork's own
-fix for the same crash (`926c126b2`) is dropped, and its embedder tests stay as a check on
-upstream's code.
 **Why.** The layer steps in at these seams instead of changing every caller. A base pattern or
 Type3 font on a layer page drew base images, and the image loader read the cache entry the refusal
 never started (a null read).
 **Where.** `cpdf_document.{h,cpp}`, `cpdf_indirect_object_holder.h`, `cpdf_docpagedata.{h,cpp}`,
-`cpdf_docrenderdata.{h,cpp}`, `cpdf_imageloader.cpp`, `cpdf_pageimagecache.{h,cpp}`.
+`cpdf_docrenderdata.{h,cpp}`. The image cache's refusal (`cpdf_imageloader.cpp`,
+`cpdf_pageimagecache.{h,cpp}`) is tagged bug-fix; see the bug-fix entry.
 **Guarded by.** The build: an `override` fails when its seam disappears. The layer tests, among
 them `EPDFLayerEmbedderTest.FreshLayerRendersImageInTilingPattern`,
 `FreshLayerRendersImageInType3Glyph`, `FreshLayerKeepsType3GlyphCacheInLayer` and
-`PageRendersImageFromAnotherDocument`.
+`PageRendersImageFromAnotherDocument`, and upstream's
+`EPDFLayerEmbedderTest.LayerDrawsImagesInPatternsAndType3Glyphs` and
+`EPDFViewEmbedderTest.ImageOfAnotherDocumentDraws`.
 **When upstream touches this.** Keep the seam when upstream renames or splits a method. A new
 upstream accessor to the same state needs the same seam.
 
