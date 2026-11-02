@@ -19,7 +19,6 @@
 #include "public/fpdf_text.h"
 #include "public/fpdfview.h"
 #include "testing/embedder_test.h"
-#include "testing/embedder_test_constants.h"
 #include "testing/fx_string_testhelpers.h"
 #include "testing/gmock/include/gmock/gmock-matchers.h"
 #include "testing/gtest/include/gtest/gtest.h"
@@ -176,7 +175,10 @@ TEST_F(FPDFSaveEmbedderTest, SaveLinearizedDoc) {
   EXPECT_THAT(GetString(), HasSubstr("36 0 obj"));
   EXPECT_THAT(GetString(), Not(HasSubstr("37 0 obj")));
   EXPECT_THAT(GetString(), Not(HasSubstr("38 0 obj")));
-  EXPECT_EQ(7884u, GetString().size());
+  // EmbedPDF(complete-xref): one subsection; 26 and 28 (the linearization
+  // dictionary), which the save doesn't reach, are free entries in it.
+  EXPECT_THAT(GetString(), HasSubstr("xref\r\n0 37\r\n0000000026 65535 f\r\n"));
+  EXPECT_EQ(7912u, GetString().size());
 
   // Make sure new document renders the same as the old one.
   ScopedSavedDoc saved_document = OpenScopedSavedDocument();
@@ -207,8 +209,8 @@ TEST_F(FPDFSaveEmbedderTest, Bug1409) {
   ASSERT_TRUE(saved_document);
   ScopedSavedPage saved_page = LoadScopedSavedPage(0);
   ASSERT_TRUE(saved_page);
-  ScopedFPDFBitmap bitmap = RenderSavedPage(saved_page.get());
-  CompareBitmap(bitmap.get(), pdfium::kBlankPage612By792Png);
+  CompareDisplayList(RenderSavedPageToDisplayList(saved_page.get()),
+                     "blank_page_612x792");
 
   EXPECT_THAT(GetString(), StartsWith("%PDF-1.7\r\n"));
   EXPECT_THAT(GetString(), HasSubstr("/Root "));
@@ -321,6 +323,17 @@ TEST_F(FPDFSaveEmbedderTest, IncrementalSaveWithModifications) {
 
   // Verify the text object exists after the save
   EXPECT_EQ(1, count_text_objects(saved_page.get()));
+}
+
+TEST_F(FPDFSaveEmbedderTest, Pdf2FileVersion) {
+  ASSERT_TRUE(OpenDocument("pdf20_minimal.pdf"));
+  int version = 0;
+  ASSERT_TRUE(FPDF_GetFileVersion(document(), &version));
+  ASSERT_EQ(version, 20);
+
+  ASSERT_TRUE(FPDF_SaveAsCopy(document(), this, FPDF_NO_INCREMENTAL));
+
+  EXPECT_THAT(GetString(), StartsWith("%PDF-2.0\r\n"));
 }
 
 class FPDFSaveWithFontSubsetEmbedderTest : public FPDFSaveEmbedderTest {

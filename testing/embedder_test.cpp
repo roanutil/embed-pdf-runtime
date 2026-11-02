@@ -5,6 +5,7 @@
 #include "testing/embedder_test.h"
 
 #include <algorithm>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <utility>
@@ -685,6 +686,30 @@ bool EmbedderTest::OpenDocumentWithOptions(const std::string& filename,
                             &form_handle_);
 }
 
+// EmbedPDF(layer-mode): what OpenDocumentWithOptions() does with a file's
+// contents, with `contents`.
+bool EmbedderTest::OpenDocumentFromMemory(std::string_view contents) {
+  if (contents.empty()) {
+    return false;
+  }
+  file_contents_.assign(contents.begin(), contents.end());
+
+  EXPECT_TRUE(!loader_);
+  loader_ = std::make_unique<TestLoader>(file_contents_);
+
+  file_access_ = {
+      .m_FileLen = pdfium::checked_cast<unsigned long>(file_contents_.size()),
+      .m_GetBlock = TestLoader::GetBlock,
+      .m_Param = loader_.get(),
+  };
+
+  fake_file_access_ = std::make_unique<FakeFileAccess>(&file_access_);
+  return OpenDocumentHelper("", LinearizeOption::kDefaultLinearize,
+                            JavaScriptOption::kEnableJavaScript,
+                            fake_file_access_.get(), &document_, &avail_,
+                            &form_handle_);
+}
+
 bool EmbedderTest::OpenDocumentHelper(const ByteString& password,
                                       LinearizeOption linearize_option,
                                       JavaScriptOption javascript_option,
@@ -1279,16 +1304,18 @@ void EmbedderTest::WriteBitmapToPng(FPDF_BITMAP bitmap,
 
 // static
 void EmbedderTest::CompareBitmap(FPDF_BITMAP bitmap,
+
                                  std::string_view expectation_png_name) {
+  auto* env = EmbedderTestEnvironment::GetInstance();
   std::string png_path =
       GetEmbedderTestPngExpectationPath(expectation_png_name);
   SCOPED_TRACE(testing::Message() << "CompareBitmap() with " << png_path);
   DiffOptions options = kExactDiffOptions;
-  if (EmbedderTestEnvironment::GetInstance()->fontations()) {
+  if (env->GetFontLibraryType() == FPDF_FONTBACKENDTYPE_FONTATIONS) {
     options = kFontationsDiffOptions;
   }
   CompareBitmapToPngFile(bitmap, png_path, options);
-  if (EmbedderTestEnvironment::GetInstance()->write_pngs()) {
+  if (env->write_results()) {
     WriteBitmapToPng(bitmap, png_path);
   }
 }
@@ -1298,8 +1325,9 @@ void EmbedderTest::CompareBitmapWithExpectationSuffix(
     FPDF_BITMAP bitmap,
     std::string_view expectation_png_name,
     const DiffOptions& options) {
+  auto* env = EmbedderTestEnvironment::GetInstance();
   DiffOptions effective_options = options;
-  if (EmbedderTestEnvironment::GetInstance()->fontations()) {
+  if (env->GetFontLibraryType() == FPDF_FONTBACKENDTYPE_FONTATIONS) {
     effective_options.max_pixel_per_channel_delta =
         std::max(options.max_pixel_per_channel_delta,
                  kFontationsDiffOptions.max_pixel_per_channel_delta);
@@ -1324,7 +1352,7 @@ void EmbedderTest::CompareBitmapWithExpectationSuffix(
     SCOPED_TRACE(testing::Message()
                  << "CompareBitmapWithExpectationSuffix() with " << png_path);
     CompareBitmapToPngFile(bitmap, png_path, effective_options);
-    if (EmbedderTestEnvironment::GetInstance()->write_pngs()) {
+    if (EmbedderTestEnvironment::GetInstance()->write_results()) {
       WriteBitmapToPng(bitmap, png_path);
     }
     return;
@@ -1339,6 +1367,10 @@ void EmbedderTest::CompareDisplayList(const std::string& display_list,
   std::string path =
       GetEmbedderTestDisplayListExpectationPath(expectation_name);
   SCOPED_TRACE(testing::Message() << "CompareDisplayList() with " << path);
+  if (EmbedderTestEnvironment::GetInstance()->write_results()) {
+    std::ofstream out(path, std::ios::binary);
+    out << display_list;
+  }
   std::vector<uint8_t> expected_data = GetFileContents(path.c_str());
   if (expected_data.empty()) {
     ADD_FAILURE() << "Missing or empty expectation file: " << path;

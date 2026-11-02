@@ -77,6 +77,34 @@ TEST(CFXPath, ShearTransform) {
   EXPECT_EQ(CFX_FloatRect(1, 2, 3, 5), path.GetBoundingBox());
 }
 
+TEST(CFXPath, MicroShearTransformTolerance) {
+  CFX_Path path;
+  path.AppendRect(/*left=*/1, /*bottom=*/2, /*right=*/3, /*top=*/5);
+
+  const CFX_Matrix kMicroDeviationMatrix(1.0f, 0.0f, -4.69486423e-08f, 1.0f,
+                                         0.0f, 0.0f);
+  EXPECT_TRUE(path.IsRect());
+  // Use EXPECT_FLOAT_EQ() instead of EXPECT_EQ() with `CFX_FloatRect` because
+  // `CFX_FloatRect` uses exact floating-point equality.
+  std::optional<CFX_FloatRect> rect = path.GetRect(&kMicroDeviationMatrix);
+  ASSERT_TRUE(rect.has_value());
+  EXPECT_FLOAT_EQ(1.0f, rect->left);
+  EXPECT_FLOAT_EQ(2.0f, rect->bottom);
+  EXPECT_FLOAT_EQ(3.0f, rect->right);
+  EXPECT_FLOAT_EQ(5.0f, rect->top);
+}
+
+TEST(CFXPath, FivePointRectFuzzyEndpoints) {
+  CFX_Path path;
+  path.AppendPoint({0, 0}, CFX_Path::Point::Type::kMove);
+  path.AppendPoint({2, 0}, CFX_Path::Point::Type::kLine);
+  path.AppendPoint({2, 1}, CFX_Path::Point::Type::kLine);
+  path.AppendPoint({0, 1}, CFX_Path::Point::Type::kLine);
+  path.AppendPoint({1e-7f, -1e-7f}, CFX_Path::Point::Type::kLine);
+  EXPECT_TRUE(path.IsRect());
+  EXPECT_EQ(CFX_FloatRect(0, 0, 2, 1), path.GetRect(nullptr));
+}
+
 TEST(CFXPath, Hexagon) {
   CFX_Path path;
   path.AppendPoint({1, 0}, CFX_Path::Point::Type::kMove);

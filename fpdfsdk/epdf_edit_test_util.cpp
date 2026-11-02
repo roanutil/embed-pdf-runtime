@@ -102,9 +102,20 @@ std::string MakePdf(const std::vector<std::string>& objects) {
   return pdf;
 }
 
+std::string EmptyPdf() {
+  return MakePdf({
+      "<< /Type /Catalog /Pages 2 0 R >>",
+      "<< /Type /Pages /Kids [] /Count 0 >>",
+  });
+}
+
 std::string Stream(const std::string& data) {
-  return "<< /Length " + std::to_string(data.size()) + " >>\nstream\n" + data +
-         "\nendstream";
+  return Stream("", data);
+}
+
+std::string Stream(const std::string& entries, const std::string& data) {
+  return "<< " + entries + (entries.empty() ? "" : " ") + "/Length " +
+         std::to_string(data.size()) + " >>\nstream\n" + data + "\nendstream";
 }
 
 std::map<uint32_t, std::string> ObjectGraph(CPDF_Document* doc) {

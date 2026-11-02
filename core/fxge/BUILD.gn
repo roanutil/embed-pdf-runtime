@@ -52,14 +52,28 @@ source_set("fxge") {
     "cfx_glyphbitmap.h",
     "cfx_glyphcache.cpp",
     "cfx_glyphcache.h",
+    # EmbedPDF(fonts): the code points a font maps, as ranges.
+    "cfx_codepointrange.cpp",
+    "cfx_codepointrange.h",
+    # EmbedPDF(fonts): a glyph's outline in font units, unscaled and unhinted.
+    "cfx_glyphoutline.cpp",
+    "cfx_glyphoutline.h",
     "cfx_graphstate.cpp",
     "cfx_graphstate.h",
     "cfx_graphstatedata.cpp",
     "cfx_graphstatedata.h",
+    # EmbedPDF(fonts): an OpenType font written from glyph outlines, the
+    # display program of a document font a browser can't load as it is.
+    "cfx_opentypewriter.cpp",
+    "cfx_opentypewriter.h",
     "cfx_path.cpp",
     "cfx_path.h",
     "cfx_renderdevice.cpp",
     "cfx_renderdevice.h",
+    # EmbedPDF(fonts): the sfnt container: writing one, and its tables
+    # realigned for a browser.
+    "cfx_sfnt.cpp",
+    "cfx_sfnt.h",
     "cfx_standardfont.cpp",
     "cfx_standardfont.h",
     "cfx_substfont.cpp",
@@ -81,6 +95,8 @@ source_set("fxge") {
     "dib/cfx_imagetransformer.h",
     "dib/cfx_scanlinecompositor.cpp",
     "dib/cfx_scanlinecompositor.h",
+    "dib/cfx_scanlinecompositor_hwy.cpp",
+    "dib/cfx_scanlinecompositor_hwy.h",
     "dib/cstretchengine.cpp",
     "dib/cstretchengine.h",
     "dib/cstretchengine_hwy.cpp",
@@ -233,13 +249,9 @@ source_set("fxge") {
     sources += [
       "skia/cfx_dibbase_skia.cpp",
       "skia/fx_skia_device.cpp",
+      "skia/fx_skia_device.h",
     ]
     public_deps += [ "//skia" ]
-
-    if (pdf_skia_font_manager_target != "") {
-      defines += [ "PDF_USE_SKIA_CUSTOM_FONT_MANAGER" ]
-      deps += [ pdf_skia_font_manager_target ]
-    }
   }
 
   visibility = [ "../../*" ]
@@ -255,8 +267,8 @@ if (pdf_enable_fontations) {
     features = [ "agl" ]
     deps = [
       "//build/rust:cxx_cppdeps",
-      "//third_party/rust/read_fonts/v0_43:lib",
-      "//third_party/rust/skrifa/v0_46:lib",
+      "//third_party/rust/read_fonts/v0_45:lib",
+      "//third_party/rust/skrifa/v0_48:lib",
     ]
     configs += [ ":skrifa_cxx_config" ]
   }
@@ -289,11 +301,13 @@ source_set("test_support") {
   deps = [
     ":fxge",
     "../fxcrt",
+    "../fxcrt:test_support",
   ]
 }
 
 pdfium_unittest_source_set("unittests") {
   sources = [
+    "cfx_codepointrange_unittest.cpp",
     "cfx_color_unittest.cpp",
     "cfx_face_unittest.cpp",
     "cfx_folderfontinfo_unittest.cpp",
@@ -312,6 +326,7 @@ pdfium_unittest_source_set("unittests") {
     "dib/fx_dib_unittest.cpp",
     "fx_font_unittest.cpp",
   ]
+  data = [ "../../third_party/NotoSansCJK/NotoSansSC-Regular.subset.otf" ]
   deps = [
     ":fxge",
     ":test_support",
@@ -336,6 +351,10 @@ pdfium_unittest_source_set("unittests") {
 
   if (is_win) {
     sources += [ "win32/cfx_psrenderer_unittest.cpp" ]
+  }
+
+  if (pdf_use_agg) {
+    sources += [ "agg/cfx_agg_cliprgn_unittest.cpp" ]
   }
 
   if (pdf_enable_fontations) {

@@ -27,6 +27,7 @@
 #include "public/epdf_outline.h"
 #include "public/epdf_pieceinfo.h"
 #include "public/epdf_png.h"
+#include "public/epdf_ppo.h"
 #include "public/epdf_progressive.h"
 #include "public/epdf_redact.h"
 #include "public/epdf_save.h"
@@ -111,6 +112,7 @@ int CheckEmbedPDFCApi(void) {
   CHK(EPDFAnnot_GetColor);
   CHK(EPDFAnnot_GetDefaultAppearance);
   CHK(EPDFAnnot_GetDefaultAppearanceFontFace);
+  CHK(EPDFAnnot_GetDefaultAppearanceFontPostScriptName);
   CHK(EPDFAnnot_GetDrawingRect);
   CHK(EPDFAnnot_GetEmbedMetadataBoolean);
   CHK(EPDFAnnot_GetEmbedMetadataJSON);
@@ -153,6 +155,7 @@ int CheckEmbedPDFCApi(void) {
   CHK(EPDFAnnot_SetCalloutLine);
   CHK(EPDFAnnot_SetColor);
   CHK(EPDFAnnot_SetDefaultAppearance);
+  CHK(EPDFAnnot_SetDefaultAppearanceDocumentFont);
   CHK(EPDFAnnot_SetDefaultAppearanceRegisteredFont);
   CHK(EPDFAnnot_SetEmbedMetadataBoolean);
   CHK(EPDFAnnot_SetEmbedMetadataJSON);
@@ -234,6 +237,8 @@ int CheckEmbedPDFCApi(void) {
 
   // epdf_catalog.h
   CHK(EPDFCatalog_GetLanguage);
+  CHK(EPDFCatalog_GetMetadata);
+  CHK(EPDFCatalog_SetMetadata);
 
   // epdf_digest.h
   CHK(EPDF_DigestBuffer);
@@ -254,6 +259,9 @@ int CheckEmbedPDFCApi(void) {
   CHK(EPDFDest_CreateXYZByObjectNumber);
   CHK(EPDFDest_GetPageObjectNumber);
   CHK(EPDFDest_GetViewNullParams);
+  CHK(EPDFDoc_GetPageLabelSectionAt);
+  CHK(EPDFDoc_GetPageLabelSectionCount);
+  CHK(EPDFDoc_SetPageLabelSections);
   CHK(EPDFNamedDest_Remove);
   CHK(EPDFNamedDest_SetDest);
   CHK(EPDF_GetMetaKeyCount);
@@ -277,14 +285,59 @@ int CheckEmbedPDFCApi(void) {
   CHK(EPDFPage_FlattenAnnotations);
 
   // epdf_font.h
+  CHK(EPDFDoc_ClearMissingCharacters);
+  CHK(EPDFDoc_CountMissingCharacters);
+  CHK(EPDFDoc_GetFontDisplayProgramCoverage);
+  CHK(EPDFDoc_GetFontDisplayProgramData);
   CHK(EPDFDoc_GetFontEmbeddingPolicy);
+  CHK(EPDFDoc_GetFontProgramData);
+  CHK(EPDFDoc_GetFontsFingerprint);
+  CHK(EPDFDoc_GetMissingCharacter);
+  CHK(EPDFDoc_ResolveFonts);
   CHK(EPDFDoc_SetFontEmbeddingPolicy);
+  CHK(EPDFFontFaces_Close);
+  CHK(EPDFFontFaces_Count);
+  CHK(EPDFFontFaces_CountPrograms);
+  CHK(EPDFFontFaces_GetFamily);
+  CHK(EPDFFontFaces_GetProgramDisplayHash);
+  CHK(EPDFFontFaces_GetProgramEmbedded);
+  CHK(EPDFFontFaces_GetProgramEmbeddingPermission);
+  CHK(EPDFFontFaces_GetProgramFormat);
+  CHK(EPDFFontFaces_GetProgramHash);
+  CHK(EPDFFontFaces_GetProgramMetrics);
+  CHK(EPDFFontFaces_GetProgramObjNum);
+  CHK(EPDFFontFaces_GetProgramPostScriptName);
+  CHK(EPDFFontFaces_GetWeight);
+  CHK(EPDFFontFaces_IsItalic);
+  CHK(EPDFFontFaces_Load);
+  CHK(EPDFFontFaces_ProgramMapsUnicode);
+  CHK(EPDFFontResolution_Close);
+  CHK(EPDFFontResolution_CountMissingCharacters);
+  CHK(EPDFFontResolution_GetBaseFontName);
+  CHK(EPDFFontResolution_GetFallbacks);
+  CHK(EPDFFontResolution_GetFamily);
+  CHK(EPDFFontResolution_GetMissingCharacter);
+  CHK(EPDFFontResolution_GetProgramDisplayHash);
+  CHK(EPDFFontResolution_GetProgramObjNum);
+  CHK(EPDFFontResolution_GetRegisteredFont);
+  CHK(EPDFFontResolution_GetSource);
+  CHK(EPDFFontResolution_GetWeight);
+  CHK(EPDFFontResolution_IsDegraded);
+  CHK(EPDFFontResolution_IsItalic);
   CHK(EPDFFont_AddFallbackFont);
   CHK(EPDFFont_AuthorizeEditing);
   CHK(EPDFFont_ClearFallbackFonts);
   CHK(EPDFFont_ClearRegisteredFonts);
+  CHK(EPDFFont_GetCoverage);
   CHK(EPDFFont_GetEmbeddingPermission);
+  CHK(EPDFFont_GetFallbackOrder);
   CHK(EPDFFont_GetFamilyName);
+  CHK(EPDFFont_GetLastResortFont);
+  CHK(EPDFFont_GetMetrics);
+  CHK(EPDFFont_GetPostScriptName);
+  CHK(EPDFFont_GetProgramData);
+  CHK(EPDFFont_GetProgramFormat);
+  CHK(EPDFFont_GetProgramHash);
   CHK(EPDFFont_GetWeight);
   CHK(EPDFFont_IsEditingAuthorized);
   CHK(EPDFFont_IsInstanced);
@@ -292,6 +345,7 @@ int CheckEmbedPDFCApi(void) {
   CHK(EPDFFont_RegisterFont);
   CHK(EPDFFont_RegisterMemFont);
   CHK(EPDFFont_RegisterMemFont64);
+  CHK(EPDFFont_SetLastResortFont);
 
   // epdf_form.h
   CHK(EPDFForm_AttachWidget);
@@ -329,6 +383,7 @@ int CheckEmbedPDFCApi(void) {
   CHK(EPDFForm_GetFieldOptionLabel);
   CHK(EPDFForm_GetFieldOptionValue);
   CHK(EPDFForm_GetFieldOrigin);
+  CHK(EPDFForm_GetFieldPartialName);
   CHK(EPDFForm_GetFieldTopIndex);
   CHK(EPDFForm_GetFieldValueAt);
   CHK(EPDFForm_GetFieldValueKind);
@@ -501,6 +556,10 @@ int CheckEmbedPDFCApi(void) {
 
   // epdf_png.h
   CHK(EPDF_PNG_EncodeRGBA);
+
+  // epdf_ppo.h
+  CHK(EPDFDoc_GetImportFieldRoots);
+  CHK(EPDFDoc_ImportPages);
 
   // epdf_progressive.h
   CHK(EPDF_RenderPageBitmapWithMatrix_Start);

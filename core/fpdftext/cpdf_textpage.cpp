@@ -321,6 +321,33 @@ bool DrawsOnlySpaces(const CPDF_TextObject* text_obj) {
   return true;
 }
 
+// EmbedPDF(bug-fix): whether `text_obj` draws only combining marks: harakat,
+// Hebrew points, accents. A shaping engine places a mark above or below its
+// letter, so a producer that draws each glyph as its own object draws the mark
+// off the line's baseline, though it belongs to the line.
+bool DrawsOnlyMarks(const CPDF_TextObject* text_obj) {
+  RetainPtr<CPDF_Font> font = text_obj->GetFont();
+  if (!font || text_obj->CharCount() == 0) {
+    return false;
+  }
+  for (size_t i = 0; i < text_obj->CharCount(); ++i) {
+    const uint32_t char_code = text_obj->GetCharCode(i);
+    if (char_code == CPDF_Font::kInvalidCharCode) {
+      return false;
+    }
+    const WideString unicode = font->UnicodeFromCharCode(char_code);
+    if (unicode.IsEmpty()) {
+      return false;
+    }
+    for (wchar_t c : unicode) {
+      if (pdfium::unicode::GetBidiClass(c) != BidiClass::kNSM) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 // EmbedPDF(text-geometry): a character's loose and tight boxes in its text
 // object's space. The tight box is upstream's char box, moved here from
 // ProcessTextObjectItems() so the text page and EPDFText_GetCharGeometry
@@ -431,22 +458,84 @@ CFX_FloatRect GetLooseBounds(const CPDF_TextPage::CharInfo& charinfo) {
   return charinfo.char_box();
 }
 
-// EmbedPDF(bug-fix): whether `chars`, the line so far, ends in right-to-left
-// text that isn't /ActualText. Spaces and other characters without a strong
-// direction are skipped.
-bool FollowsLiteralRightToLeftText(
-    pdfium::span<const CPDF_TextPage::CharInfo> chars) {
-  for (size_t i = chars.size(); i > 0; --i) {
-    const CPDF_TextPage::CharInfo& info = chars[i - 1];
-    const BidiClass bidi = pdfium::unicode::GetBidiClass(info.unicode());
-    if (bidi == BidiClass::kL) {
-      return false;
+// EmbedPDF(bug-fix): whether `a` and `b` come from one /ActualText span.
+// ProcessMarkedContent() gives a span's characters the text object it is read
+// from, and a text object is in one span at most.
+bool InSameActualTextSpan(const CPDF_TextPage::CharInfo& a,
+                          const CPDF_TextPage::CharInfo& b) {
+  return a.char_type() == CPDF_TextPage::CharType::kActualText &&
+         b.char_type() == CPDF_TextPage::CharType::kActualText &&
+         a.text_object() == b.text_object();
+}
+
+// EmbedPDF(bug-fix): the text a line's bidi segments are cut from. An
+// /ActualText span is logical text, so inside one, a mark takes the direction
+// of the character before it, and characters with no strong direction between
+// two with the same one take theirs (UAX #9 W1 and N1); the span's leading and
+// trailing ones keep their own. Cut at its marks and inner spaces, a span came
+// out as its segments in visual order, each kept forward: a pointed Hebrew
+// word read back scrambled, and a right-to-left span of two words with the
+// words swapped.
+WideString BidiTextOf(const WideString& str,
+                      pdfium::span<const CPDF_TextPage::CharInfo> chars) {
+  enum class Strong { kNone, kLeft, kRight };
+  auto strong_of = [](wchar_t c) {
+    switch (pdfium::unicode::GetBidiClass(c)) {
+      case BidiClass::kL:
+        return Strong::kLeft;
+      case BidiClass::kR:
+      case BidiClass::kAL:
+        return Strong::kRight;
+      default:
+        return Strong::kNone;
     }
-    if (bidi == BidiClass::kR || bidi == BidiClass::kAL) {
-      return info.char_type() != CPDF_TextPage::CharType::kActualText;
+  };
+
+  WideString text = str;
+  const size_t count = std::min(str.GetLength(), chars.size());
+  size_t begin = 0;
+  while (begin < count) {
+    const CPDF_TextPage::CharInfo& first = chars[begin];
+    size_t end = begin + 1;
+    if (first.char_type() != CPDF_TextPage::CharType::kActualText) {
+      begin = end;
+      continue;
     }
+    while (end < count && InSameActualTextSpan(chars[end], first)) {
+      ++end;
+    }
+
+    std::vector<Strong> resolved;
+    for (size_t i = begin; i < end; ++i) {
+      Strong direction = strong_of(str[i]);
+      if (direction == Strong::kNone && i > begin &&
+          pdfium::unicode::GetBidiClass(str[i]) == BidiClass::kNSM) {
+        direction = resolved.back();
+      }
+      resolved.push_back(direction);
+    }
+    std::optional<size_t> last_strong;
+    for (size_t i = 0; i < resolved.size(); ++i) {
+      if (resolved[i] == Strong::kNone) {
+        continue;
+      }
+      if (last_strong && resolved[*last_strong] == resolved[i]) {
+        std::fill(resolved.begin() + *last_strong + 1, resolved.begin() + i,
+                  resolved[i]);
+      }
+      last_strong = i;
+    }
+
+    // Stand-ins of the resolved direction: Hebrew alef, Latin a.
+    for (size_t i = begin; i < end; ++i) {
+      const Strong direction = resolved[i - begin];
+      if (direction != Strong::kNone && strong_of(str[i]) == Strong::kNone) {
+        text.SetAt(i, direction == Strong::kRight ? 0x05D0 : L'a');
+      }
+    }
+    begin = end;
   }
-  return false;
+  return text;
 }
 
 }  // namespace
@@ -992,22 +1081,35 @@ void CPDF_TextPage::CloseTempLine() {
     return;
   }
 
-  WideString str = temp_text_buf_.MakeString();
-  bool prev_char_is_space = false;
-  for (size_t i = 0; i < str.GetLength(); ++i) {
-    if (str[i] != ' ') {
-      prev_char_is_space = false;
-      continue;
+  {
+    // Since `temp_text_buf_` gets cleared later, give this span a limited scope
+    // to avoid potential dangling pointers.
+    pdfium::span<wchar_t> text_span = temp_text_buf_.GetWideSpan();
+    CHECK_EQ(text_span.size(), temp_char_list_.size());
+    size_t write_index = 0;
+    bool prev_char_is_space = false;
+    for (size_t read_index = 0; read_index < text_span.size(); ++read_index) {
+      wchar_t ch = text_span[read_index];
+      if (ch == ' ' && prev_char_is_space) {
+        continue;
+      }
+      prev_char_is_space = ch == ' ';
+      if (write_index != read_index) {
+        temp_char_list_[write_index] = temp_char_list_[read_index];
+        text_span[write_index] = ch;
+      }
+      ++write_index;
     }
-    if (prev_char_is_space) {
-      temp_text_buf_.Delete(i, 1);
-      temp_char_list_.erase(temp_char_list_.begin() + i);
-      str.Delete(i);
-      --i;
-    }
-    prev_char_is_space = true;
+    temp_char_list_.erase(temp_char_list_.begin() + write_index,
+                          temp_char_list_.end());
+    temp_text_buf_.Delete(write_index, text_span.size() - write_index);
   }
-  CFX_BidiString bidi(str, /*auto_order=*/true);
+
+  const WideString str = temp_text_buf_.MakeString();
+  // EmbedPDF(bug-fix): /ActualText spans aren't cut at their marks and inner
+  // spaces (BidiTextOf); the characters are still those of `str`.
+  const WideString bidi_text = BidiTextOf(str, temp_char_list_);
+  CFX_BidiString bidi(bidi_text, /*auto_order=*/true);
   if (rtl_) {
     bidi.SetOverallDirectionRight();
   }
@@ -1020,19 +1122,24 @@ void CPDF_TextPage::CloseTempLine() {
         (segment.direction == CFX_BidiChar::Direction::kNeutral &&
          current_direction == CFX_BidiChar::Direction::kRight)) {
       current_direction = CFX_BidiChar::Direction::kRight;
-      const bool is_actual_text =
-          !char_span.empty() &&
-          char_span[0].char_type() == CharType::kActualText;
-      if (is_actual_text) {
-        // Since /ActualText strings are already in logical order, pass their
-        // characters in forward order instead of reversing them.
-        for (auto [c, info] : fxcrt::Zip(str_span, char_span)) {
-          AddCharInfo(c, info, /*is_rtl=*/true);
+      // EmbedPDF(bug-fix): the segment is in visual order, but an /ActualText
+      // span in it is logical text. So the segment is reversed unit by unit: a
+      // span is one unit, kept as written, and any other character is a unit
+      // of its own. Upstream passed a segment that starts with a span forward
+      // whole, and reversed each span ahead of time where it followed other
+      // right-to-left text; spans drawn in visual order, one per letter, then
+      // came out in visual order.
+      size_t end = segment.count;
+      while (end > 0) {
+        size_t begin = end - 1;
+        while (begin > 0 &&
+               InSameActualTextSpan(char_span[begin - 1], char_span[end - 1])) {
+          --begin;
         }
-      } else {
-        for (size_t i = segment.count; i > 0; --i) {
-          AddCharInfo(str_span[i - 1], char_span[i - 1], /*is_rtl=*/true);
+        for (size_t i = begin; i < end; ++i) {
+          AddCharInfo(str_span[i], char_span[i], /*is_rtl=*/true);
         }
+        end = begin;
       }
     } else {
       if (segment.direction != CFX_BidiChar::Direction::kLeftWeak) {
@@ -1044,7 +1151,7 @@ void CPDF_TextPage::CloseTempLine() {
     }
   }
   temp_char_list_.clear();
-  temp_text_buf_.Delete(0, temp_text_buf_.GetLength());
+  temp_text_buf_.Clear();
 }
 
 void CPDF_TextPage::ProcessTextObject(
@@ -1072,7 +1179,15 @@ void CPDF_TextPage::ProcessTextObject(
   }
 
   // Explicitly copy in case `text_objects_` gets cleared.
+  // EmbedPDF(bug-fix): the line's last glyph that isn't a mark; a mark sits
+  // off the baseline (DrawsOnlyMarks).
   TransformedTextObject prev_obj = text_objects_.back();
+  for (size_t i = text_objects_.size(); i > 0; --i) {
+    if (!DrawsOnlyMarks(text_objects_[i - 1].text_obj_)) {
+      prev_obj = text_objects_[i - 1];
+      break;
+    }
+  }
   size_t nItem = prev_obj.text_obj_->CountItems();
   if (nItem == 0) {
     return;
@@ -1099,7 +1214,18 @@ void CPDF_TextPage::ProcessTextObject(
       prev_obj.form_matrix_.Transform(prev_obj.text_obj_->GetPos()));
   CFX_PointF this_pos =
       display_matrix_.Transform(form_matrix.Transform(text_obj->GetPos()));
-  if (fabs(this_pos.y - prev_pos.y) > threshold * 2) {
+  // EmbedPDF(bug-fix): a mark, or a line of only marks so far, belongs to the
+  // line within a font size of its baseline: marks are placed that far above
+  // or below their letters, and a mark has no width to measure by.
+  float line_tolerance = threshold * 2;
+  if (DrawsOnlyMarks(text_obj) || DrawsOnlyMarks(prev_obj.text_obj_)) {
+    const float this_size =
+        this_matrix.TransformDistance(fabs(text_obj->GetFontSize()));
+    const float prev_size =
+        prev_matrix.TransformDistance(fabs(prev_obj.text_obj_->GetFontSize()));
+    line_tolerance = std::max({line_tolerance, this_size, prev_size});
+  }
+  if (fabs(this_pos.y - prev_pos.y) > line_tolerance) {
     ProcessTransformedTextObjects();
     text_objects_.clear();
     text_objects_.push_back(new_obj);
@@ -1173,7 +1299,9 @@ CPDF_TextPage::MarkedContentState CPDF_TextPage::PreMarkedContent(
   return MarkedContentState::kDelay;
 }
 
-bool CPDF_TextPage::ProcessMarkedContent(const TransformedTextObject& obj) {
+// EmbedPDF(bug-fix): returns nothing, as the span is never reversed here (see
+// CloseTempLine()).
+void CPDF_TextPage::ProcessMarkedContent(const TransformedTextObject& obj) {
   CPDF_TextObject* const text_obj = obj.text_obj_;
   const CPDF_ContentMarks* marks = text_obj->GetContentMarks();
   const size_t content_marks_count = marks->CountItems();
@@ -1186,7 +1314,7 @@ bool CPDF_TextPage::ProcessMarkedContent(const TransformedTextObject& obj) {
     }
   }
   if (actual_text.IsEmpty()) {
-    return false;
+    return;
   }
 
   const bool is_rtl =
@@ -1194,7 +1322,13 @@ bool CPDF_TextPage::ProcessMarkedContent(const TransformedTextObject& obj) {
       (prev_text_obj_ && IsRightToLeft(*prev_text_obj_) &&
        CFX_BidiString(actual_text, /*auto_order=*/true).OverallDirection() ==
            CFX_BidiChar::Direction::kRight);
-  CFX_Matrix matrix = text_obj->GetTextMatrix() * obj.form_matrix_;
+  // EmbedPDF(bug-fix): the characters are boxed and placed in page space, as
+  // every other character is. The text object's rect and position are in the
+  // space of the form XObject that draws it; upstream used them as they are,
+  // so /ActualText in a form drawn anywhere but the page's origin, such as a
+  // flattened field, was boxed in the wrong place.
+  const CFX_Matrix& form_matrix = obj.form_matrix_;
+  CFX_Matrix matrix = text_obj->GetTextMatrix() * form_matrix;
   CFX_FloatRect rect = text_obj->GetRect();
   float step = 0;
 
@@ -1219,12 +1353,13 @@ bool CPDF_TextPage::ProcessMarkedContent(const TransformedTextObject& obj) {
     CFX_FloatRect char_box(rect);
     char_box.Translate(k * step, 0);
     temp_text_buf_.AppendChar(wc);
-    // EmbedPDF(text-geometry): not a real glyph, so no local origin.
-    temp_char_list_.push_back(
-        CharInfo::Synthetic(CharType::kActualText, wc, text_obj->GetPos(),
-                            char_box, matrix, text_obj));
+    // EmbedPDF(text-geometry, bug-fix): not a real glyph, so no local origin.
+    // The position and box are taken through the form's matrix into page
+    // space (see `form_matrix` above).
+    temp_char_list_.push_back(CharInfo::Synthetic(
+        CharType::kActualText, wc, form_matrix.Transform(text_obj->GetPos()),
+        form_matrix.TransformRect(char_box), matrix, text_obj));
   }
-  return is_rtl;
 }
 
 void CPDF_TextPage::FindPreviousTextObject() {
@@ -1293,19 +1428,9 @@ void CPDF_TextPage::ProcessTransformedTextObjects() {
     const size_t orig_char_list_index = temp_char_list_.size();
     const size_t orig_buf_index = temp_text_buf_.GetLength();
     if (ePreMKC == MarkedContentState::kDelay) {
-      // EmbedPDF(bug-fix): a right-to-left /ActualText run is reversed here
-      // only after literal right-to-left text, whose segment CloseTempLine()
-      // reverses as a whole. A run that starts its segment stays in logical
-      // order, because CloseTempLine() passes such a segment forward: reversing
-      // it here turned Acrobat's /ActualText around each shaped Arabic or
-      // Hebrew run back to front.
-      if (ProcessMarkedContent(obj) &&
-          FollowsLiteralRightToLeftText(
-              pdfium::span(temp_char_list_).first(orig_char_list_index))) {
-        // TODO(thestig): It would be nicer if there was a way to avoid doing
-        // this second reversal.
-        ReverseTempTextBufs(orig_char_list_index, orig_buf_index);
-      }
+      // EmbedPDF(bug-fix): the span stays in logical order; CloseTempLine()
+      // reverses a right-to-left segment span by span.
+      ProcessMarkedContent(obj);
       prev_text_obj_ = text_obj;
       prev_matrix_ = form_matrix;
       continue;

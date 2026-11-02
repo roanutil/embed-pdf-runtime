@@ -55,13 +55,6 @@ RetainPtr<CPDF_Type3Cache> CPDF_DocRenderData::GetCachedType3(
     return pdfium::WrapRetain(it->second.Get());
   }
 
-  // EmbedPDF(layer-seam): a font the base parsed uses the base's cache. A
-  // layer's own Type3 font (CPDF_DocPageData::GetFont never shares one) keeps
-  // its glyph cache in the layer.
-  if (fallback_ && font->GetDocument() == fallback_->GetDocument()) {
-    return fallback_->GetCachedType3(font);
-  }
-
   auto cache = pdfium::MakeRetain<CPDF_Type3Cache>(font);
   type3_face_map_[font].Reset(cache.Get());
   return cache;

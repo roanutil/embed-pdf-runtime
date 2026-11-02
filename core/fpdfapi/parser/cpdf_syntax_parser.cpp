@@ -95,9 +95,16 @@ CPDF_SyntaxParser::CPDF_SyntaxParser(
 
 CPDF_SyntaxParser::CPDF_SyntaxParser(RetainPtr<CPDF_ReadValidator> validator,
                                      FX_FILESIZE header_offset)
+    : CPDF_SyntaxParser(std::move(validator), header_offset, /*pool=*/nullptr) {
+}
+
+CPDF_SyntaxParser::CPDF_SyntaxParser(RetainPtr<CPDF_ReadValidator> validator,
+                                     FX_FILESIZE header_offset,
+                                     WeakPtr<ByteStringPool> pool)
     : file_access_(std::move(validator)),
       header_offset_(header_offset),
-      file_len_(file_access_->GetSize()) {
+      file_len_(file_access_->GetSize()),
+      pool_(std::move(pool)) {
   DCHECK_LE(header_offset_, file_len_);
 }
 
@@ -863,8 +870,9 @@ RetainPtr<CPDF_Stream> CPDF_SyntaxParser::ReadStream(
     // changing object lifetimes by handing `substream` to `stream`, make a
     // copy of the data here.
     auto data = FixedSizeDataVector<uint8_t>::Uninit(substream->GetSize());
-    bool did_read = substream->ReadBlockAtOffset(data.span(), 0);
-    CHECK(did_read);
+    if (!substream->ReadBlockAtOffset(data.span(), 0)) {
+      return nullptr;
+    }
     auto data_as_stream =
         pdfium::MakeRetain<CFX_ReadOnlyFixedSizeDataVectorStream>(
             std::move(data));

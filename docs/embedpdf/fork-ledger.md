@@ -70,14 +70,16 @@ forget dropped versions at commit and abort.
 page list storage, the indirect object holder, the document's page and render data.
 A layer's page data falls back to its base's for objects the layer hasn't promoted, except images
 and what draws them: tiling patterns and Type3 fonts parse forms under their own document, and a
-page's image cache refuses another document's images. An image from another document loads
-uncached. A Type3 font's glyph cache lives with the document that parsed the font, so a layer's own
-Type3 font never caches its glyphs in the base.
+page's image cache refuses another document's images. An image the cache refuses loads uncached.
+A Type3 font's glyph cache lives in the layer's render data; `GetCachedType3` has no base fallback.
+This is upstream's fix (`4639ac974`), taken whole when the fork merged `cff0077cf`. The fork's own
+fix for the same crash (`926c126b2`) is dropped, and its embedder tests stay as a check on
+upstream's code.
 **Why.** The layer steps in at these seams instead of changing every caller. A base pattern or
 Type3 font on a layer page drew base images, and the image loader read the cache entry the refusal
 never started (a null read).
 **Where.** `cpdf_document.{h,cpp}`, `cpdf_indirect_object_holder.h`, `cpdf_docpagedata.{h,cpp}`,
-`cpdf_docrenderdata.{h,cpp}`, `cpdf_imageloader.cpp`.
+`cpdf_docrenderdata.{h,cpp}`, `cpdf_imageloader.cpp`, `cpdf_pageimagecache.{h,cpp}`.
 **Guarded by.** The build: an `override` fails when its seam disappears. The layer tests, among
 them `EPDFLayerEmbedderTest.FreshLayerRendersImageInTilingPattern`,
 `FreshLayerRendersImageInType3Glyph`, `FreshLayerKeepsType3GlyphCacheInLayer` and
@@ -93,7 +95,8 @@ layer sees.
 **Where.** `cpdf_document_view_scope.{h,cpp}`, `CPDF_BaseDocument`, read entry points in
 `fpdfsdk/`. Every function in `epdf_annot.cpp` opens one before it walks the document's objects.
 **Guarded by.** `cpdf_base_document_unittest.cpp`, `cpdf_layer_document_unittest.cpp`,
-`EPDFAnnotEmbedderTest.ReadsResolveThroughTheLayer`.
+`EPDFAnnotEmbedderTest.ReadsResolveThroughTheLayer`,
+`EPDFPageLabelsEmbedderTest.WritesInALayerTransaction` (`FPDF_GetPageLabel`).
 **When upstream touches this.** A new entry point that walks objects beyond its own page opens a
 scope, whether it reads or writes: `FPDFPage_Flatten()` writes one page but reads every page's
 `/Annots`. Without a scope, a base page with layer `/Annots` crashes the view detector.
@@ -151,9 +154,12 @@ promote before any structural write.
 and the last object number only rises.
 **Why.** Optimistic edits name objects before the engine applies them.
 **Where.** `CPDF_LayerDocument::RaiseLastObjectNumber`, `CanAddIndirectObjectAt`,
-`AddIndirectObjectAt`, the explicit-number APIs in `fpdf_editpage.cpp`.
-**Guarded by.** `epdf_object_number_embeddertest.cpp`.
-**When upstream touches this.** The object number allocator: keep the free-number check.
+`AddIndirectObjectAt`, the explicit-number APIs in `fpdf_editpage.cpp`, the page numbers
+`CPDF_PageExporter::ExportPages` takes for `EPDFDoc_ImportPages`.
+**Guarded by.** `epdf_object_number_embeddertest.cpp`,
+`EPDFPpoEmbedderTest.CopiesTakeTheChosenNumbers`.
+**When upstream touches this.** The object number allocator: keep the free-number check. The page
+exporter: keep creating each page at its chosen number.
 
 ### layer-open
 **Rule.** A layer opens over a base file plus a saved delta: the parser reads the base bytes
@@ -201,14 +207,38 @@ and encryption objects leaked into saves.
 `cpdf_object_stream_cache_unittest.cpp`.
 **When upstream touches this.** The creator's traversal and the parser's object stream access.
 
+### complete-xref
+**Rule.** A full save's cross-reference table is one subsection, from object 0 through the last
+number it writes. A number no written object holds is a free entry with generation 0; entry 0
+heads the list of free entries, each links to the next higher one, and the last links back to 0.
+Object numbers are never changed to close the holes.
+**Why.** ISO 32000-1 7.5.4: a file that was never updated has one subsection, numbered from 0.
+Editing sessions reserve numbers they may not use, and upstream gave the numbers between runs of
+written objects no entry at all. Acrobat can't judge a later revision's changes against such a
+table, so a signature over a rewritten file read as indeterminate after any edit
+(`HasSparseXref`). Object numbers are the engine's identities.
+**Where.** `CPDF_Creator::WriteDoc_Stage3`, the `kWriteXrefsNotIncremental81` stage.
+**Guarded by.** `EPDFObjectNumberEmbedderTest.FullSaveListsUnusedNumbersAsFree`.
+**When upstream touches this.** The full save's cross-reference writer: keep the one subsection
+and the free list. Update sections (incremental saves) stay sparse.
+
 ### save-security
 **Rule.** Pending encryption settings belong to the document, not to a global. AES-256 encryption
-and password probing are ours.
-**Why.** Saves on different threads must not share pending security state.
+and password probing are ours. The file key, the `/U` and `/O` salts and every AES IV come from
+`EPDF_FillSecureRandom`, the operating system's secure random source, never from `FX_Random` or
+`rand()`. When it fails, `EPDF_SetEncryption` or the save fails.
+**Why.** Saves on different threads must not share pending security state. `FX_Random` is a
+Mersenne Twister with a 32-bit seed (time, pid and a stack address outside Windows): the public
+salts give the seed away, and with it a file key, without the password.
 **Where.** `CPDF_Document` pending security, `fpdf_save.cpp`, `cpdf_security_handler.cpp`,
-`cpdf_crypto_handler.cpp`.
-**Guarded by.** Encrypted save embedder tests; the thread soak's encrypted save.
-**When upstream touches this.** The security handler and the save paths.
+`cpdf_crypto_handler.cpp`, `CPDF_Encryptor` and its callers in `cpdf_string.cpp` and
+`cpdf_stream.cpp`, `core/fxcrt/epdf_secure_random.{h,cpp}`.
+**Guarded by.** Encrypted save embedder tests (`EncryptedSavesShareNoKeyOrSalts`),
+`epdf_secure_random_unittest.cpp`; the thread soak's encrypted save.
+**When upstream touches this.** The security handler and the save paths. New key, salt or IV bytes
+use `EPDF_FillSecureRandom` and fail when it fails. Two upstream draws still use `FX_Random`, and
+neither is secret: the `/Perms` filler bytes (encrypted under the file key) and the R≥5 branch of
+`OnCreate` (the creator calls `OnCreate` only for R2 and R3).
 
 ## Content and pages
 
@@ -393,13 +423,24 @@ the same in every engine, WebAssembly (which has no system fonts) included.
 **Where.** `cfx_fontregistry` (ours), `cpdf_font*`, `cfx_fontmapper.cpp`. Upstream's embedder tests
 expect standard fonts from the test fonts, so the embedder test environment turns on
 `CFX_FontMapper::SetStandardFontsFromSystemForTesting()`; our tests of the rule turn it off.
+A document's fonts, their display programs and the resolver are ours (`cpdf_documentfonts`,
+`cpdf_displayprogram`, `cpdf_fontresolver`, `cfx_sfnt`, `cfx_opentypewriter`, `cfx_glyphoutline`,
+`cfx_codepointrange`, `cfx_bidiparagraph`). They reach into upstream files at three places:
+`CPDF_Document::FontIndex`, the document's hold on its font index; `CPVT_NeedDivision`,
+`CPVT_IsOpenStylePunctuation` and `CPVT_IsSpace` in `cpvt_section`, CPVT's own word breaking,
+which the rich text layout breaks a field's lines with; and `CFX_Face::LoadUnscaledGlyphOutline`
+and `GetMappedCodePointRanges`, defined in our `cfx_glyphoutline.cpp` and `cfx_codepointrange.cpp`.
 **Guarded by.** The font embedder tests; `cfx_fontmapper_unittest.cpp` and
-`EPDFViewEmbedderTest.StandardFontsDrawWithBuiltInFaces` for standard fonts.
+`EPDFViewEmbedderTest.StandardFontsDrawWithBuiltInFaces` for standard fonts;
+`epdf_font_embeddertest.cpp` and `epdf_richtextlayout_embeddertest.cpp` (`FieldMatchesCpvt` for
+the line breaks) for a document's fonts and the layout.
 **When upstream touches this.** Font loading and mapping. A new upstream test that expects the test
 fonts for a standard font passes as it is; one of ours that expects the built-in faces turns the
 switch off. Our font code calls FreeType directly (`CFX_Face::GetFsTypeFlags()`, CID-keyed CFF,
 the registry), so our builds keep `pdf_enable_freetype` on; a Fontations-only build would need
-Skrifa versions of them.
+Skrifa versions of them. When upstream changes CPVT's word breaking, the layout follows on purpose:
+a field breaks its lines where upstream's would. Keep `font_index_` declared after
+`epdf_attachment_` in `CPDF_Document`, so the index goes before the attachment and the parser.
 
 ### measurement
 **Rule.** Measurement dictionaries and dimension appearances.
@@ -466,12 +507,15 @@ race.
 ### layer-mode
 **Rule.** With `EPDF_EMBEDDER_LAYER_MODE=1`, the embedder test harness opens every file as a fresh
 layer over a frozen base. Like the engine, it sends the form-fill environment no page events and
-doesn't draw with it.
+doesn't draw with it. A document a test builds in memory goes through the layer too when the test
+opens it with `EmbedderTest::OpenDocumentFromMemory()`, or with
+`embedpdf_test::LoadMemDocumentForTest()` when it keeps the document itself; a test that writes
+into a new document starts from `EmptyPdf()`, since `CreateEmptyDocument()` never makes a layer.
 **Why.** Upstream's embedder tests then run through the layer's read and write paths, so a new
 upstream feature is tested on a layer without anyone writing a layer test.
-**Where.** `testing/embedpdf_layer_mode.{h,cpp}`, four hooks in `testing/embedder_test.cpp`,
-`testing/tools/run_layer_mode.py` with `testing/embedpdf_layer_mode_expectations.txt` and
-`testing/embedpdf_layer_mode_writers.txt`.
+**Where.** `testing/embedpdf_layer_mode.{h,cpp}`, the `EmbedPDF(layer-mode)` hooks in
+`testing/embedder_test.{h,cpp}`, `testing/tools/run_layer_mode.py` with
+`testing/embedpdf_layer_mode_expectations.txt` and `testing/embedpdf_layer_mode_writers.txt`.
 **Guarded by.** `run_layer_mode.py` fails when no test leaves an object in a layer, which is what
 happens when a hook stops working.
 **When upstream touches this.** `EmbedderTest`'s document opening, page loading and page

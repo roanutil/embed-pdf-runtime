@@ -42,8 +42,18 @@ inline constexpr uint8_t kBluePng[] = {
 // A PDF of the given object bodies, numbered from 1, with a classic xref.
 std::string MakePdf(const std::vector<std::string>& objects);
 
+// A PDF with no pages, for a test that writes into a document of its own.
+// Opened with EmbedderTest::OpenDocumentFromMemory() or
+// embedpdf_test::LoadMemDocumentForTest(), it is a layer in layer mode, as
+// every document the engine opens is; CreateEmptyDocument() never is.
+std::string EmptyPdf();
+
 // A stream object body holding `data`.
 std::string Stream(const std::string& data);
+
+// A stream object body holding `data`, with `entries` in its dictionary
+// before /Length.
+std::string Stream(const std::string& entries, const std::string& data);
 
 // Every indirect object, by number, from 1 to the last, as text: streams with
 // their raw bytes, so two graphs compare by value.
