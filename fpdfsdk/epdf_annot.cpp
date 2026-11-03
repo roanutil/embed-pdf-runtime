@@ -50,6 +50,7 @@
 #include "core/fpdfdoc/cpdf_fontface.h"
 #include "core/fpdfdoc/cpdf_formfield.h"
 #include "core/fpdfdoc/cpdf_interactiveform.h"
+#include "core/fpdfdoc/cpdf_numbertree.h"
 #include "core/fpdfdoc/cpdf_richtextjson.h"
 #include "core/fpdfdoc/cpdf_richtextparser.h"
 #include "core/fpdfdoc/cpdf_richtextwriter.h"
@@ -3521,8 +3522,10 @@ static RetainPtr<CPDF_Stream> ImportPageAsDrawing(CPDF_Document* dest_doc,
                                                   CPDF_Document* src_doc,
                                                   int page_index,
                                                   float opacity) {
-  RetainPtr<CPDF_Dictionary> src_page_dict =
-      src_doc->GetMutablePageDictionary(page_index);
+  // The source is only read (rule reads-dont-write): a mutable getter would
+  // copy a layer's page into the layer.
+  RetainPtr<const CPDF_Dictionary> src_page_dict =
+      src_doc->GetPageDictionary(page_index);
   if (!src_page_dict) {
     return nullptr;
   }
@@ -3586,8 +3589,9 @@ static RetainPtr<CPDF_Stream> ImportPageAsDrawing(CPDF_Document* dest_doc,
     return nullptr;
   }
 
-  // Build a Form XObject stream in the source document so that
-  // AnnotAppearanceExporter can deep-clone it with all resource dependencies.
+  // A Form XObject over the page's content and resources, which
+  // AnnotAppearanceExporter deep-clones with everything they refer to. It is
+  // no object of the source: adding it would write there.
   auto xobj_dict = pdfium::MakeRetain<CPDF_Dictionary>();
   xobj_dict->SetNewFor<CPDF_Name>(pdfium::annotation::kType, "XObject");
   xobj_dict->SetNewFor<CPDF_Name>(pdfium::annotation::kSubtype, "Form");
@@ -3599,16 +3603,12 @@ static RetainPtr<CPDF_Stream> ImportPageAsDrawing(CPDF_Document* dest_doc,
     xobj_dict->SetFor("Resources", src_resources->Clone());
   }
 
-  auto src_stream = src_doc->NewIndirect<CPDF_Stream>(std::move(xobj_dict));
+  auto src_stream = pdfium::MakeRetain<CPDF_Stream>(std::move(xobj_dict));
   src_stream->SetData(content_data);
 
   // Clone the stream (and all its resource references) into dest_doc.
   AnnotAppearanceExporter exporter(dest_doc, src_doc);
   RetainPtr<CPDF_Stream> cloned_stream = exporter.ExportFormXObject(src_stream);
-
-  // Clean up temporary object from source document.
-  src_doc->DeleteIndirectObject(src_stream->GetObjNum());
-
   if (!cloned_stream) {
     return nullptr;
   }
@@ -4718,6 +4718,124 @@ EPDFAnnot_GetObjectNumber(FPDF_ANNOTATION annot) {
     return 0;
   }
   return dict->GetObjNum();
+}
+
+namespace {
+
+// How deep EPDFAnnot_GetStructurePosition() climbs before it gives up.
+constexpr size_t kMaxStructureDepth = 256;
+
+// The index of the first of |node|'s /K kids that |is_it| accepts, or nullopt.
+// /K is one kid or an array of them (ISO 32000-2 Table 355).
+template <typename Predicate>
+std::optional<unsigned int> KidIndex(const CPDF_Dictionary* node,
+                                     Predicate is_it) {
+  RetainPtr<const CPDF_Object> kids = node->GetDirectObjectFor("K");
+  if (!kids) {
+    return std::nullopt;
+  }
+  const CPDF_Array* array = kids->AsArray();
+  if (!array) {
+    return is_it(kids.Get()) ? std::optional<unsigned int>(0) : std::nullopt;
+  }
+  for (size_t i = 0; i < array->size(); ++i) {
+    RetainPtr<const CPDF_Object> kid = array->GetDirectObjectAt(i);
+    if (kid && is_it(kid.Get())) {
+      return static_cast<unsigned int>(i);
+    }
+  }
+  return std::nullopt;
+}
+
+// |annot|'s place in the structure tree, the root's index first; empty when it
+// isn't in the tree. See EPDFAnnot_GetStructurePosition().
+std::vector<unsigned int> StructurePositionOf(const CPDF_Document* doc,
+                                              const CPDF_Dictionary* annot) {
+  RetainPtr<const CPDF_Number> key =
+      ToNumber(annot->GetDirectObjectFor("StructParent"));
+  const CPDF_Dictionary* catalog = doc->GetRoot();
+  if (!key || !key->IsInteger() || key->GetInteger() < 0 || !catalog) {
+    return {};
+  }
+  RetainPtr<const CPDF_Dictionary> tree_root =
+      catalog->GetDictFor("StructTreeRoot");
+  RetainPtr<const CPDF_Dictionary> parent_tree =
+      tree_root ? tree_root->GetDictFor("ParentTree") : nullptr;
+  if (!parent_tree) {
+    return {};
+  }
+  // An annotation's entry in the parent tree is the element whose /K holds its
+  // object reference (ISO 32000-2 14.7.5.4).
+  RetainPtr<const CPDF_Object> entry =
+      CPDF_NumberTree(std::move(parent_tree)).LookupValue(key->GetInteger());
+  RetainPtr<const CPDF_Dictionary> element =
+      ToDictionary(entry ? entry->GetDirect() : nullptr);
+  if (!element) {
+    return {};
+  }
+  const uint32_t annot_obj_num = annot->GetObjNum();
+  std::optional<unsigned int> step =
+      KidIndex(element.Get(), [annot_obj_num](const CPDF_Object* kid) {
+        const CPDF_Dictionary* objr = kid->AsDictionary();
+        if (!objr || objr->GetNameFor("Type") != "OBJR") {
+          return false;
+        }
+        RetainPtr<const CPDF_Reference> target =
+            ToReference(objr->GetObjectFor("Obj"));
+        return target && annot_obj_num &&
+               target->GetRefObjNum() == annot_obj_num;
+      });
+  if (!step) {
+    return {};
+  }
+
+  std::vector<unsigned int> steps = {*step};
+  std::set<const CPDF_Dictionary*> seen = {element.Get()};
+  RetainPtr<const CPDF_Dictionary> node = element;
+  while (steps.size() <= kMaxStructureDepth) {
+    RetainPtr<const CPDF_Dictionary> parent = node->GetDictFor("P");
+    if (!parent || !seen.insert(parent.Get()).second) {
+      return {};
+    }
+    const CPDF_Dictionary* child = node.Get();
+    step = KidIndex(parent.Get(), [child](const CPDF_Object* kid) {
+      return kid->AsDictionary() == child;
+    });
+    if (!step) {
+      return {};
+    }
+    steps.push_back(*step);
+    if (parent == tree_root) {
+      std::reverse(steps.begin(), steps.end());
+      return steps;
+    }
+    node = std::move(parent);
+  }
+  return {};
+}
+
+}  // namespace
+
+FPDF_EXPORT unsigned long FPDF_CALLCONV
+EPDFAnnot_GetStructurePosition(FPDF_ANNOTATION annot,
+                               unsigned int* buffer,
+                               unsigned long buflen) {
+  ScopedFPDFAnnotationView annot_view(annot);
+  CPDF_AnnotContext* ctx = CPDFAnnotContextFromFPDFAnnotation(annot);
+  if (!ctx) {
+    return 0;
+  }
+  CPDF_Document* doc = ctx->GetPage()->GetDocument();
+  CPDF_DocumentViewScope document_view(doc);
+  const CPDF_Dictionary* annot_dict = ctx->GetAnnotDict();
+  if (!annot_dict || !doc) {
+    return 0;
+  }
+  const std::vector<unsigned int> steps = StructurePositionOf(doc, annot_dict);
+  if (buffer) {
+    std::copy_n(steps.begin(), std::min<size_t>(steps.size(), buflen), buffer);
+  }
+  return static_cast<unsigned long>(steps.size());
 }
 
 FPDF_EXPORT FPDF_ANNOTATION FPDF_CALLCONV
