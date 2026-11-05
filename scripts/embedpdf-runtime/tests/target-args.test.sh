@@ -198,6 +198,85 @@ for t in android-arm64 android-x64; do
   fi
 done
 
+# Static macOS artifacts must be independently linkable on both architectures.
+for t in darwin-static-arm64 darwin-static-x64; do
+  out="$(bash "$SCRIPT" "$t" 2>/dev/null)" || { fail "$t is unsupported"; continue; }
+  for setting in 'target_os="mac"' "target_cpu=\"${t##*-}\"" \
+      'pdf_is_complete_lib=true' 'mac_deployment_target="14.0"' \
+      'use_custom_libcxx=false' 'use_clang_modules=false' 'use_lld=false' \
+      'embedpdf_thread_local_globals=true' 'pdf_enable_brotli=false'; do
+    grep -qx "$setting" <<<"$out" && pass "$t $setting" || fail "$t missing $setting"
+  done
+done
+
+# Exercise the real patch router and packager on independent scratch inputs.
+# The tiny patches stand in for dependency source, without a PDFium build.
+if python3 - "$HERE/.." <<'PY'
+import json, os, pathlib, shutil, subprocess, sys, tarfile, tempfile
+scripts = pathlib.Path(sys.argv[1]).resolve()
+with tempfile.TemporaryDirectory(prefix="epdf-static-mac-") as temp:
+    root = pathlib.Path(temp)
+    def write(path, text):
+        dest = root / path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(text)
+    def patch(name, path, old, new):
+        write("patches/embedpdf-runtime/" + name,
+              f"--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-{old}\n+{new}\n")
+    for name in ["apply-patches.sh", "unapply-patches.sh"]:
+        dest = root / "scripts/embedpdf-runtime" / name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(scripts / name, dest)
+    write("third_party/skia/skia.txt", "skia\n")
+    write("BUILD.gn", "component\n")
+    write("build/host.txt", "host\n")
+    write("build/lto.txt", "lto\n")
+    patch("skia/geometry-only-stroke.patch", "skia.txt", "skia", "geometry")
+    patch("shared-library.patch", "BUILD.gn", "component", "shared")
+    patch("mac/build.patch", "host.txt", "host", "shared-host")
+    patch("mac/system-lto.patch", "lto.txt", "lto", "system-lto")
+    env = dict(os.environ, PDF_RUNTIME_SOURCE_DIR=str(root))
+    def run(*args, ok=True):
+        result = subprocess.run(args, env=env, capture_output=True, text=True)
+        if ok and result.returncode:
+            raise AssertionError(f"{args}: {result.stdout}\n{result.stderr}")
+        return result
+    for target in ["darwin-static-arm64", "darwin-arm64", "darwin-static-x64"]:
+        run("bash", str(root / "scripts/embedpdf-runtime/apply-patches.sh"), target)
+        static = target.startswith("darwin-static-")
+        assert (root / "BUILD.gn").read_text() == ("component\n" if static else "shared\n")
+        assert (root / "build/lto.txt").read_text() == ("system-lto\n" if static else "lto\n")
+        assert (root / "build/host.txt").read_text() == ("host\n" if static else "shared-host\n")
+    run("git", "-C", str(root), "init", "-q")
+    # An isolated synthetic object supplies the metadata commit identity only.
+    run("git", "-C", str(root), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-qm", "fixture")
+    write("public/fixture.h", "/* fixture */\n")
+    write("LICENSE", "fixture license\n")
+    write("bin/install_name_tool", "#!/bin/sh\necho unexpected install_name_tool >&2\nexit 99\n")
+    (root / "bin/install_name_tool").chmod(0o755)
+    env["PATH"] = str(root / "bin") + os.pathsep + env["PATH"]
+    for target in ["darwin-static-arm64", "darwin-static-x64"]:
+        path = f"out/embedpdf-runtime/{target}"
+        write(path + "/args.gn", "target_os=\"mac\"\n")
+        missing = run("bash", str(scripts / "package-target.sh"), target, ok=False)
+        assert missing.returncode != 0 and "obj/libembedpdf.a" in missing.stderr
+        write(path + "/obj/libembedpdf.a", "static-archive-marker\n")
+        result = run("bash", str(scripts / "package-target.sh"), target)
+        archive = pathlib.Path(result.stdout.strip().splitlines()[-1])
+        with tarfile.open(archive) as tar:
+            assert tar.extractfile("./lib/libembedpdf.a").read() == b"static-archive-marker\n"
+            metadata = json.load(tar.extractfile("./BUILD-METADATA.json"))
+            assert metadata["target"] == target
+            assert metadata["sha"] == run("git", "-C", str(root), "rev-parse", "HEAD").stdout.strip()
+        assert not (root / f"out/embedpdf-runtime-staging/{target}/lib/libembedpdf.dylib").exists()
+print("static patch switching and real archive packaging passed")
+PY
+then
+  pass "static macOS routing and archive contract"
+else
+  fail "static macOS routing or archive contract"
+fi
+
 if (( FAILURES > 0 )); then
   echo "$FAILURES failure(s)" >&2
   exit 1

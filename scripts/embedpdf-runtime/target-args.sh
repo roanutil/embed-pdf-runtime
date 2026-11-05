@@ -39,6 +39,13 @@ case "$TARGET" in
       EXTRA_ARGS+=$'\nuse_system_xcode=true'
     fi
     ;;
+  darwin-static-arm64 | darwin-static-x64)
+    GN_TARGET_OS="mac"
+    GN_TARGET_CPU="${TARGET##*-}"
+    # SwiftPM embeds a complete archive linked against the SDK's libc++.
+    # Xcode's host linker handles SDK TAPI inputs the pinned lld cannot read.
+    EXTRA_ARGS=$'\nmac_deployment_target="14.0"\nuse_custom_libcxx=false\nuse_clang_modules=false\nuse_lld=false'
+    ;;
   darwin-arm64)
     GN_TARGET_OS="mac"
     GN_TARGET_CPU="arm64"
