@@ -1,0 +1,21 @@
+ok: wasm32 is pinned to 3.1.72
+ok: wasm32-eh is pinned to 4.0.0
+ok: target-args.sh's wasm32 has an emsdk pin
+ok: target-args.sh's wasm32-eh has an emsdk pin
+ok: a wasm target without a pin is rejected
+ok: darwin-arm64 has no emsdk pin
+ok: darwin-arm64 passes the check without an emsdk
+ok: linux-x64 has no emsdk pin
+ok: linux-x64 passes the check without an emsdk
+ok: ios-arm64 has no emsdk pin
+ok: ios-arm64 passes the check without an emsdk
+ok: wasm32 passes on 3.1.72
+ok: wasm32-eh refuses on 3.1.72
+ok: the refusal names the version to activate
+ok: wasm32-eh passes on 4.0.0
+ok: wasm32 refuses on 4.0.0
+ok: wasm32 refuses with no emsdk
+ok: build-target.sh checks emsdk before ensure-deps.sh
+ok: build-target.sh checks emsdk before apply-patches.sh
+ok: build-target.sh checks emsdk before gn gen
+all emsdk-version assertions passed

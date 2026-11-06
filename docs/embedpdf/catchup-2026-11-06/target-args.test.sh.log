@@ -1,0 +1,88 @@
+ok: wasm32 matches golden
+ok: darwin-arm64 matches golden
+ok: darwin-x64 matches golden
+ok: linux-x64 matches golden
+ok: linux-arm64 matches golden
+ok: linuxmusl-x64 matches golden
+ok: linuxmusl-arm64 matches golden
+ok: win32-x64 matches golden
+ok: win32-arm64 matches golden
+ok: wasm32 leaves Brotli out
+ok: wasm32-eh leaves Brotli out
+ok: darwin-static-arm64 leaves Brotli out
+ok: darwin-static-x64 leaves Brotli out
+ok: darwin-arm64 leaves Brotli out
+ok: darwin-x64 leaves Brotli out
+ok: linux-x64 leaves Brotli out
+ok: linux-arm64 leaves Brotli out
+ok: linuxmusl-x64 leaves Brotli out
+ok: linuxmusl-arm64 leaves Brotli out
+ok: win32-x64 leaves Brotli out
+ok: win32-arm64 leaves Brotli out
+ok: android-arm64 leaves Brotli out
+ok: android-x64 leaves Brotli out
+ok: ios-arm64 leaves Brotli out
+ok: ios-sim-arm64 leaves Brotli out
+ok: wasm32 leaves libyuv out
+ok: wasm32-eh leaves libyuv out
+ok: unknown target rejected
+ok: wasm32 has thread-local globals off
+ok: wasm32-eh has thread-local globals off
+ok: darwin-arm64 has thread-local globals on
+ok: linux-x64 has thread-local globals on
+ok: win32-x64 has thread-local globals on
+ok: build-target.sh derives GN_TARGET_CPU
+ok: build-target.sh derives GN_TARGET_OS
+ok: wasm32-eh args match wasm32
+ok: android-arm64 targets android
+ok: android-arm64 is a static library
+ok: android-arm64 has thread-local globals on
+ok: android-arm64 disables the bundled libc++
+ok: android-x64 targets android
+ok: android-x64 is a static library
+ok: android-x64 has thread-local globals on
+ok: android-x64 disables the bundled libc++
+ok: android-arm64 is arm64
+ok: android-x64 is x64
+ok: ios-arm64 targets ios
+ok: ios-arm64 is arm64
+ok: ios-arm64 is a static library
+ok: ios-arm64 has thread-local globals on
+ok: ios-arm64 forces use_blink on for libjpeg_turbo
+ok: ios-arm64 sets ios_deployment_target=17.0
+ok: ios-arm64 disables the bundled libc++
+ok: ios-arm64 disables clang header modules
+ok: ios-sim-arm64 targets ios
+ok: ios-sim-arm64 is arm64
+ok: ios-sim-arm64 is a static library
+ok: ios-sim-arm64 has thread-local globals on
+ok: ios-sim-arm64 forces use_blink on for libjpeg_turbo
+ok: ios-sim-arm64 sets ios_deployment_target=17.0
+ok: ios-sim-arm64 disables the bundled libc++
+ok: ios-sim-arm64 disables clang header modules
+ok: ios-arm64 is a device slice
+ok: ios-sim-arm64 is a simulator slice
+ok: darwin-arm64 leaves use_custom_libcxx untouched
+ok: android-arm64 disables clang modules
+ok: android-x64 disables clang modules
+ok: darwin-static-arm64 target_os="mac"
+ok: darwin-static-arm64 target_cpu="arm64"
+ok: darwin-static-arm64 pdf_is_complete_lib=true
+ok: darwin-static-arm64 mac_deployment_target="14.0"
+ok: darwin-static-arm64 use_custom_libcxx=false
+ok: darwin-static-arm64 use_clang_modules=false
+ok: darwin-static-arm64 use_lld=false
+ok: darwin-static-arm64 embedpdf_thread_local_globals=true
+ok: darwin-static-arm64 pdf_enable_brotli=false
+ok: darwin-static-x64 target_os="mac"
+ok: darwin-static-x64 target_cpu="x64"
+ok: darwin-static-x64 pdf_is_complete_lib=true
+ok: darwin-static-x64 mac_deployment_target="14.0"
+ok: darwin-static-x64 use_custom_libcxx=false
+ok: darwin-static-x64 use_clang_modules=false
+ok: darwin-static-x64 use_lld=false
+ok: darwin-static-x64 embedpdf_thread_local_globals=true
+ok: darwin-static-x64 pdf_enable_brotli=false
+static patch switching and real archive packaging passed
+ok: static macOS routing and archive contract
+all target-args assertions passed
