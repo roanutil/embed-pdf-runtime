@@ -292,8 +292,23 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
 EPDFAnnot_ClearColor(FPDF_ANNOTATION annot, FPDFANNOT_COLORTYPE type);
 
 // Experimental EmbedPDF Extension API.
+// Write the color of an annotation as an empty array, which ISO 32000 defines
+// as no color (transparent). Unlike EPDFAnnot_ClearColor, which removes the
+// entry, this states "none" in a way every reader agrees on: a viewer that
+// redraws a shape with no /C at all may give it a default color.
+//
+//   annot    - handle to an annotation.
+//   type     - type of the color to be set to none.
+//
+// Returns true if successful.
+FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
+EPDFAnnot_SetNoColor(FPDF_ANNOTATION annot, FPDFANNOT_COLORTYPE type);
+
+// Experimental EmbedPDF Extension API.
 // Get the border style and width of an annotation. This function handles both
-// the modern /BS dictionary and the legacy /Border array.
+// the modern /BS dictionary and the legacy /Border array. A border is dashed
+// when it draws dashes: a dashed /BS whose /D is an empty array, like a
+// /Border whose dash array is empty, draws a solid line and reads solid.
 //
 //   annot  - handle to an annotation.
 //   width  - receives the border width; can be NULL.
@@ -478,8 +493,10 @@ EPDFAnnot_GetRichContent(FPDF_ANNOTATION annot,
                          unsigned long buflen);
 
 // Experimental EmbedPDF Extension API.
-// The rich text of a FreeText annotation (/RC over /DS and /DA) or of a rich
-// text field (/RV), as UTF-8 JSON: {"source":"rc"|"contents","body":{...},
+// The rich text of a FreeText annotation (/RC over /DS and /DA), of another
+// markup annotation's comment (/RC over the reader's defaults, whatever its
+// /DA says), or of a rich text field (/RV over /DA), as UTF-8
+// JSON: {"source":"rc"|"contents","body":{...},
 // "paragraphs":[{"align","dir","runs":[{"text","style":{deltas}}]}],
 // "diagnostics":[{"code","detail"}]}. When there is no rich text the document
 // is synthesised from /Contents (one paragraph per line break) and "source" is
@@ -506,15 +523,21 @@ EPDFAnnot_GetRichTextJSON(FPDF_ANNOTATION annot,
 // change nothing. An unresolvable family is not a failure: it substitutes
 // and the run reads back "degraded".
 //
-//   annot     - handle to a FreeText annotation.
+// Any other markup annotation's rich text is its comment (ISO 32000-2
+// §12.5.6.2), which draws nothing: /RC and /Contents are written, the body
+// stating only what differs from a comment that states nothing (its reader's
+// face, 12 pt, black, left-aligned), and the appearance stays. A kind that
+// isn't markup (link, popup, widget, ...) returns false.
+//
+//   annot     - handle to a markup annotation.
 //   json_utf8 - the document, UTF-8 JSON.
 FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
 EPDFAnnot_SetRichTextJSON(FPDF_ANNOTATION annot, FPDF_BYTESTRING json_utf8);
 
 // Experimental EmbedPDF Extension API (rich text, Phase D).
 // Import raw XHTML (the XFA rich text subset, e.g. another producer's /RC)
-// over the annotation's DA and DS defaults; same effects and failures as
-// EPDFAnnot_SetRichTextJSON(). Malformed XML returns false.
+// over the defaults EPDFAnnot_GetRichTextJSON() reads it over; same effects
+// and failures as EPDFAnnot_SetRichTextJSON(). Malformed XML returns false.
 FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
 EPDFAnnot_SetRichTextXHTML(FPDF_ANNOTATION annot, FPDF_WIDESTRING xhtml);
 
@@ -946,6 +969,30 @@ FPDF_EXPORT int FPDF_CALLCONV EPDFPage_PromoteInlineAnnotsRaw(FPDF_DOCUMENT doc,
 //
 // Returns true if the handle is valid.
 FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV EPDFAnnot_IsValid(FPDF_ANNOTATION annot);
+
+// Experimental EmbedPDF Extension API.
+// Change an annotation's kind in place: write its /Subtype and nothing else.
+// It keeps its dictionary, object number, place in /Annots and every other
+// entry. /AP is left as it is, so draw the new kind with
+// EPDFAnnot_GenerateAppearance(). Which kinds may become which is the
+// caller's decision; ISO 32000-2 describes some subtypes with one table of
+// entries (the four text markup subtypes; Square and Circle), and only those
+// share all of them.
+//
+// A widget belongs to its form field and a popup to its parent, so neither
+// changes kind, and no annotation becomes one. FPDFAnnot_GetSubtype() reads
+// the new subtype at once; a form-fill environment's page view loaded before
+// the change keeps the old one until the page is loaded again, as after
+// FPDFPage_CreateAnnot().
+//
+//   annot   - handle to an annotation.
+//   subtype - the new subtype.
+//
+// Returns true on success; false for a null or invalid handle, or when the
+// current or the new subtype is one FPDFAnnot_IsSupportedSubtype() refuses,
+// a widget or a popup.
+FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
+EPDFAnnot_SetSubtype(FPDF_ANNOTATION annot, FPDF_ANNOTATION_SUBTYPE subtype);
 
 // Experimental EmbedPDF Extension API.
 // Set the /Name entry of an annotation: the icon name of a text, file
@@ -1579,10 +1626,14 @@ FPDF_EXPORT int FPDF_CALLCONV EPDFAnnot_GetMKRotation(FPDF_ANNOTATION annot);
 //             symbol /MK /CA names in the /DA colour. A push button: its
 //             background and border, and its caption (/MK /CA) centred in
 //             the /DA font and colour; an icon (/MK /I) is not drawn.
+//   - /Sig, and a widget in no field -> its box: the background and border
+//             as a text field draws them. It replaces whatever the widget
+//             shows, a signature drawn into it included.
 //
 //   annot - handle to a widget annotation.
 //
-// Returns true on success, false if the annotation is not a form field.
+// Returns true on success, false for another subtype or a field type it
+// doesn't draw.
 FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
 EPDFAnnot_GenerateFormFieldAP(FPDF_ANNOTATION annot);
 
