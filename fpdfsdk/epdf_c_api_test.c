@@ -172,6 +172,7 @@ int CheckEmbedPDFCApi(void) {
   CHK(EPDFAnnot_SetMKText);
   CHK(EPDFAnnot_SetMKTextPosition);
   CHK(EPDFAnnot_SetName);
+  CHK(EPDFAnnot_SetNoColor);
   CHK(EPDFAnnot_SetNumberValue);
   CHK(EPDFAnnot_SetOpacity);
   CHK(EPDFAnnot_SetOverlayText);
@@ -183,6 +184,7 @@ int CheckEmbedPDFCApi(void) {
   CHK(EPDFAnnot_SetRotate);
   CHK(EPDFAnnot_SetStampDrawing);
   CHK(EPDFAnnot_SetStampOpacity);
+  CHK(EPDFAnnot_SetSubtype);
   CHK(EPDFAnnot_SetTextAlignment);
   CHK(EPDFAnnot_SetVertices);
   CHK(EPDFAnnot_UpdateAppearanceToRect);

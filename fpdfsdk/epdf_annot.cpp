@@ -1208,6 +1208,25 @@ EPDFAnnot_ClearColor(FPDF_ANNOTATION annot, FPDFANNOT_COLORTYPE type) {
   return true;
 }
 
+FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
+EPDFAnnot_SetNoColor(FPDF_ANNOTATION annot, FPDFANNOT_COLORTYPE type) {
+  ScopedFPDFAnnotationView annot_view(annot);
+  RetainPtr<CPDF_Dictionary> dict =
+      GetMutableAnnotDictFromFPDFAnnotation(annot);
+  if (!dict) {
+    return false;
+  }
+
+  // OverlayColor (OC) is only valid for Redact annotations.
+  if (type == FPDFANNOT_COLORTYPE_OverlayColor &&
+      FPDFAnnot_GetSubtype(annot) != FPDF_ANNOT_REDACT) {
+    return false;
+  }
+
+  dict->SetNewFor<CPDF_Array>(GetColorKeyForType(type));
+  return true;
+}
+
 FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV EPDFAnnot_SetOpacity(FPDF_ANNOTATION annot,
                                                          float opacity) {
   ScopedFPDFAnnotationView annot_view(annot);
@@ -1504,6 +1523,13 @@ EPDFAnnot_GetBorderStyle(FPDF_ANNOTATION annot, float* width) {
     if (nStyle == CPDF_Annot::BorderStyle::kUnknown) {
       nStyle = CPDF_Annot::BorderStyle::kSolid;
     }
+    // A dashed border with an empty pattern draws a solid line (ISO 32000
+    // 8.4.3.6), so it reads solid, as a /Border with an empty dash array does.
+    RetainPtr<const CPDF_Array> pDashArray = pBSDict->GetArrayFor("D");
+    if (nStyle == CPDF_Annot::BorderStyle::kDashed && pDashArray &&
+        pDashArray->IsEmpty()) {
+      nStyle = CPDF_Annot::BorderStyle::kSolid;
+    }
     return static_cast<FPDF_ANNOT_BORDER_STYLE>(nStyle);
   }
 
@@ -1751,8 +1777,26 @@ EPDFAnnot_GetRichTextJSON(FPDF_ANNOTATION annot,
 
 namespace {
 
-// The rich text setters share one path: build the document, then write
-// all four forms and the appearance through CPDF_RichTextWriter, or nothing.
+// The kinds ISO 32000-2 Table 171 marks as markup: the ones /RC is an entry
+// of (§12.5.6.2).
+bool IsMarkupSubtype(const ByteString& subtype) {
+  static constexpr const char* kMarkup[] = {
+      "Text",      "FreeText", "Line",      "Square",    "Circle",
+      "Polygon",   "PolyLine", "Highlight", "Underline", "Squiggly",
+      "StrikeOut", "Caret",    "Stamp",     "Ink",       "FileAttachment",
+      "Sound",     "Redact",   "Projection"};
+  for (const char* name : kMarkup) {
+    if (subtype == name) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// The rich text setters share one path. A free text draws its rich text:
+// all four forms and the appearance through CPDF_RichTextWriter, or
+// nothing. Another markup annotation's is its comment: /RC and /Contents.
+// Every other kind has none.
 bool ApplyRichTextDocument(FPDF_ANNOTATION annot,
                            const CPDF_RichTextDocument& document) {
   CPDF_AnnotContext* context = CPDFAnnotContextFromFPDFAnnotation(annot);
@@ -1760,8 +1804,16 @@ bool ApplyRichTextDocument(FPDF_ANNOTATION annot,
     return false;
   }
   RetainPtr<CPDF_Dictionary> annot_dict = context->GetMutableAnnotDict();
-  if (!annot_dict || annot_dict->GetNameFor("Subtype") != "FreeText") {
+  if (!annot_dict) {
     return false;
+  }
+  const ByteString subtype = annot_dict->GetNameFor("Subtype");
+  if (subtype != "FreeText") {
+    if (!IsMarkupSubtype(subtype)) {
+      return false;
+    }
+    CPDF_RichTextWriter::ApplyComment(annot_dict.Get(), document);
+    return true;
   }
   CPDF_Document* doc = context->GetPage()->GetDocument();
   if (!doc) {
@@ -2868,6 +2920,35 @@ FPDF_EXPORT int FPDF_CALLCONV EPDFPage_PromoteInlineAnnotsRaw(FPDF_DOCUMENT doc,
 FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV EPDFAnnot_IsValid(FPDF_ANNOTATION annot) {
   ScopedFPDFAnnotationView annot_view(annot);
   return !!CPDFAnnotContextFromFPDFAnnotation(annot);
+}
+
+namespace {
+
+// A subtype EPDFAnnot_SetSubtype() can change from and to: one the
+// annotation API creates, other than the two that belong to a structure
+// beside their page (a widget to its field, a popup to its parent).
+bool IsRetypableSubtype(FPDF_ANNOTATION_SUBTYPE subtype) {
+  return FPDFAnnot_IsSupportedSubtype(subtype) &&
+         subtype != FPDF_ANNOT_WIDGET && subtype != FPDF_ANNOT_POPUP;
+}
+
+}  // namespace
+
+FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
+EPDFAnnot_SetSubtype(FPDF_ANNOTATION annot, FPDF_ANNOTATION_SUBTYPE subtype) {
+  ScopedFPDFAnnotationView annot_view(annot);
+  RetainPtr<CPDF_Dictionary> dict =
+      GetMutableAnnotDictFromFPDFAnnotation(annot);
+  if (!dict || !IsRetypableSubtype(FPDFAnnot_GetSubtype(annot)) ||
+      !IsRetypableSubtype(subtype)) {
+    return false;
+  }
+  // The name only: the caller draws the new appearance, and every other
+  // entry stays as the annotation had it.
+  dict->SetNewFor<CPDF_Name>(pdfium::annotation::kSubtype,
+                             CPDF_Annot::AnnotSubtypeToString(
+                                 static_cast<CPDF_Annot::Subtype>(subtype)));
+  return true;
 }
 
 FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV EPDFAnnot_SetName(FPDF_ANNOTATION annot,
@@ -4524,7 +4605,7 @@ FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
 EPDFAnnot_GenerateFormFieldAP(FPDF_ANNOTATION annot) {
   ScopedFPDFAnnotationView annot_view(annot);
   CPDF_AnnotContext* pContext = CPDFAnnotContextFromFPDFAnnotation(annot);
-  if (!pContext) {
+  if (!pContext || FPDFAnnot_GetSubtype(annot) != FPDF_ANNOT_WIDGET) {
     return false;
   }
 
@@ -4550,8 +4631,10 @@ EPDFAnnot_GenerateFormFieldAP(FPDF_ANNOTATION annot) {
     pLookup = pLookup->GetDictFor("Parent");
   }
 
-  if (ft.IsEmpty()) {
-    return false;
+  // A signature field's widget and one in no field show only their box.
+  if (ft.IsEmpty() || ft == "Sig") {
+    CPDF_AppearanceGenerator::GenerateBoxFormAP(pDoc, pAnnotDict.Get());
+    return true;
   }
 
   uint32_t ff = 0;
