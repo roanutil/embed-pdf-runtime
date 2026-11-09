@@ -13,7 +13,7 @@
 #include <windows.h>
 
 #include <bcrypt.h>
-#elif BUILDFLAG(IS_APPLE)
+#elif BUILDFLAG(IS_APPLE) || BUILDFLAG(IS_ANDROID)
 #include <stdlib.h>
 #elif BUILDFLAG(IS_ASMJS)
 #include <unistd.h>
@@ -38,7 +38,7 @@ bool FillChunk(pdfium::span<uint8_t> chunk) {
   return BCRYPT_SUCCESS(::BCryptGenRandom(nullptr, chunk.data(),
                                           static_cast<ULONG>(chunk.size()),
                                           BCRYPT_USE_SYSTEM_PREFERRED_RNG));
-#elif BUILDFLAG(IS_APPLE)
+#elif BUILDFLAG(IS_APPLE) || BUILDFLAG(IS_ANDROID)
   arc4random_buf(chunk.data(), chunk.size());
   return true;
 #elif BUILDFLAG(IS_ASMJS)
